@@ -1,0 +1,693 @@
+#!/usr/bin/env python3
+"""Authenticated AG-UI gateway to existing Herdr-managed coding agents.
+
+Version 0.5.0 adds per-session/per-pane routes and live agent discovery while
+preserving the tested v0.4.2 /ag-ui demo route and text-file reconstruction.
+Python standard library only. It does not launch, stop, or resume Herdr agents.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import hmac
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import threading
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
+
+
+TARGET = os.environ.get("HERDR_AGENT_TARGET", "").strip()
+MACHINE = os.environ.get("HERDR_MACHINE", "").strip()
+SESSION = os.environ.get("HERDR_SESSION", "").strip()
+SESSIONS = tuple(dict.fromkeys(s.strip() for s in
+    os.environ.get("HERDR_SESSIONS", SESSION).split(",") if s.strip()))
+SOCKET_PATH = os.environ.get("HERDR_SOCKET_PATH", "").strip()
+HERDR_BIN = os.environ.get("HERDR_BIN", "herdr")
+TOKEN_FILE = os.environ.get("OPENBOT_BRIDGE_TOKEN_FILE", "").strip()
+TOKEN = os.environ.get("OPENBOT_BRIDGE_TOKEN", "")
+if TOKEN_FILE and not TOKEN:
+    # systemd LoadCredential provides this path without leaking the bearer
+    # token into process arguments or unit files.
+    TOKEN = Path(TOKEN_FILE).read_text(encoding="utf-8").strip()
+HOST = os.environ.get("OPENBOT_BRIDGE_HOST", "127.0.0.1")
+PORT = int(os.environ.get("OPENBOT_BRIDGE_PORT", "8765"))
+TIMEOUT_MS = int(os.environ.get("OPENBOT_BRIDGE_TIMEOUT_MS", "120000"))
+WORKDIR = os.environ.get("OPENBOT_BRIDGE_WORKDIR", "").strip()
+ALLOWED_ROOTS = tuple(s.strip() for s in
+    os.environ.get("OPENBOT_BRIDGE_ALLOWED_ROOTS", "").split(":") if s.strip())
+AGENT_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+LOCKS_GUARD = threading.Lock()
+GLOBAL_SLOTS = threading.BoundedSemaphore(8)
+MAX_BODY = 24 * 1024 * 1024
+MAX_PROMPT = 4000
+MAX_FILE_SIZE = 8 * 1024 * 1024
+MAX_TOTAL_FILES = 12 * 1024 * 1024
+MAX_FILES = 2
+OPENBOT_TEXT_FILE = re.compile(r'\AAttached file "([^"\r\n]{1,160})":\r?\n\r?\n([\s\S]*)\Z')
+TEXT_MIMES = {
+    ".csv": "text/csv",
+    ".tsv": "text/tab-separated-values",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".json": "application/json",
+    ".yaml": "application/yaml",
+    ".yml": "application/yaml",
+    ".log": "text/plain",
+}
+PANE_RE = re.compile(r"w[0-9A-Za-z]+:p[0-9A-Za-z]+\Z")
+SESSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+AGENT_ROUTE = re.compile(r"/sessions/([A-Za-z0-9][A-Za-z0-9_-]{0,63})/agents/(w[0-9A-Za-z]+:p[0-9A-Za-z]+)/ag-ui\Z")
+
+
+def command(*args: str, session: str | None = None, wait_seconds: float = 15) -> str:
+    cmd = [HERDR_BIN]
+    if MACHINE:
+        cmd += ["--machine", MACHINE]
+    elif session and not SOCKET_PATH:
+        cmd += ["--session", session]
+    cmd += list(args)
+    env = os.environ.copy()
+    if session and not MACHINE:
+        env["HERDR_SESSION"] = session
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, check=False, timeout=wait_seconds,
+        env=env
+    )
+    if result.returncode != 0:
+        # CLI stderr may contain user data; do not put it in HTTP responses.
+        reason = (result.stderr or "").strip().splitlines()
+        brief = reason[0][:160] if reason else "no details"
+        raise RuntimeError(f"Herdr command failed (exit={result.returncode}): {brief}")
+    return result.stdout
+
+
+def agent_record(session: str, target: str) -> dict:
+    output = command("agent", "get", target, session=session)
+    data = json.loads(output)
+    agent = data.get("result", {}).get("agent", {})
+    if not isinstance(agent, dict) or not agent:
+        raise RuntimeError("Herdr did not return an agent record")
+    return agent
+
+
+def normalized_state(agent: dict) -> str:
+    status = agent.get("agent_status") or agent.get("status")
+    if isinstance(status, dict):
+        status = status.get("state") or status.get("status")
+    if not isinstance(status, str):
+        raise RuntimeError("Herdr returned no recognizable agent status; inspect agent get")
+    return status.lower()
+
+
+def target_state() -> str:
+    """Backward-compatible single-target status used by /agent."""
+    return normalized_state(agent_record(SESSION, TARGET))
+
+
+def list_agents(session: str) -> list[dict]:
+    payload = json.loads(command("agent", "list", session=session))
+    agents = payload.get("result", {}).get("agents", [])
+    if not isinstance(agents, list):
+        raise RuntimeError("Invalid Herdr agent list")
+    return [a for a in agents if isinstance(a, dict) and
+            PANE_RE.fullmatch(str(a.get("pane_id", "")))]
+
+
+def public_agent_info(session: str, agent: dict) -> dict:
+    pane = agent["pane_id"]
+    return {"session": session, "pane_id": pane,
+            "name": agent.get("name") or "",
+            "title": agent.get("terminal_title_stripped") or agent.get("name") or pane,
+            "status": normalized_state(agent),
+            "cwd": agent.get("foreground_cwd") or agent.get("cwd") or "",
+            "ag_ui_path": f"/sessions/{session}/agents/{pane}/ag-ui"}
+
+
+def live_target(session: str, pane_id: str) -> dict:
+    """Allow only currently recognized agents in an explicitly allowed session."""
+    if session not in SESSIONS or not PANE_RE.fullmatch(pane_id):
+        raise LookupError("Unknown agent route")
+    for agent in list_agents(session):
+        if agent["pane_id"] == pane_id:
+            return agent
+    raise LookupError("No live Herdr agent in this pane")
+
+
+def target_lock(session: str, pane_id: str) -> threading.Lock:
+    key = (session, pane_id)
+    with LOCKS_GUARD:
+        if key not in AGENT_LOCKS:
+            AGENT_LOCKS[key] = threading.Lock()
+        return AGENT_LOCKS[key]
+
+
+def last_user_text(body: dict) -> str:
+    for msg in reversed(body.get("messages", [])):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = "\n".join(
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        else:
+            text = ""
+        if text.strip():
+            return text.strip()
+    raise ValueError("No text user message was provided")
+
+
+def safe_filename(name: str) -> str:
+    name = Path(name.replace("\\", "/")).name
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:96].strip(".")
+    return name or "attachment.bin"
+
+
+def openbot_text_attachment(text: str) -> tuple[str, str, bytes] | None:
+    """Rebuild a *derived UTF-8 copy* of OpenBot's textual file rendering.
+
+    OpenBot 1.0.2 was observed to send a second text part of exactly this form:
+    `Attached file "test.csv":\n\nname,amount\nSample,42f\n` (50 chars).
+    This is NOT an original binary upload or a byte-for-byte representation.
+    """
+    if not text.startswith('Attached file "'):
+        return None
+    match = OPENBOT_TEXT_FILE.fullmatch(text)
+    if match is None:
+        raise ValueError("Unsupported OpenBot text attachment wrapper")
+    name = safe_filename(match.group(1))
+    mime = TEXT_MIMES.get(Path(name).suffix.lower())
+    if mime is None:
+        raise ValueError("OpenBot rendered an unsupported file type as text; use a binary attachment handoff")
+    content = match.group(2)
+    if "\x00" in content:
+        raise ValueError("OpenBot text attachment contains a null character")
+    data = content.encode("utf-8")
+    if not data or len(data) > MAX_FILE_SIZE:
+        raise ValueError("OpenBot text attachment is empty or exceeds the 8 MiB pilot limit")
+    return name, mime + "; source=openbot-derived-text", data
+
+
+def parse_user_message(body: dict) -> tuple[str, list[tuple[str, str, bytes]]]:
+    """Parse only the latest user turn, preserving media and rejecting unknown sources.
+
+    Inline AG-UI 1.0 DataSource media is the only supported attachment transport.
+    Never silently omit a file or request the bridge to fetch arbitrary URLs.
+    """
+    if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
+        raise ValueError("AG-UI messages must be an array")
+    user = next((msg for msg in reversed(body["messages"])
+                 if isinstance(msg, dict) and msg.get("role") == "user"), None)
+    if user is None:
+        raise ValueError("No user message was provided")
+    content = user.get("content", "")
+    if isinstance(content, str):
+        text = content.strip()
+        if not text:
+            raise ValueError("No text user message was provided")
+        return text, []
+    if not isinstance(content, list):
+        raise ValueError("Unsupported AG-UI message content")
+
+    texts: list[str] = []
+    attachments: list[tuple[str, str, bytes]] = []
+    size_total = 0
+    for part_index, part in enumerate(content):
+        if not isinstance(part, dict):
+            raise ValueError("Malformed AG-UI content part")
+        kind = part.get("type")
+        if kind == "text":
+            if not isinstance(part.get("text"), str):
+                raise ValueError("Malformed text content part")
+            derived = openbot_text_attachment(part["text"]) if part_index > 0 else None
+            if derived is not None:
+                if len(attachments) >= MAX_FILES:
+                    raise ValueError(f"Pilot supports at most {MAX_FILES} files per message")
+                size_total += len(derived[2])
+                if size_total > MAX_TOTAL_FILES:
+                    raise ValueError("Total attachment bytes exceed the 12 MiB pilot limit")
+                attachments.append(derived)
+            else:
+                texts.append(part["text"])
+            continue
+        if kind not in ("image", "audio", "video", "document"):
+            raise ValueError(f"Unsupported AG-UI content part: {str(kind)[:40]}")
+        if len(attachments) >= MAX_FILES:
+            raise ValueError(f"Pilot supports at most {MAX_FILES} files per message")
+        source = part.get("source")
+        if not isinstance(source, dict) or source.get("type") != "data":
+            raise ValueError("File references/URLs are not supported yet; send inline AG-UI data")
+        encoded = source.get("value")
+        if not isinstance(encoded, str) or len(encoded) > 4 * MAX_FILE_SIZE // 3 + 8:
+            raise ValueError("Attachment exceeds the 8 MiB pilot limit")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("Invalid attachment base64") from exc
+        if not data or len(data) > MAX_FILE_SIZE:
+            raise ValueError("Attachment exceeds the 8 MiB pilot limit or is empty")
+        size_total += len(data)
+        if size_total > MAX_TOTAL_FILES:
+            raise ValueError("Total attachment bytes exceed the 12 MiB pilot limit")
+        mime = source.get("mimeType", "application/octet-stream")
+        if not isinstance(mime, str) or len(mime) > 120 or "\n" in mime:
+            raise ValueError("Invalid attachment MIME type")
+        metadata = part.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        name = metadata.get("filename") or metadata.get("fileName") or "attachment.bin"
+        if not isinstance(name, str):
+            name = "attachment.bin"
+        name = safe_filename(name)
+        attachments.append((name, mime, data))
+    text = "\n".join(texts).strip()
+    if not text and not attachments:
+        raise ValueError("No text or attachment was provided")
+    return text or "Please examine the attached files.", attachments
+
+
+def redacted_request_shape(body: object) -> dict:
+    """Report field *structure* for troubleshooting, never content or secrets.
+
+    OpenBot may store composer files in its own backend rather than placing
+    inline AG-UI parts in the request. This lets us identify the handoff path
+    without writing raw messages, data URLs, bearer tokens, or filenames to logs.
+    """
+    if not isinstance(body, dict):
+        return {"body": "non-object"}
+
+    def keys(obj: object) -> list[str]:
+        if not isinstance(obj, dict):
+            return []
+        return sorted(str(key)[:40] for key in obj)[:24]
+
+    def field_kind(obj: object) -> dict:
+        if isinstance(obj, dict):
+            return {"kind": "object", "keys": keys(obj)}
+        if isinstance(obj, list):
+            return {"kind": "array", "items": len(obj)}
+        if isinstance(obj, str):
+            return {"kind": "string", "characters": len(obj)}
+        return {"kind": type(obj).__name__}
+
+    messages = body.get("messages")
+    user = next((msg for msg in reversed(messages)
+                 if isinstance(msg, dict) and msg.get("role") == "user"), None) \
+        if isinstance(messages, list) else None
+    result = {"body_keys": keys(body),
+              "message_count": len(messages) if isinstance(messages, list) else 0,
+              "latest_user_keys": keys(user)}
+    if not isinstance(user, dict):
+        return result
+
+    content = user.get("content")
+    result["content"] = field_kind(content)
+    if isinstance(content, list):
+        parts = []
+        for part in content[:12]:
+            if not isinstance(part, dict):
+                parts.append({"kind": "non-object"})
+                continue
+            kind = part.get("type")
+            source = part.get("source")
+            info = {"part_keys": keys(part),
+                    "part_type": kind if kind in ("text", "image", "audio", "video", "document") else "other",
+                    "source": field_kind(source),
+                    "metadata": field_kind(part.get("metadata"))}
+            if isinstance(source, dict):
+                source_kind = source.get("type")
+                info["source_type"] = source_kind if source_kind in ("data", "url", "file") else "other"
+                info["source_value"] = field_kind(source.get("value"))
+            if isinstance(part.get("text"), str):
+                info["text_characters"] = len(part["text"])
+            parts.append(info)
+        result["parts"] = parts
+    for key in ("attachments", "files", "forwardedProps", "metadata", "context", "state"):
+        if key in body:
+            result["body_" + key] = field_kind(body[key])
+        if key in user:
+            result["user_" + key] = field_kind(user[key])
+    return result
+
+
+def stage_attachments(attachments: list[tuple[str, str, bytes]],
+                      marker_id: str, workdir: str, *, dynamic: bool = False) -> list[str]:
+    """Write into the selected agent's workdir, never a supplied HTTP path."""
+    if not attachments:
+        return []
+    if not workdir:
+        raise ValueError("Agent has no known working directory for attachments")
+    root = Path(workdir).expanduser()
+    if not root.is_absolute() or not root.is_dir() or root.is_symlink():
+        raise ValueError("The configured agent working directory is unavailable")
+    if dynamic:
+        if not ALLOWED_ROOTS:
+            raise ValueError("Set OPENBOT_BRIDGE_ALLOWED_ROOTS to enable per-agent uploads")
+        canonical = root.resolve(strict=True)
+        if not any(canonical.is_relative_to(Path(path).resolve(strict=True))
+                   for path in ALLOWED_ROOTS):
+            raise ValueError("Agent working directory is outside allowed upload roots")
+    inbox = root / ".openbot-inbox"
+    if inbox.is_symlink():
+        raise ValueError("The attachment inbox cannot be a symlink")
+    inbox.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(inbox, 0o700)
+    target = inbox / marker_id
+    target.mkdir(mode=0o700)
+    written: list[Path] = []
+    try:
+        for i, (name, mime, data) in enumerate(attachments, 1):
+            filename = f"{i}-{safe_filename(name)}"
+            path = target / filename
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(path, flags, 0o600)
+            written.append(path)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            # Only paths and metadata go to the agent prompt, never file contents.
+        return [f".openbot-inbox/{marker_id}/{i}-{safe_filename(name)} ({mime}; {len(data)} bytes)"
+                for i, (name, mime, data) in enumerate(attachments, 1)]
+    except Exception:
+        for path in written:
+            path.unlink(missing_ok=True)
+        target.rmdir()
+        raise
+
+
+def extract_reply(transcript: str, marker_id: str) -> str:
+    # The prompt itself contains the sentinels. Take the LAST complete pair.
+    begin = f"OPENBOT_BEGIN_{marker_id}"
+    end = f"OPENBOT_END_{marker_id}"
+    parts = list(re.finditer(re.escape(begin) + r"\s*(.*?)\s*" + re.escape(end),
+                             transcript, flags=re.DOTALL))
+    if not parts:
+        raise RuntimeError(
+            "Could not correlate the agent's answer with the request. "
+            "Check the Herdr pane; the prompt may already have been submitted. "
+            "Do not retry automatically."
+        )
+    text = parts[-1].group(1).strip()
+    if (not text or text == "<your response>" or
+            "OPENBOT_BEGIN_" in text or "OPENBOT_END_" in text):
+        raise RuntimeError("Agent reply could not be safely extracted; inspect Herdr")
+    return text
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "OpenBotHerdrBridge/0.5.0"
+
+    def log_message(self, format_string: str, *args: object) -> None:
+        # Deliberately never logs request bodies, authorization, or agent output.
+        sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(),
+                                          format_string % args))
+
+    def authorized(self) -> bool:
+        value = self.headers.get("Authorization", "")
+        return hmac.compare_digest(value, "Bearer " + TOKEN)
+
+    def json_response(self, status: int, obj: dict) -> None:
+        data = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self) -> None:
+        path = urlsplit(self.path).path
+        if path == "/health":
+            self.json_response(200, {"ok": True, "version": "0.5.0", "mode": "multi-agent"})
+            return
+        if not self.authorized():
+            self.json_response(401, {"error": "unauthorized"})
+            return
+        if path in ("/agents", "/attention"):
+            sessions = []
+            for session in SESSIONS:
+                try:
+                    agents = [public_agent_info(session, a) for a in list_agents(session)]
+                    sessions.append({"name": session, "online": True, "agents": agents})
+                except (RuntimeError, OSError, subprocess.TimeoutExpired,
+                        ValueError, json.JSONDecodeError):
+                    # A stopped session remains visible without being started.
+                    sessions.append({"name": session, "online": False, "agents": []})
+            if path == "/attention":
+                self.json_response(200, {"blocked": [a for s in sessions for a in s["agents"]
+                                                    if a["status"] == "blocked"],
+                                         "offline_sessions": [s["name"] for s in sessions
+                                                              if not s["online"]]})
+            else:
+                self.json_response(200, {"version": "0.5.0", "sessions": sessions})
+            return
+        if path == "/agent" and TARGET:
+            try:
+                self.json_response(200, {"target": TARGET, "machine": MACHINE or "local",
+                                         "state": target_state()})
+            except Exception as exc:
+                self.json_response(503, {"error": str(exc)})
+            return
+        self.json_response(404, {"error": "not_found"})
+
+    def send_event(self, payload: dict) -> None:
+        message = "data: " + json.dumps(payload, separators=(",", ":")) + "\n\n"
+        self.wfile.write(message.encode("utf-8"))
+        self.wfile.flush()
+
+    def read_request_body(self) -> bytes:
+        """Read bounded JSON bodies using Content-Length or HTTP chunked framing."""
+        encoding = self.headers.get("Transfer-Encoding", "").strip().lower()
+        content_length = self.headers.get("Content-Length")
+        self.log_message("AGUI request framing: Content-Length=%r Transfer-Encoding=%r Limit=%d",
+                         content_length, encoding, MAX_BODY)
+        self.connection.settimeout(30)
+        if encoding:
+            if encoding != "chunked" or content_length is not None:
+                raise ValueError("Unsupported or ambiguous request framing")
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                length_line = self.rfile.readline(1025)
+                if not length_line or len(length_line) > 1024:
+                    raise ValueError("Invalid chunk header")
+                try:
+                    size = int(length_line.split(b";", 1)[0].strip(), 16)
+                except ValueError:
+                    raise ValueError("Invalid chunk size") from None
+                if size < 0 or total + size > MAX_BODY:
+                    raise ValueError("Invalid request size")
+                if size == 0:
+                    # Consume permitted trailers so the framing stays well-formed.
+                    trailer_bytes = 0
+                    while True:
+                        trailer = self.rfile.readline(1025)
+                        trailer_bytes += len(trailer)
+                        if not trailer or len(trailer) > 1024 or trailer_bytes > 8192:
+                            raise ValueError("Invalid request trailers")
+                        if trailer in (b"\r\n", b"\n"):
+                            return b"".join(chunks)
+                chunk = self.rfile.read(size)
+                if len(chunk) != size or self.rfile.read(2) != b"\r\n":
+                    raise ValueError("Truncated or malformed request chunk")
+                total += size
+                chunks.append(chunk)
+
+        try:
+            size = int(content_length or "0")
+        except ValueError:
+            raise ValueError("Invalid Content-Length") from None
+        if size <= 0 or size > MAX_BODY:
+            raise ValueError("Invalid request size")
+        data = self.rfile.read(size)
+        if len(data) != size:
+            raise ValueError("Incomplete request body")
+        return data
+
+    def do_POST(self) -> None:
+        path = urlsplit(self.path).path.rstrip("/")
+        match = AGENT_ROUTE.fullmatch(path)
+        legacy = path == "/ag-ui" and bool(TARGET)
+        if not match and not legacy:
+            self.json_response(404, {"error": "not_found"})
+            return
+        if not self.authorized():
+            self.json_response(401, {"error": "unauthorized"})
+            return
+        if match:
+            session, requested_pane = match.groups()
+            try:
+                agent = live_target(session, requested_pane)
+            except LookupError:
+                self.json_response(404, {"error": "agent_not_found"})
+                return
+            except (RuntimeError, OSError, subprocess.TimeoutExpired,
+                    ValueError, json.JSONDecodeError):
+                self.json_response(503, {"error": "Herdr session unavailable"})
+                return
+            target = requested_pane
+            workdir = str(agent.get("foreground_cwd") or agent.get("cwd") or "")
+            dynamic = True
+        else:
+            session = SESSION
+            target = TARGET
+            try:
+                agent = agent_record(session, target)
+            except (RuntimeError, OSError, subprocess.TimeoutExpired,
+                    ValueError, json.JSONDecodeError):
+                self.json_response(503, {"error": "Legacy agent unavailable"})
+                return
+            workdir = WORKDIR
+            dynamic = False
+        pane_id = str(agent.get("pane_id") or target)
+        if not PANE_RE.fullmatch(pane_id):
+            self.json_response(503, {"error": "Herdr did not identify the target pane"})
+            return
+        try:
+            body = json.loads(self.read_request_body())
+            # Key names, field types and lengths only; no user content or tokens.
+            self.log_message("AGUI request shape: %s",
+                             json.dumps(redacted_request_shape(body), separators=(",", ":")))
+            user_text, attachments = parse_user_message(body)
+            if len(user_text) > MAX_PROMPT or "\x00" in user_text:
+                raise ValueError("User message too large or contains null characters")
+        except (ValueError, json.JSONDecodeError, TypeError, TimeoutError) as exc:
+            self.json_response(400, {"error": str(exc)})
+            return
+
+        if not GLOBAL_SLOTS.acquire(blocking=False):
+            self.json_response(503, {"error": "Bridge is at concurrent run capacity"})
+            return
+        lock = target_lock(session, pane_id)
+        if not lock.acquire(blocking=False):
+            GLOBAL_SLOTS.release()
+            self.json_response(409, {"error": "Agent is already handling an OpenBot request"})
+            return
+
+        thread_id = str(body.get("threadId") or uuid.uuid4())
+        run_id = str(body.get("runId") or uuid.uuid4())
+        msg_id = str(uuid.uuid4())
+        marker_id = secrets.token_hex(8).upper()
+        begin = f"OPENBOT_BEGIN_{marker_id}"
+        end = f"OPENBOT_END_{marker_id}"
+        try:
+            current_agent = agent_record(session, pane_id)
+            state = normalized_state(current_agent)
+            # Don't route to a process that replaced the pane occupant after
+            # discovery. Herdr's native session ref exists for most Claude panes.
+            original_ref = agent.get("agent_session", {}).get("value") if isinstance(
+                agent.get("agent_session"), dict) else None
+            current_ref = current_agent.get("agent_session", {}).get("value") if isinstance(
+                current_agent.get("agent_session"), dict) else None
+            if original_ref and current_ref and original_ref != current_ref:
+                self.json_response(409, {"error": "Agent changed while request was preparing"})
+                return
+            if state not in ("idle", "done"):
+                self.json_response(409, {"error": f"Agent is {state}, no prompt submitted"})
+                return
+            try:
+                staged = stage_attachments(attachments, marker_id, workdir,
+                                           dynamic=dynamic)
+            except (ValueError, OSError) as exc:
+                self.json_response(422, {"error": str(exc)})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.send_event({"type": "RUN_STARTED", "threadId": thread_id,
+                             "runId": run_id})
+            attachment_instructions = ""
+            if staged:
+                attachment_instructions = (
+                    "\n\nThe user uploaded these files into your working directory. "
+                    "Read them with your normal file tools as needed; the files are not "
+                    "included verbatim in this prompt. A file marked "
+                    "source=openbot-derived-text is a reconstructed UTF-8 text copy, "
+                    "not guaranteed to be byte-for-byte identical to the upload:\n" +
+                    "\n".join(f"- {path}" for path in staged)
+                )
+            prompt = (
+                f"[OpenBot pilot request {marker_id}]\n{user_text}"
+                f"{attachment_instructions}\n\n"
+                "For this integration test, enclose your final response between "
+                "these exact lines, with no formatting around them:\n"
+                f"{begin}\n<your response>\n{end}\n"
+                "Keep the response concise."
+            )
+            # This may submit even if Herdr times out; NEVER auto-retry.
+            command("agent", "prompt", pane_id, prompt, "--wait", "--until", "idle",
+                    "--until", "done", "--until", "blocked", "--timeout", str(TIMEOUT_MS),
+                    session=session,
+                    wait_seconds=TIMEOUT_MS / 1000 + 15)
+            if normalized_state(agent_record(session, pane_id)) == "blocked":
+                raise RuntimeError(f"Agent {pane_id} needs an approval or answer in Herdr")
+            transcript = command("agent", "read", pane_id,
+                                 "--source", "recent-unwrapped", "--lines", "200",
+                                 session=session,
+                                 wait_seconds=30)
+            response = extract_reply(transcript, marker_id)
+            self.send_event({"type": "TEXT_MESSAGE_START", "messageId": msg_id,
+                             "role": "assistant"})
+            self.send_event({"type": "TEXT_MESSAGE_CONTENT", "messageId": msg_id,
+                             "delta": response})
+            self.send_event({"type": "TEXT_MESSAGE_END", "messageId": msg_id})
+            self.send_event({"type": "RUN_FINISHED", "threadId": thread_id,
+                             "runId": run_id})
+        except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+            # A protocol run failure is not proof the Herdr prompt was not sent.
+            try:
+                self.send_event({"type": "RUN_ERROR", "message": str(exc)})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            lock.release()
+            GLOBAL_SLOTS.release()
+
+
+def main() -> None:
+    if TARGET and not re.fullmatch(r"(?:w[0-9A-Za-z]+:p[0-9A-Za-z]+|[a-z][a-z0-9_-]{0,31})", TARGET):
+        sys.exit("HERDR_AGENT_TARGET must be an existing agent name or pane ID")
+    if not SESSIONS or any(not SESSION_RE.fullmatch(s) for s in SESSIONS):
+        sys.exit("Set HERDR_SESSIONS to one or more named Herdr sessions")
+    if TARGET and SESSION not in SESSIONS:
+        sys.exit("HERDR_SESSION must belong to HERDR_SESSIONS when using legacy /ag-ui")
+    if not TOKEN or len(TOKEN) < 24:
+        sys.exit("Set OPENBOT_BRIDGE_TOKEN to a random secret of at least 24 characters")
+    if HOST != "127.0.0.1":
+        sys.exit("Bridge must bind to 127.0.0.1; use a private proxy/tunnel")
+    if MACHINE and (SESSION or SOCKET_PATH):
+        sys.exit("Use HERDR_MACHINE OR local HERDR_SESSION/SOCKET_PATH, not both")
+    if (MACHINE or SOCKET_PATH) and len(SESSIONS) != 1:
+        sys.exit("Multi-session routing requires local Herdr sessions (no machine/socket override)")
+    for root in ALLOWED_ROOTS:
+        if not Path(root).is_absolute() or not Path(root).is_dir():
+            sys.exit("Every OPENBOT_BRIDGE_ALLOWED_ROOTS entry must be an existing absolute directory")
+    if TIMEOUT_MS < 1000 or TIMEOUT_MS > 600000:
+        sys.exit("OPENBOT_BRIDGE_TIMEOUT_MS must be between 1000 and 600000")
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"Bridge ready on http://{HOST}:{PORT}/agents | "
+          f"sessions={','.join(SESSIONS)} | legacy_target={TARGET or 'disabled'}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
