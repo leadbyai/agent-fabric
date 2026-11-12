@@ -1,1 +1,105 @@
-# agent-fabric
+# LeadByAI Agent Fabric — Herdr gateway
+
+Vendor-neutral, authenticated AG-UI gateway for **existing** Herdr-managed
+coding agents. Agent Fabric can discover multiple Herdr sessions belonging to
+one Unix user and address an individual agent by its live pane ID.
+
+## Release status
+
+`v0.5.0` is a **staging release**. It was tested with simulated Herdr agents;
+it has not yet been validated against a production Herdr/OpenBot installation.
+The installer defaults to `127.0.0.1:8766` so it can run beside an existing
+bridge without changing its listening port or shutting it down.
+
+It does **not** create, start, stop, or resume Herdr sessions or agent
+processes. A stopped session is listed as offline until the owner starts it.
+
+## HTTP endpoints
+
+| Endpoint | Purpose | Authentication |
+| --- | --- | --- |
+| `GET /health` | Process health | None |
+| `GET /agents` | Discover recognized agents across configured sessions | Bearer token |
+| `GET /attention` | List blocked agents and offline sessions | Bearer token |
+| `POST /sessions/<session>/agents/<pane-id>/ag-ui` | Send AG-UI request to one existing agent | Bearer token |
+| `POST /ag-ui` | Legacy single-agent entry point when configured | Bearer token |
+| `GET /agent` | Legacy target status when configured | Bearer token |
+
+Small inline file attachments and OpenBot's textual attachment reconstruction
+are supported. Dynamic routes stage files only beneath configured allowed
+working-directory roots. Larger files can be shared using external file links;
+the bridge does not fetch arbitrary attachment URLs.
+
+## Installing
+
+Requirements: Linux with systemd, Python 3, curl, and an installed Herdr CLI
+for the selected Unix account. The selected Herdr sessions must belong to
+that same account.
+
+The installer is idempotent for the service it owns and stores its bearer
+credential in a root-owned file supplied to the service via systemd
+`LoadCredential`. It does not overwrite an unmanaged service and backs up its
+own previous Python bridge before updating.
+
+From a reviewed local source checkout, install into a separate port:
+
+```bash
+sudo bash ./install.sh --source-dir "$PWD" --user agentuser \
+  --sessions Main,Review --roots /home/agentuser/work --port 8766
+```
+
+When this version is published, use the **commit-pinned** installer download
+URL rather than a moving branch. The installer verifies `bridge.py` against
+its embedded SHA-256 checksum. Change the example user, sessions and upload
+roots to match the destination host.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leadbyai/agent-fabric/COMMIT_SHA/install.sh | sudo bash -s -- --user agentuser --sessions Main,Review --roots /home/agentuser/work --port 8766
+```
+
+The `COMMIT_SHA` placeholder is deliberately not executable as-is. Use the
+exact published commit SHA supplied with the release.
+
+The installer does **not** configure public DNS or Cloudflare credentials.
+Once locally validated, publish only the localhost bridge through an
+authenticated HTTPS proxy/tunnel. Do not expose Herdr's socket or terminal
+control API to the Internet.
+
+Optional backwards-compatible legacy route:
+
+```bash
+sudo bash ./install.sh --source-dir "$PWD" --user agentuser \
+  --sessions Main --roots /home/agentuser/work --legacy-target demo \
+  --legacy-workdir /home/agentuser/work/demo \
+  --token-file /home/agentuser/.existing-bridge-token --port 8766
+```
+
+Inspect the staging service:
+
+```bash
+curl -fsS http://127.0.0.1:8766/health
+sudo systemctl status openbot-herdr-gateway.service --no-pager
+```
+
+## Safety and rollout
+
+- No agent input is submitted while Herdr marks that agent `working` or `blocked`.
+- Requests to unknown agent panes and stopped sessions are rejected.
+- A per-agent lock prevents two concurrent OpenBot requests targeting one pane.
+- Failed or ambiguous CLI submissions are **never retried automatically**.
+- The gateway stays localhost-only; its bearer token is never logged.
+- The existing single-target bridge need not be removed or restarted.
+
+Run offline tests before deployment:
+
+```bash
+python3 -m unittest discover -s tests -v
+bash -n install.sh
+python3 -m py_compile bridge.py
+```
+
+**Not yet implemented:** automatic OpenBot Bot creation/synchronization or
+native push notifications. `GET /agents` and `GET /attention` expose the
+necessary status information, but OpenBot's authenticated registration and
+notification interfaces must be integrated and verified separately. A
+staging gateway alone does not populate the OpenBot sidebar.
