@@ -240,6 +240,24 @@ class BridgeTests(unittest.TestCase):
             self.bridge.persist_reply_images("OPENBOT_IMAGE: escape.png", outbox)
         self.assertFalse((root / "other" / "secret.png").exists())
 
+    def test_indented_image_declaration_is_embedded(self):
+        # Live Blog Desk output used two spaces before OPENBOT_IMAGE; the
+        # previous start-of-line-only parser silently left a raw filename.
+        outbox = Path(self.tmp.name) / "demo" / ".openbot-outbox" / "INDENT123"
+        outbox.mkdir(parents=True)
+        (outbox / "1-image.png").write_bytes(ONE_PIXEL_PNG)
+        reply = "Image copied.\n  OPENBOT_IMAGE: 1-image.png\n"
+        rendered = self.bridge.persist_reply_images(reply, outbox)
+        self.assertNotIn("OPENBOT_IMAGE:", rendered)
+        self.assertIn("![Screenshot](data:image/png;base64,", rendered)
+
+    def test_image_declaration_inside_code_indent_is_not_interpreted(self):
+        # A four-space Markdown code sample is not a delivery declaration.
+        outbox = Path(self.tmp.name) / "demo" / ".openbot-outbox" / "CODE123"
+        outbox.mkdir(parents=True)
+        reply = "Example:\n    OPENBOT_IMAGE: not-a-file.png"
+        self.assertEqual(self.bridge.persist_reply_images(reply, outbox), reply)
+
     def test_nul_character_has_distinct_error_and_is_not_submitted(self):
         status, body = self.request("POST", "/ag-ui", self.message("Hello\x00world"))
         self.assertEqual(status, 400)
