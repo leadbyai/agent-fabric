@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Authenticated AG-UI gateway to existing Herdr-managed coding agents.
 
-Version 0.7.0 supports long instructions and bidirectional image handoff,
-preserving FIFO queueing, correlation, recovery, and idempotency.
+Version 0.7.1 records every accepted request durably as `queued` before it
+waits, so a gateway restart or expired wait leaves a truthful `failed` record
+instead of a silently lost message, and strips inline data-URI images from the
+AG-UI history before parsing so screenshot-heavy chats stay under the limit.
+Version 0.7.0 added long instructions and bidirectional image handoff.
 Python standard library only. It does not launch, stop, or resume Herdr agents.
 """
 
@@ -16,6 +19,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import stat
 import subprocess
 import sys
@@ -52,6 +56,9 @@ LEDGER_PATH = os.environ.get("OPENBOT_BRIDGE_LEDGER_PATH", "").strip()
 LEDGER: RequestLedger | None = None
 HEARTBEAT_SECONDS = 15.0
 STATE_POLL_SECONDS = 2.0
+SHUTTING_DOWN = threading.Event()
+SHUTDOWN_GRACE_SECONDS = 5.0
+VERSION = "0.7.1"
 WORKDIR = os.environ.get("OPENBOT_BRIDGE_WORKDIR", "").strip()
 ALLOWED_ROOTS = tuple(s.strip() for s in
     os.environ.get("OPENBOT_BRIDGE_ALLOWED_ROOTS", "").split(":") if s.strip())
@@ -64,6 +71,11 @@ WAITING_SLOTS = threading.BoundedSemaphore(64)
 # OpenBot may inline up to 32 MiB of recent attachments; base64 plus history
 # makes a full AG-UI request larger than those original bytes.
 MAX_BODY = 64 * 1024 * 1024
+# Bytes on the wire before history data-URI images are stripped. Only the
+# stripped body (<= MAX_BODY) is ever held in memory.
+MAX_RAW_BODY = 512 * 1024 * 1024
+# Inline base64 images shorter than this are left untouched.
+DATA_URI_STRIP_MIN = 4096
 # The Herdr CLI prompt is an OS argument. Longer text is saved as a private
 # file for the agent to read, rather than being rejected or truncated.
 MAX_PROMPT_BYTES = 64 * 1024
@@ -88,6 +100,116 @@ ARTIFACT_RE = re.compile(r"/artifacts/([A-Za-z0-9_-]{32,64})\.(png|jpg|webp)\Z")
 
 class PayloadTooLarge(ValueError):
     """A safely bounded but too-large request, reported as HTTP 413."""
+
+
+class DataUriStripper:
+    """Streaming filter: drop large `data:image/...;base64,` payloads from JSON bytes.
+
+    OpenBot resends the whole conversation on every AG-UI run. Screenshots this
+    gateway returned inline (Markdown data-URI images in assistant messages)
+    would otherwise accumulate until every later turn in that chat hit the body
+    limit. The gateway only acts on the latest user turn, whose real attachments
+    arrive as AG-UI DataSource parts (bare base64, no `data:` prefix) and are not
+    touched. A long run is replaced with `OPENBOT_OMITTED`; JSON stays valid
+    because base64 characters and the JSON escape `\\/` never contain quotes.
+    Works across arbitrary chunk boundaries.
+    """
+    PREFIX = b"data:image"
+    HEADER = re.compile(rb"data:image(?:/|\\/)[A-Za-z0-9.+-]{1,40};base64,")
+    PARTIAL_HEADER = re.compile(rb"data:image(?:\\(?:/[A-Za-z0-9.+-]{0,40}(?:;(?:b(?:a(?:s(?:e(?:6(?:4)?)?)?)?)?)?)?)?|/[A-Za-z0-9.+-]{0,40}(?:;(?:b(?:a(?:s(?:e(?:6(?:4)?)?)?)?)?)?)?)?")
+    B64 = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+    PLACEHOLDER = b"OPENBOT_OMITTED"
+
+    def __init__(self, min_run: int = DATA_URI_STRIP_MIN):
+        self.min_run = min_run
+        self.buffer = b""
+        self.in_run = False
+        self.kept = bytearray()   # first bytes of the current run, until min_run
+        self.dropping = False
+        self.pending_escape = False
+        self.stripped = 0
+
+    def feed(self, data: bytes) -> bytes:
+        out = bytearray()
+        data = self.buffer + data
+        self.buffer = b""
+        i = 0
+        n = len(data)
+        while i < n:
+            if self.in_run:
+                if self.pending_escape:
+                    self.pending_escape = False
+                    if data[i] == 0x2F:  # JSON-escaped "/" inside base64
+                        self._run_byte(b"\\/", out)
+                        i += 1
+                        continue
+                    self._end_run(out)
+                    out += b"\\"
+                    continue
+                byte = data[i]
+                if byte in self.B64:
+                    self._run_byte(data[i:i + 1], out)
+                    i += 1
+                    continue
+                if byte == 0x5C:  # backslash: may start "\/"
+                    self.pending_escape = True
+                    i += 1
+                    continue
+                self._end_run(out)
+                continue
+            j = data.find(self.PREFIX, i)
+            if j < 0:
+                # Keep a tail that could be the start of a split prefix.
+                keep = max(i, n - (len(self.PREFIX) - 1))
+                out += data[i:keep]
+                self.buffer = data[keep:]
+                return bytes(out)
+            out += data[i:j]
+            match = self.HEADER.match(data, j)
+            if match is None:
+                if self.PARTIAL_HEADER.fullmatch(data, j):
+                    # Header may be split across chunks; wait for more bytes.
+                    self.buffer = data[j:]
+                    return bytes(out)
+                out += data[j:j + 1]
+                i = j + 1
+                continue
+            out += match.group(0)
+            i = match.end()
+            self.in_run = True
+            self.kept = bytearray()
+            self.dropping = False
+        return bytes(out)
+
+    def _run_byte(self, piece: bytes, out: bytearray) -> None:
+        if self.dropping:
+            return
+        self.kept += piece
+        if len(self.kept) >= self.min_run:
+            self.dropping = True
+            self.stripped += 1
+            self.kept = bytearray()
+            out += self.PLACEHOLDER
+
+    def _end_run(self, out: bytearray) -> None:
+        if not self.dropping:
+            out += self.kept
+        self.kept = bytearray()
+        self.in_run = False
+        self.dropping = False
+
+    def finish(self) -> bytes:
+        out = bytearray()
+        if self.in_run:
+            if self.pending_escape:
+                self.pending_escape = False
+                self._end_run(out)
+                out += b"\\"
+            else:
+                self._end_run(out)
+        out += self.buffer
+        self.buffer = b""
+        return bytes(out)
 OPENBOT_TEXT_FILE = re.compile(r'\AAttached file "([^"\r\n]{1,160})":\r?\n\r?\n([\s\S]*)\Z')
 TEXT_MIMES = {
     ".csv": "text/csv",
@@ -651,7 +773,7 @@ def normalize_prose_wrapping(text: str) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "OpenBotHerdrBridge/0.7.0"
+    server_version = f"OpenBotHerdrBridge/{VERSION}"
 
     def log_message(self, format_string: str, *args: object) -> None:
         # Deliberately never logs request bodies, authorization, or agent output.
@@ -674,7 +796,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path == "/health":
-            self.json_response(200, {"ok": True, "version": "0.7.0", "mode": "multi-agent",
+            self.json_response(200, {"ok": True, "version": VERSION, "mode": "multi-agent",
                                      "busy_wait_enabled": BUSY_WAIT_SECONDS > 0})
             return
         # Public capability links do not carry the gateway's broad bearer
@@ -727,6 +849,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_response(404, {"error": "not_found"})
             else:
                 self.json_response(200, {"id": key, "state": record["state"],
+                                         "reason": record.get("reason"),
+                                         "queued_at": record.get("queued_at"),
+                                         "updated_at": record["updated_at"],
                                          "reply": record["reply"] if record["state"] == "finished" else None})
             return
         if path in ("/agents", "/attention"):
@@ -744,9 +869,12 @@ class Handler(BaseHTTPRequestHandler):
                                                     if a["status"] == "blocked"],
                                          "offline_sessions": [s["name"] for s in sessions
                                                               if not s["online"]],
-                                         "unresolved_requests": LEDGER.unresolved() if LEDGER else []})
+                                         "unresolved_requests": LEDGER.unresolved() if LEDGER else [],
+                                         "queued_requests": LEDGER.queued() if LEDGER else [],
+                                         "recent_failed_requests":
+                                             LEDGER.recent_failures() if LEDGER else []})
             else:
-                self.json_response(200, {"version": "0.7.0", "sessions": sessions})
+                self.json_response(200, {"version": VERSION, "sessions": sessions})
             return
         if path == "/agent" and TARGET:
             try:
@@ -855,16 +983,37 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(min(STATE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
 
     def read_request_body(self) -> bytes:
-        """Read bounded JSON bodies using Content-Length or HTTP chunked framing."""
+        """Read bounded JSON bodies using Content-Length or HTTP chunked framing.
+
+        Wire bytes are bounded by MAX_RAW_BODY and streamed through
+        DataUriStripper; only the stripped body (<= MAX_BODY) is kept.
+        """
         encoding = self.headers.get("Transfer-Encoding", "").strip().lower()
         content_length = self.headers.get("Content-Length")
         self.log_message("AGUI request framing: Content-Length=%r Transfer-Encoding=%r Limit=%d",
                          content_length, encoding, MAX_BODY)
         self.connection.settimeout(30)
+        stripper = DataUriStripper()
+        kept: list[bytes] = []
+        kept_total = 0
+
+        def keep(piece: bytes) -> None:
+            nonlocal kept_total
+            kept_total += len(piece)
+            if kept_total > MAX_BODY:
+                raise PayloadTooLarge("Request exceeds the 64 MiB AG-UI limit")
+            kept.append(piece)
+
+        def done() -> bytes:
+            keep(stripper.finish())
+            if stripper.stripped:
+                self.log_message("AGUI history: omitted %d inline data-URI image(s)",
+                                 stripper.stripped)
+            return b"".join(kept)
+
         if encoding:
             if encoding != "chunked" or content_length is not None:
                 raise ValueError("Unsupported or ambiguous request framing")
-            chunks: list[bytes] = []
             total = 0
             while True:
                 length_line = self.rfile.readline(1025)
@@ -874,7 +1023,7 @@ class Handler(BaseHTTPRequestHandler):
                     size = int(length_line.split(b";", 1)[0].strip(), 16)
                 except ValueError:
                     raise ValueError("Invalid chunk size") from None
-                if size < 0 or total + size > MAX_BODY:
+                if size < 0 or total + size > MAX_RAW_BODY:
                     raise PayloadTooLarge("Request exceeds the 64 MiB AG-UI limit")
                 if size == 0:
                     # Consume permitted trailers so the framing stays well-formed.
@@ -885,25 +1034,34 @@ class Handler(BaseHTTPRequestHandler):
                         if not trailer or len(trailer) > 1024 or trailer_bytes > 8192:
                             raise ValueError("Invalid request trailers")
                         if trailer in (b"\r\n", b"\n"):
-                            return b"".join(chunks)
-                chunk = self.rfile.read(size)
-                if len(chunk) != size or self.rfile.read(2) != b"\r\n":
+                            return done()
+                remaining = size
+                while remaining:
+                    piece = self.rfile.read(min(remaining, 1024 * 1024))
+                    if not piece:
+                        raise ValueError("Truncated or malformed request chunk")
+                    remaining -= len(piece)
+                    keep(stripper.feed(piece))
+                if self.rfile.read(2) != b"\r\n":
                     raise ValueError("Truncated or malformed request chunk")
                 total += size
-                chunks.append(chunk)
 
         try:
             size = int(content_length or "0")
         except ValueError:
             raise ValueError("Invalid Content-Length") from None
-        if size > MAX_BODY:
+        if size > MAX_RAW_BODY:
             raise PayloadTooLarge("Request exceeds the 64 MiB AG-UI limit")
         if size <= 0:
             raise ValueError("Invalid request size")
-        data = self.rfile.read(size)
-        if len(data) != size:
-            raise ValueError("Incomplete request body")
-        return data
+        remaining = size
+        while remaining:
+            piece = self.rfile.read(min(remaining, 1024 * 1024))
+            if not piece:
+                raise ValueError("Incomplete request body")
+            remaining -= len(piece)
+            keep(stripper.feed(piece))
+        return done()
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path.rstrip("/")
@@ -914,6 +1072,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self.authorized():
             self.json_response(401, {"error": "unauthorized"})
+            return
+        if SHUTTING_DOWN.is_set():
+            self.json_response(503, {"error": "Gateway is restarting; no prompt submitted. Resend shortly.",
+                                     "code": "gateway_restarting"})
             return
         if match:
             session, requested_pane = match.groups()
@@ -972,7 +1134,7 @@ class Handler(BaseHTTPRequestHandler):
         input_digest = LEDGER.fingerprint(user_text, attachments) if LEDGER else ""
         if LEDGER:
             previous = LEDGER.get(request_key)
-            if previous:
+            if previous and previous["state"] != "failed":
                 if previous["fingerprint"] != input_digest:
                     self.json_response(409, {"error": "Run identifier reused with different content"})
                     return
@@ -981,7 +1143,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_reply(msg_id, thread_id, run_id, previous["reply"] or "")
                 else:
                     self.send_event({"type": "RUN_ERROR", "message":
-                                     f"Request {request_key} was already submitted or is uncertain. "
+                                     f"Request {request_key} is already {previous['state']}. "
                                      "No duplicate prompt sent. Inspect Herdr or check /requests/ID."})
                 return
 
@@ -1006,9 +1168,16 @@ class Handler(BaseHTTPRequestHandler):
         have_slot = not wait_enabled
         stream_started = False
         ledger_reserved = False
+        ledger_queued = False
+        fail_reason = "not_submitted"
         queue_ticket: object | None = None
         pane_queue = waiting_queue(session, pane_id) if wait_enabled else None
         last_progress = 0.0
+
+        def check_shutdown() -> None:
+            if SHUTTING_DOWN.is_set():
+                raise RuntimeError("Gateway is restarting; this queued request was not submitted. "
+                                   "Please resend it.")
 
         def progress_if_due(state: str) -> None:
             nonlocal last_progress
@@ -1021,6 +1190,24 @@ class Handler(BaseHTTPRequestHandler):
             if wait_enabled:
                 self.start_stream(thread_id, run_id)
                 stream_started = True
+                if LEDGER:
+                    try:
+                        queued = LEDGER.enqueue(request_key, session, pane_id,
+                                                input_digest, marker_id)
+                    except ValueError as exc:
+                        raise RuntimeError(str(exc)) from exc
+                    if not queued["created"]:
+                        # A concurrent identical run owns this key.
+                        if queued["state"] == "finished":
+                            self.send_reply(msg_id, thread_id, run_id, queued["reply"] or "")
+                        else:
+                            self.send_event({"type": "RUN_ERROR", "message":
+                                             f"Request {request_key} is already {queued['state']}. "
+                                             "No duplicate prompt sent."})
+                        return
+                    ledger_queued = True
+                    self.send_event({"type": "CUSTOM", "name": "agent-fabric.request",
+                                     "value": {"id": request_key, "state": "queued"}})
                 deadline = time.monotonic() + BUSY_WAIT_SECONDS
                 # Explicit FIFO: lock acquisition alone is not guaranteed fair.
                 queue_ticket = object()
@@ -1036,6 +1223,7 @@ class Handler(BaseHTTPRequestHandler):
                             break
                     if time.monotonic() >= deadline:
                         raise RuntimeError("Agent is still busy; waiting expired. No prompt submitted.")
+                    check_shutdown()
                     progress_if_due("queued")
                     time.sleep(min(STATE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
 
@@ -1055,6 +1243,7 @@ class Handler(BaseHTTPRequestHandler):
             while wait_enabled and state == "working":
                 if time.monotonic() >= deadline:
                     raise RuntimeError("Agent is still working; waiting expired. No prompt submitted.")
+                check_shutdown()
                 progress_if_due("queued")
                 time.sleep(min(STATE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
                 current_agent = agent_record(session, pane_id)
@@ -1072,6 +1261,7 @@ class Handler(BaseHTTPRequestHandler):
                 while not GLOBAL_SLOTS.acquire(blocking=False):
                     if time.monotonic() >= deadline:
                         raise RuntimeError("Bridge is still at capacity; waiting expired. No prompt submitted.")
+                    check_shutdown()
                     progress_if_due("waiting_for_capacity")
                     time.sleep(min(STATE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
                 have_slot = True
@@ -1130,6 +1320,8 @@ class Handler(BaseHTTPRequestHandler):
                 "special reply formatting is needed. This is optional; never claim a "
                 "screenshot was attached unless you saved the image. Keep the response concise."
             )
+            if wait_enabled:
+                check_shutdown()
             if LEDGER:
                 try:
                     reserved = LEDGER.reserve(request_key, session, pane_id,
@@ -1154,6 +1346,7 @@ class Handler(BaseHTTPRequestHandler):
                 ledger_reserved = False
             self.send_reply(msg_id, thread_id, run_id, response)
         except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+            fail_reason = str(exc) or type(exc).__name__
             # A protocol run failure is not proof the Herdr prompt was not sent.
             if ledger_reserved and LEDGER:
                 LEDGER.uncertain(request_key)
@@ -1162,10 +1355,17 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
         except (BrokenPipeError, ConnectionResetError):
+            fail_reason = "client_disconnected_before_submit"
             if ledger_reserved and LEDGER:
                 LEDGER.uncertain(request_key)
             pass
         finally:
+            if ledger_queued and LEDGER:
+                # No-op unless the row is still 'queued' (never submitted).
+                try:
+                    LEDGER.fail(request_key, fail_reason)
+                except Exception as exc:  # noqa: BLE001 - startup recovery still covers it
+                    self.log_message("ledger fail() error: %s", type(exc).__name__)
             if queue_ticket is not None and pane_queue is not None:
                 with WAIT_QUEUES_GUARD:
                     pane_queue.remove(queue_ticket)
@@ -1207,6 +1407,10 @@ def main() -> None:
     if LEDGER_PATH:
         os.umask(0o077)
         LEDGER = RequestLedger(LEDGER_PATH)
+        abandoned = LEDGER.fail_abandoned_queue()
+        if abandoned:
+            print(f"Ledger: marked {abandoned} request(s) failed "
+                  "(queued at previous shutdown, never submitted)", flush=True)
         LEDGER.trim_finished()
     if ARTIFACT_DIR:
         directory = Path(ARTIFACT_DIR)
@@ -1226,6 +1430,32 @@ def main() -> None:
     if ARTIFACT_STORAGE_BYTES < MAX_FILE_SIZE:
         sys.exit("OPENBOT_BRIDGE_ARTIFACT_STORAGE_BYTES must allow at least one screenshot")
     server = ThreadingHTTPServer((HOST, PORT), Handler)
+
+    def on_sigterm(signum: int, frame: object) -> None:
+        # Tell queued waiters (they answer RUN_ERROR + ledger 'failed'), refuse
+        # new runs, then stop. Requests already submitted are unaffected by this
+        # and remain 'submitted' in the ledger, exactly as before.
+        if SHUTTING_DOWN.is_set():
+            return
+        SHUTTING_DOWN.set()
+        print("Shutdown requested: refusing new runs, releasing queued requests", flush=True)
+
+        def stop() -> None:
+            deadline = time.monotonic() + SHUTDOWN_GRACE_SECONDS
+            while time.monotonic() < deadline:
+                if LEDGER is not None:
+                    if not LEDGER.queued():
+                        break
+                else:
+                    with WAIT_QUEUES_GUARD:
+                        if not any(WAIT_QUEUES.values()):
+                            break
+                time.sleep(0.1)
+            server.shutdown()
+
+        threading.Thread(target=stop, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, on_sigterm)
     print(f"Bridge ready on http://{HOST}:{PORT}/agents | "
           f"sessions={','.join(SESSIONS)} | legacy_target={TARGET or 'disabled'}", flush=True)
     try:
