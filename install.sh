@@ -3,9 +3,9 @@
 # Does NOT modify any existing Herdr session or openbot-herdr-pilot.service.
 set -euo pipefail
 
-RELEASE_VERSION="v0.5.0"
+RELEASE_VERSION="v0.5.1"
 RELEASE_URL="https://raw.githubusercontent.com/leadbyai/agent-fabric/${RELEASE_VERSION}"
-BRIDGE_SHA256="7f7e87a210c23018d9a7e6b82d244bd27117280438ca81cd910eeee19c8db52b"
+BRIDGE_SHA256="fae6cb09f3bfece64559b85db64a95136df7f23a50be356041dcd91446639680"
 RUN_USER=""
 HERDR_SESSIONS=""
 UPLOAD_ROOTS=""
