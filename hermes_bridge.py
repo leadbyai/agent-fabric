@@ -50,8 +50,13 @@ def env_config() -> dict:
     token_file = os.environ.get("OPENBOT_BRIDGE_TOKEN_FILE", "").strip()
     if token_file and not token:
         token = Path(token_file).read_text(encoding="utf-8").strip()
+    token_sha256 = os.environ.get("OPENBOT_BRIDGE_TOKEN_SHA256", "").strip().lower()
+    sha_file = os.environ.get("OPENBOT_BRIDGE_TOKEN_SHA256_FILE", "").strip()
+    if sha_file and not token_sha256:
+        token_sha256 = Path(sha_file).read_text(encoding="utf-8").strip().lower()
     return {
         "token": token,
+        "token_sha256": token_sha256,
         "host": os.environ.get("OPENBOT_BRIDGE_HOST", "127.0.0.1").strip(),
         "port": int(os.environ.get("OPENBOT_BRIDGE_PORT", "8767")),
         "hermes_home": os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")).strip(),
@@ -106,6 +111,21 @@ class HermesLedger(RequestLedger):
                 ON CONFLICT(profile_id, thread_id) DO UPDATE SET session_id=excluded.session_id,
                   origin=excluded.origin
             """, (profile_id, thread_id, session_id, origin, int(time.time())))
+
+
+def bearer_ok(header: str, config: dict) -> bool:
+    """Timing-safe bearer check. With a hash-only config the bridge never holds the token itself:
+    it compares SHA-256 of the presented bearer with the stored hex digest."""
+    import hmac
+    if not header.startswith("Bearer ") or len(header) > 4096:
+        return False
+    presented = header[len("Bearer "):]
+    expected_hash = config.get("token_sha256") or ""
+    if expected_hash:
+        digest = hashlib.sha256(presented.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(digest, expected_hash)
+    token = config.get("token") or ""
+    return bool(token) and hmac.compare_digest(presented, token)
 
 
 def stable_id(*parts: str, length: int = 32) -> str:
@@ -318,9 +338,7 @@ class HermesHandler(bridge.Handler):
     ledger: HermesLedger | None = None
 
     def authorized(self) -> bool:
-        import hmac
-        return bool(self.config.get("token")) and hmac.compare_digest(
-            self.headers.get("Authorization", ""), "Bearer " + self.config["token"])
+        return bearer_ok(self.headers.get("Authorization", ""), self.config)
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
@@ -431,8 +449,14 @@ class HermesHandler(bridge.Handler):
 
 def main() -> None:
     config = env_config()
-    if not config["token"] or len(config["token"]) < 24:
-        sys.exit("Set OPENBOT_BRIDGE_TOKEN(_FILE) to a random secret of at least 24 characters")
+    if config["token_sha256"]:
+        if config["token"]:
+            sys.exit("Configure either a token or a token SHA-256, not both")
+        if not re.fullmatch(r"[0-9a-f]{64}", config["token_sha256"]):
+            sys.exit("OPENBOT_BRIDGE_TOKEN_SHA256(_FILE) must be a 64-character hex SHA-256")
+    elif not config["token"] or len(config["token"]) < 24:
+        sys.exit("Set OPENBOT_BRIDGE_TOKEN(_FILE) to a random secret of at least 24 characters, "
+                 "or OPENBOT_BRIDGE_TOKEN_SHA256(_FILE) to the SHA-256 of one")
     try:
         check_bind_host(config["host"])
     except ValueError as exc:

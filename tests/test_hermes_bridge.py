@@ -245,6 +245,28 @@ class HermesBridgeTests(unittest.TestCase):
         self.assertEqual(self.gateway.sessions["NATIVE"], ["hi"])
         self.assertEqual(self.gateway.created, 0)
 
+    def test_hash_only_bearer(self):
+        import hashlib
+        real = "r" * 43
+        config = {"token": "", "token_sha256": hashlib.sha256(real.encode()).hexdigest()}
+        self.assertTrue(hermes_bridge.bearer_ok("Bearer " + real, config))
+        self.assertFalse(hermes_bridge.bearer_ok("Bearer " + real + "x", config))
+        self.assertFalse(hermes_bridge.bearer_ok("", config))
+        self.assertFalse(hermes_bridge.bearer_ok(real, config))  # missing "Bearer "
+        self.assertFalse(hermes_bridge.bearer_ok("Bearer " + config["token_sha256"], config))  # the hash is not the token
+        self.assertFalse(hermes_bridge.bearer_ok("Bearer anything", {"token": "", "token_sha256": ""}))
+
+    def test_hash_only_config_over_http(self):
+        import hashlib
+        real = "s" * 43
+        self.server.RequestHandlerClass.config = {**self.server.RequestHandlerClass.config,
+                                                  "token": "", "token_sha256": hashlib.sha256(real.encode()).hexdigest()}
+        self.assertEqual(self.request("GET", "/agents", token=real)[0], 200)
+        self.assertEqual(self.request("GET", "/agents", token=TOKEN)[0], 401)
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        conn.request("GET", "/agents")
+        self.assertEqual(conn.getresponse().status, 401)
+
     def test_bind_host_policy(self):
         hermes_bridge.check_bind_host("127.0.0.1")
         hermes_bridge.check_bind_host("100.100.1.2")

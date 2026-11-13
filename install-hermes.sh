@@ -5,7 +5,8 @@
 # touches Hermes config, credentials, sessions or cron jobs.
 #
 #   bash install-hermes.sh --source-dir DIR --profiles NAME[,NAME] --bind IP [--port 8767]
-#        [--hermes-home ~/.hermes] [--hermes-agent-dir DIR] [--python PATH] [--token-file PATH]
+#        [--hermes-home ~/.hermes] [--hermes-agent-dir DIR] [--python PATH]
+#        [--token-sha256 HEX | --token-file PATH]   # hash-only: the bridge never stores the token
 #        [--timeout-seconds 900] [--no-start]
 #   bash install-hermes.sh --uninstall        # rollback: stop, disable and remove the unit and files
 set -euo pipefail
@@ -16,19 +17,19 @@ CONF_DIR="$HOME/.config/agent-fabric-hermes"
 STATE_DIR="$HOME/.local/state/agent-fabric-hermes"
 UNIT_DIR="$HOME/.config/systemd/user"
 SOURCE_DIR=""; PROFILES=""; BIND=""; PORT="8767"; HERMES_HOME_DIR="$HOME/.hermes"
-AGENT_DIR=""; PY=""; TOKEN_SOURCE=""; TIMEOUT_SECONDS="900"; SKIP_START=0; UNINSTALL=0
+AGENT_DIR=""; PY=""; TOKEN_SOURCE=""; TOKEN_SHA256=""; TIMEOUT_SECONDS="900"; SKIP_START=0; UNINSTALL=0
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,12p' "$0"; }
 
 while (($#)); do
   case "$1" in
-    --source-dir|--profiles|--bind|--port|--hermes-home|--hermes-agent-dir|--python|--token-file|--timeout-seconds)
+    --source-dir|--profiles|--bind|--port|--hermes-home|--hermes-agent-dir|--python|--token-file|--token-sha256|--timeout-seconds)
       (($# >= 2)) || die "Missing value for $1"
       case "$1" in
         --source-dir) SOURCE_DIR="$2" ;; --profiles) PROFILES="$2" ;; --bind) BIND="$2" ;;
         --port) PORT="$2" ;; --hermes-home) HERMES_HOME_DIR="$2" ;; --hermes-agent-dir) AGENT_DIR="$2" ;;
-        --python) PY="$2" ;; --token-file) TOKEN_SOURCE="$2" ;; --timeout-seconds) TIMEOUT_SECONDS="$2" ;;
+        --python) PY="$2" ;; --token-file) TOKEN_SOURCE="$2" ;; --token-sha256) TOKEN_SHA256="$2" ;; --timeout-seconds) TIMEOUT_SECONDS="$2" ;;
       esac
       shift 2 ;;
     --no-start) SKIP_START=1; shift ;;
@@ -56,6 +57,8 @@ fi
 [[ "$PROFILES" =~ ^[a-z0-9][a-z0-9_-]{0,63}(,[a-z0-9][a-z0-9_-]{0,63})*$ ]] || die "Invalid --profiles"
 [[ "$PORT" =~ ^[0-9]{4,5}$ ]] && ((PORT >= 1024 && PORT <= 65535)) || die "Invalid --port"
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]{2,4}$ ]] && ((TIMEOUT_SECONDS >= 30 && TIMEOUT_SECONDS <= 3600)) || die "Invalid --timeout-seconds"
+[[ -z "$TOKEN_SHA256" || -z "$TOKEN_SOURCE" ]] || die "Use --token-sha256 or --token-file, not both"
+[[ -z "$TOKEN_SHA256" || "$TOKEN_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--token-sha256 must be 64 lowercase hex characters"
 [[ "$BIND" =~ ^[0-9.]+$ ]] || die "--bind must be an IPv4 address (127.0.0.1 or this host's Tailscale address)"
 if [[ "$BIND" != "127.0.0.1" ]]; then
   ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 | grep -qx "$BIND" || die "--bind $BIND is not an address of this host"
@@ -94,13 +97,22 @@ install -d -m 0700 "$APP_DIR" "$CONF_DIR" "$STATE_DIR" "$UNIT_DIR"
 for file in hermes_bridge.py bridge.py request_ledger.py; do
   install -m 0600 "$SOURCE_DIR/$file" "$APP_DIR/$file"
 done
-if [[ -n "$TOKEN_SOURCE" ]]; then
-  [[ -f "$TOKEN_SOURCE" ]] || die "Token file does not exist"
-  install -m 0600 "$TOKEN_SOURCE" "$CONF_DIR/bridge.token"
-elif [[ ! -s "$CONF_DIR/bridge.token" ]]; then
-  "$PY" -E -s -c 'import secrets; print(secrets.token_urlsafe(48))' > "$CONF_DIR/bridge.token"
+if [[ -n "$TOKEN_SHA256" ]]; then
+  printf '%s\n' "$TOKEN_SHA256" > "$CONF_DIR/bridge.token.sha256"
+  chmod 0600 "$CONF_DIR/bridge.token.sha256"
+  if [[ -f "$CONF_DIR/bridge.token" ]]; then shred -u "$CONF_DIR/bridge.token"; fi
+  TOKEN_ENV="OPENBOT_BRIDGE_TOKEN_SHA256_FILE=$CONF_DIR/bridge.token.sha256"
+else
+  if [[ -n "$TOKEN_SOURCE" ]]; then
+    [[ -f "$TOKEN_SOURCE" ]] || die "Token file does not exist"
+    install -m 0600 "$TOKEN_SOURCE" "$CONF_DIR/bridge.token"
+  elif [[ ! -s "$CONF_DIR/bridge.token" ]]; then
+    "$PY" -E -s -c 'import secrets; print(secrets.token_urlsafe(48))' > "$CONF_DIR/bridge.token"
+  fi
+  chmod 0600 "$CONF_DIR/bridge.token"
+  rm -f "$CONF_DIR/bridge.token.sha256"
+  TOKEN_ENV="OPENBOT_BRIDGE_TOKEN_FILE=$CONF_DIR/bridge.token"
 fi
-chmod 0600 "$CONF_DIR/bridge.token"
 
 cat > "$UNIT_DIR/$UNIT" <<EOF
 # Managed by agent-fabric install-hermes.sh. Additive: does not manage the Hermes gateway.
@@ -115,7 +127,7 @@ Environment=HERMES_AGENT_DIR=$AGENT_DIR
 Environment=HERMES_PROFILES=$PROFILES
 Environment=OPENBOT_BRIDGE_HOST=$BIND
 Environment=OPENBOT_BRIDGE_PORT=$PORT
-Environment=OPENBOT_BRIDGE_TOKEN_FILE=$CONF_DIR/bridge.token
+Environment=$TOKEN_ENV
 Environment=OPENBOT_BRIDGE_LEDGER_PATH=$STATE_DIR/ledger.sqlite3
 Environment=OPENBOT_BRIDGE_TIMEOUT_SECONDS=$TIMEOUT_SECONDS
 Environment=HERMES_APPROVAL_WAIT_SECONDS=0
@@ -137,7 +149,8 @@ if ((SKIP_START)); then
   printf 'Prepared. Start with: systemctl --user enable --now %s\n' "$UNIT"
   exit 0
 fi
-systemctl --user enable --now "$UNIT"
+systemctl --user enable "$UNIT"
+systemctl --user restart "$UNIT"
 for _ in $(seq 1 20); do
   if curl -fsS -m 3 "http://$BIND:$PORT/health" >/dev/null 2>&1; then
     printf 'Agent Fabric Hermes bridge healthy on %s:%s. Rollback: bash install-hermes.sh --uninstall\n' "$BIND" "$PORT"
