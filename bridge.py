@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Authenticated AG-UI gateway to existing Herdr-managed coding agents.
 
-Version 0.5.0 adds per-session/per-pane routes and live agent discovery while
-preserving the tested v0.4.2 /ag-ui demo route and text-file reconstruction.
+Version 0.5.1 adds conservative prose reflow to improve OpenBot readability
+while preserving the tested v0.5.0 per-agent routes and file reconstruction.
 Python standard library only. It does not launch, stop, or resume Herdr agents.
 """
 
@@ -406,8 +406,75 @@ def extract_reply(transcript: str, marker_id: str) -> str:
     return text
 
 
+def normalize_prose_wrapping(text: str) -> str:
+    """Undo apparent terminal-style wrapping in ordinary prose only.
+
+    Herdr may return literal newlines in what is visually one paragraph. OpenBot
+    then wraps those already-broken lines again. Only reflow sufficiently long,
+    clearly prose-like runs; keep Markdown layout and ambiguous text verbatim.
+    """
+    if "\n" not in text:
+        return text
+
+    structural = re.compile(
+        r"^(?:\s{0,3}(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|>\s?|(?:-{3,}|\*{3,}|_{3,})\s*$)"
+        r"|\s{0,3}(?:\|.*\||<[/!A-Za-z]|::\s*$|\d{4}-\d{2}-\d{2}\s)"
+        r"|\s{0,3}(?:sudo |\$ |>>> |curl |git |python\d? |systemctl )|\s{4,}|\t)"
+    )
+    speaker = re.compile(r'^\s{0,3}[A-Z][\w .-]{0,24}:\s')
+    fence = re.compile(r'^\s{0,3}(`{3,}|~{3,})')
+    output: list[str] = []
+    pending: list[str] = []
+    fence_char = ""
+    fence_length = 0
+    in_structured_block = False
+
+    def flush() -> None:
+        if (len(pending) > 1 and len(pending[0]) >= 60 and
+                all(len(re.findall(r"[A-Za-z]+", line)) >= 4 for line in pending)):
+            output.append(" ".join(line.strip() for line in pending))
+        else:
+            output.extend(pending)
+        pending.clear()
+
+    for line in text.split("\n"):
+        trimmed = line.strip()
+        marker = fence.match(line)
+        if fence_char:
+            output.append(line)
+            if marker and marker.group(1)[0] == fence_char and len(marker.group(1)) >= fence_length:
+                fence_char = ""
+            continue
+        if marker:
+            flush()
+            fence_char, fence_length = marker.group(1)[0], len(marker.group(1))
+            output.append(line)
+            continue
+        if not trimmed:
+            flush()
+            output.append(line)
+            in_structured_block = False
+            continue
+        if (in_structured_block or structural.match(line) or speaker.match(line) or
+                trimmed.endswith(":") or line.endswith(("  ", "\\")) or
+                any(c in line for c in "{}") or
+                len(re.findall(r"[A-Za-z]+", line)) < 4):
+            flush()
+            output.append(line)
+            if structural.match(line) and re.match(r'^\s{0,3}(?:[-*+]\s|\d+[.)]\s)', line):
+                in_structured_block = True
+            continue
+        if pending and re.search(r'[.!?]["\']?$', pending[-1].strip()) and trimmed[:1].isupper():
+            # A standalone sentence followed by another capitalized line may
+            # be an intentional paragraph break without an empty line.
+            flush()
+        pending.append(line)
+    flush()
+    return "\n".join(output)
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "OpenBotHerdrBridge/0.5.0"
+    server_version = "OpenBotHerdrBridge/0.5.1"
 
     def log_message(self, format_string: str, *args: object) -> None:
         # Deliberately never logs request bodies, authorization, or agent output.
@@ -430,7 +497,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path == "/health":
-            self.json_response(200, {"ok": True, "version": "0.5.0", "mode": "multi-agent"})
+            self.json_response(200, {"ok": True, "version": "0.5.1", "mode": "multi-agent"})
             return
         if not self.authorized():
             self.json_response(401, {"error": "unauthorized"})
@@ -451,7 +518,7 @@ class Handler(BaseHTTPRequestHandler):
                                          "offline_sessions": [s["name"] for s in sessions
                                                               if not s["online"]]})
             else:
-                self.json_response(200, {"version": "0.5.0", "sessions": sessions})
+                self.json_response(200, {"version": "0.5.1", "sessions": sessions})
             return
         if path == "/agent" and TARGET:
             try:
@@ -639,7 +706,7 @@ class Handler(BaseHTTPRequestHandler):
                                  "--source", "recent-unwrapped", "--lines", "200",
                                  session=session,
                                  wait_seconds=30)
-            response = extract_reply(transcript, marker_id)
+            response = normalize_prose_wrapping(extract_reply(transcript, marker_id))
             self.send_event({"type": "TEXT_MESSAGE_START", "messageId": msg_id,
                              "role": "assistant"})
             self.send_event({"type": "TEXT_MESSAGE_CONTENT", "messageId": msg_id,
