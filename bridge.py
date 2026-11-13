@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Authenticated AG-UI gateway to existing Herdr-managed coding agents.
 
-Version 0.5.1 adds conservative prose reflow to improve OpenBot readability
-while preserving the tested v0.5.0 per-agent routes and file reconstruction.
+Version 0.6.0 adds opt-in busy-agent waiting and streamed liveness signals,
+preserving v0.5.1 formatting and v0.5.0 per-agent/file behavior.
 Python standard library only. It does not launch, stop, or resume Herdr agents.
 """
 
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from collections import deque
 import hmac
 import json
 import os
@@ -18,10 +19,14 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
+
+from request_ledger import RequestLedger
 
 
 TARGET = os.environ.get("HERDR_AGENT_TARGET", "").strip()
@@ -40,12 +45,21 @@ if TOKEN_FILE and not TOKEN:
 HOST = os.environ.get("OPENBOT_BRIDGE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("OPENBOT_BRIDGE_PORT", "8765"))
 TIMEOUT_MS = int(os.environ.get("OPENBOT_BRIDGE_TIMEOUT_MS", "120000"))
+BUSY_WAIT_SECONDS = int(os.environ.get("OPENBOT_BRIDGE_BUSY_WAIT_SECONDS", "0"))
+RECOVERY_SECONDS = int(os.environ.get("OPENBOT_BRIDGE_RECOVERY_SECONDS", "0"))
+LEDGER_PATH = os.environ.get("OPENBOT_BRIDGE_LEDGER_PATH", "").strip()
+LEDGER: RequestLedger | None = None
+HEARTBEAT_SECONDS = 15.0
+STATE_POLL_SECONDS = 2.0
 WORKDIR = os.environ.get("OPENBOT_BRIDGE_WORKDIR", "").strip()
 ALLOWED_ROOTS = tuple(s.strip() for s in
     os.environ.get("OPENBOT_BRIDGE_ALLOWED_ROOTS", "").split(":") if s.strip())
 AGENT_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 LOCKS_GUARD = threading.Lock()
+WAIT_QUEUES: dict[tuple[str, str], deque[object]] = {}
+WAIT_QUEUES_GUARD = threading.Lock()
 GLOBAL_SLOTS = threading.BoundedSemaphore(8)
+WAITING_SLOTS = threading.BoundedSemaphore(64)
 MAX_BODY = 24 * 1024 * 1024
 MAX_PROMPT = 4000
 MAX_FILE_SIZE = 8 * 1024 * 1024
@@ -147,6 +161,14 @@ def target_lock(session: str, pane_id: str) -> threading.Lock:
         if key not in AGENT_LOCKS:
             AGENT_LOCKS[key] = threading.Lock()
         return AGENT_LOCKS[key]
+
+
+def waiting_queue(session: str, pane_id: str) -> deque[object]:
+    key = (session, pane_id)
+    with WAIT_QUEUES_GUARD:
+        if key not in WAIT_QUEUES:
+            WAIT_QUEUES[key] = deque()
+        return WAIT_QUEUES[key]
 
 
 def last_user_text(body: dict) -> str:
@@ -474,7 +496,7 @@ def normalize_prose_wrapping(text: str) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "OpenBotHerdrBridge/0.5.1"
+    server_version = "OpenBotHerdrBridge/0.6.0"
 
     def log_message(self, format_string: str, *args: object) -> None:
         # Deliberately never logs request bodies, authorization, or agent output.
@@ -497,10 +519,23 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path == "/health":
-            self.json_response(200, {"ok": True, "version": "0.5.1", "mode": "multi-agent"})
+            self.json_response(200, {"ok": True, "version": "0.6.0", "mode": "multi-agent",
+                                     "busy_wait_enabled": BUSY_WAIT_SECONDS > 0})
             return
         if not self.authorized():
             self.json_response(401, {"error": "unauthorized"})
+            return
+        if path.startswith("/requests/") and LEDGER is not None:
+            key = path.removeprefix("/requests/")
+            if not re.fullmatch(r"[a-f0-9]{64}", key):
+                self.json_response(404, {"error": "not_found"})
+                return
+            record = LEDGER.get(key)
+            if record is None:
+                self.json_response(404, {"error": "not_found"})
+            else:
+                self.json_response(200, {"id": key, "state": record["state"],
+                                         "reply": record["reply"] if record["state"] == "finished" else None})
             return
         if path in ("/agents", "/attention"):
             sessions = []
@@ -516,9 +551,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_response(200, {"blocked": [a for s in sessions for a in s["agents"]
                                                     if a["status"] == "blocked"],
                                          "offline_sessions": [s["name"] for s in sessions
-                                                              if not s["online"]]})
+                                                              if not s["online"]],
+                                         "unresolved_requests": LEDGER.unresolved() if LEDGER else []})
             else:
-                self.json_response(200, {"version": "0.5.1", "sessions": sessions})
+                self.json_response(200, {"version": "0.6.0", "sessions": sessions})
             return
         if path == "/agent" and TARGET:
             try:
@@ -533,6 +569,78 @@ class Handler(BaseHTTPRequestHandler):
         message = "data: " + json.dumps(payload, separators=(",", ":")) + "\n\n"
         self.wfile.write(message.encode("utf-8"))
         self.wfile.flush()
+
+    def start_stream(self, thread_id: str, run_id: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.send_event({"type": "RUN_STARTED", "threadId": thread_id,
+                         "runId": run_id})
+
+    def send_progress(self, state: str) -> None:
+        # AG-UI CUSTOM is a valid event but does not become assistant prose.
+        # The upstream OpenBot stream watchdog observes bytes, not just text.
+        self.send_event({"type": "CUSTOM", "name": "agent-fabric.progress",
+                         "value": {"state": state}})
+
+    def send_reply(self, msg_id: str, thread_id: str, run_id: str,
+                   response: str) -> None:
+        self.send_event({"type": "TEXT_MESSAGE_START", "messageId": msg_id,
+                         "role": "assistant"})
+        self.send_event({"type": "TEXT_MESSAGE_CONTENT", "messageId": msg_id,
+                         "delta": response})
+        self.send_event({"type": "TEXT_MESSAGE_END", "messageId": msg_id})
+        self.send_event({"type": "RUN_FINISHED", "threadId": thread_id,
+                         "runId": run_id})
+
+    def prompt_with_liveness(self, session: str, pane_id: str, prompt: str,
+                             marker_id: str) -> str:
+        """Submit exactly once. On an ambiguous timeout, observe; never retry."""
+        args = ("agent", "prompt", pane_id, prompt, "--wait", "--until", "idle",
+                "--until", "done", "--until", "blocked", "--timeout", str(TIMEOUT_MS))
+        timeout_error: Exception | None = None
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            submitted = pool.submit(command, *args, session=session,
+                                    wait_seconds=TIMEOUT_MS / 1000 + 15)
+            while True:
+                try:
+                    submitted.result(timeout=HEARTBEAT_SECONDS)
+                    break
+                except FutureTimeout:
+                    self.send_progress("working")
+                except (RuntimeError, subprocess.TimeoutExpired) as exc:
+                    timeout_error = exc
+                    break
+
+        if timeout_error is not None:
+            message = str(timeout_error).lower()
+            if (RECOVERY_SECONDS <= 0 or
+                    not ("timed out waiting for agent status" in message or
+                         isinstance(timeout_error, subprocess.TimeoutExpired))):
+                raise timeout_error
+
+        deadline = time.monotonic() + (RECOVERY_SECONDS if timeout_error else 0)
+        while True:
+            if normalized_state(agent_record(session, pane_id)) == "blocked":
+                raise RuntimeError(f"Agent {pane_id} needs an approval or answer in Herdr")
+            try:
+                transcript = command("agent", "read", pane_id,
+                                     "--source", "recent-unwrapped", "--lines", "200",
+                                     session=session, wait_seconds=30)
+                return normalize_prose_wrapping(extract_reply(transcript, marker_id))
+            except RuntimeError as exc:
+                if not timeout_error:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "Agent prompt may already have been submitted, but the reply "
+                        "could not be correlated. Inspect Herdr before retrying; "
+                        "automatic resubmission is disabled."
+                    ) from exc
+            self.send_progress("recovering")
+            time.sleep(min(STATE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
 
     def read_request_body(self) -> bytes:
         """Read bounded JSON bodies using Content-Length or HTTP chunked framing."""
@@ -634,22 +742,80 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response(400, {"error": str(exc)})
             return
 
-        if not GLOBAL_SLOTS.acquire(blocking=False):
+        thread_id = str(body.get("threadId") or uuid.uuid4())
+        run_id = str(body.get("runId") or uuid.uuid4())
+        msg_id = str(uuid.uuid4())
+        request_key = LEDGER.key(session, pane_id, thread_id, run_id) if LEDGER else ""
+        input_digest = LEDGER.fingerprint(user_text, attachments) if LEDGER else ""
+        if LEDGER:
+            previous = LEDGER.get(request_key)
+            if previous:
+                if previous["fingerprint"] != input_digest:
+                    self.json_response(409, {"error": "Run identifier reused with different content"})
+                    return
+                self.start_stream(thread_id, run_id)
+                if previous["state"] == "finished":
+                    self.send_reply(msg_id, thread_id, run_id, previous["reply"] or "")
+                else:
+                    self.send_event({"type": "RUN_ERROR", "message":
+                                     f"Request {request_key} was already submitted or is uncertain. "
+                                     "No duplicate prompt sent. Inspect Herdr or check /requests/ID."})
+                return
+
+        wait_enabled = BUSY_WAIT_SECONDS > 0
+        if wait_enabled:
+            if not WAITING_SLOTS.acquire(blocking=False):
+                self.json_response(503, {"error": "Bridge is at queued-request capacity"})
+                return
+        elif not GLOBAL_SLOTS.acquire(blocking=False):
             self.json_response(503, {"error": "Bridge is at concurrent run capacity"})
             return
         lock = target_lock(session, pane_id)
-        if not lock.acquire(blocking=False):
+        if not wait_enabled and not lock.acquire(blocking=False):
             GLOBAL_SLOTS.release()
             self.json_response(409, {"error": "Agent is already handling an OpenBot request"})
             return
 
-        thread_id = str(body.get("threadId") or uuid.uuid4())
-        run_id = str(body.get("runId") or uuid.uuid4())
-        msg_id = str(uuid.uuid4())
         marker_id = secrets.token_hex(8).upper()
         begin = f"OPENBOT_BEGIN_{marker_id}"
         end = f"OPENBOT_END_{marker_id}"
+        have_lock = not wait_enabled
+        have_slot = not wait_enabled
+        stream_started = False
+        ledger_reserved = False
+        queue_ticket: object | None = None
+        pane_queue = waiting_queue(session, pane_id) if wait_enabled else None
+        last_progress = 0.0
+
+        def progress_if_due(state: str) -> None:
+            nonlocal last_progress
+            now = time.monotonic()
+            if now - last_progress >= HEARTBEAT_SECONDS:
+                self.send_progress(state)
+                last_progress = now
+
         try:
+            if wait_enabled:
+                self.start_stream(thread_id, run_id)
+                stream_started = True
+                deadline = time.monotonic() + BUSY_WAIT_SECONDS
+                # Explicit FIFO: lock acquisition alone is not guaranteed fair.
+                queue_ticket = object()
+                with WAIT_QUEUES_GUARD:
+                    assert pane_queue is not None
+                    pane_queue.append(queue_ticket)
+                while True:
+                    with WAIT_QUEUES_GUARD:
+                        if pane_queue[0] is queue_ticket and lock.acquire(blocking=False):
+                            pane_queue.popleft()
+                            have_lock = True
+                            queue_ticket = None
+                            break
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Agent is still busy; waiting expired. No prompt submitted.")
+                    progress_if_due("queued")
+                    time.sleep(min(STATE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+
             current_agent = agent_record(session, pane_id)
             state = normalized_state(current_agent)
             # Don't route to a process that replaced the pane occupant after
@@ -659,24 +825,54 @@ class Handler(BaseHTTPRequestHandler):
             current_ref = current_agent.get("agent_session", {}).get("value") if isinstance(
                 current_agent.get("agent_session"), dict) else None
             if original_ref and current_ref and original_ref != current_ref:
+                if wait_enabled:
+                    raise RuntimeError("Agent changed while request was waiting. No prompt submitted.")
                 self.json_response(409, {"error": "Agent changed while request was preparing"})
                 return
-            if state not in ("idle", "done"):
+            while wait_enabled and state == "working":
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Agent is still working; waiting expired. No prompt submitted.")
+                progress_if_due("queued")
+                time.sleep(min(STATE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+                current_agent = agent_record(session, pane_id)
+                updated_ref = current_agent.get("agent_session", {}).get("value") if isinstance(
+                    current_agent.get("agent_session"), dict) else None
+                if original_ref and updated_ref and original_ref != updated_ref:
+                    raise RuntimeError("Agent session changed while queued. No prompt submitted.")
+                state = normalized_state(current_agent)
+            if state not in ("idle", "done") and not wait_enabled:
                 self.json_response(409, {"error": f"Agent is {state}, no prompt submitted"})
                 return
+            if state not in ("idle", "done"):
+                raise RuntimeError(f"Agent is {state}. No prompt submitted; inspect Herdr.")
+            if wait_enabled:
+                while not GLOBAL_SLOTS.acquire(blocking=False):
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Bridge is still at capacity; waiting expired. No prompt submitted.")
+                    progress_if_due("waiting_for_capacity")
+                    time.sleep(min(STATE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+                have_slot = True
+                # A native Herdr operator could have started the pane while we
+                # waited for capacity; revalidate before prompt submission.
+                latest_agent = agent_record(session, pane_id)
+                latest_ref = latest_agent.get("agent_session", {}).get("value") if isinstance(
+                    latest_agent.get("agent_session"), dict) else None
+                if original_ref and latest_ref and original_ref != latest_ref:
+                    raise RuntimeError("Agent session changed while queued. No prompt submitted.")
+                state = normalized_state(latest_agent)
+                if state not in ("idle", "done"):
+                    raise RuntimeError(f"Agent became {state} while queued. No prompt submitted.")
             try:
                 staged = stage_attachments(attachments, marker_id, workdir,
                                            dynamic=dynamic)
             except (ValueError, OSError) as exc:
+                if stream_started:
+                    raise RuntimeError(f"Could not prepare attachment: {exc}") from exc
                 self.json_response(422, {"error": str(exc)})
                 return
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache, no-transform")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.send_event({"type": "RUN_STARTED", "threadId": thread_id,
-                             "runId": run_id})
+            if not stream_started:
+                self.start_stream(thread_id, run_id)
+                stream_started = True
             attachment_instructions = ""
             if staged:
                 attachment_instructions = (
@@ -695,39 +891,54 @@ class Handler(BaseHTTPRequestHandler):
                 f"{begin}\n<your response>\n{end}\n"
                 "Keep the response concise."
             )
-            # This may submit even if Herdr times out; NEVER auto-retry.
-            command("agent", "prompt", pane_id, prompt, "--wait", "--until", "idle",
-                    "--until", "done", "--until", "blocked", "--timeout", str(TIMEOUT_MS),
-                    session=session,
-                    wait_seconds=TIMEOUT_MS / 1000 + 15)
-            if normalized_state(agent_record(session, pane_id)) == "blocked":
-                raise RuntimeError(f"Agent {pane_id} needs an approval or answer in Herdr")
-            transcript = command("agent", "read", pane_id,
-                                 "--source", "recent-unwrapped", "--lines", "200",
-                                 session=session,
-                                 wait_seconds=30)
-            response = normalize_prose_wrapping(extract_reply(transcript, marker_id))
-            self.send_event({"type": "TEXT_MESSAGE_START", "messageId": msg_id,
-                             "role": "assistant"})
-            self.send_event({"type": "TEXT_MESSAGE_CONTENT", "messageId": msg_id,
-                             "delta": response})
-            self.send_event({"type": "TEXT_MESSAGE_END", "messageId": msg_id})
-            self.send_event({"type": "RUN_FINISHED", "threadId": thread_id,
-                             "runId": run_id})
+            if LEDGER:
+                try:
+                    reserved = LEDGER.reserve(request_key, session, pane_id,
+                                              input_digest, marker_id)
+                except ValueError as exc:
+                    raise RuntimeError(str(exc)) from exc
+                if not reserved["created"]:
+                    if reserved["state"] == "finished":
+                        self.send_reply(msg_id, thread_id, run_id, reserved["reply"] or "")
+                    else:
+                        self.send_event({"type": "RUN_ERROR", "message":
+                                         f"Request {request_key} is already submitted or uncertain. "
+                                         "No duplicate prompt sent."})
+                    return
+                ledger_reserved = True
+                self.send_event({"type": "CUSTOM", "name": "agent-fabric.request",
+                                 "value": {"id": request_key, "state": "submitted"}})
+            response = self.prompt_with_liveness(session, pane_id, prompt, marker_id)
+            if LEDGER:
+                LEDGER.finish(request_key, response)
+                ledger_reserved = False
+            self.send_reply(msg_id, thread_id, run_id, response)
         except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
             # A protocol run failure is not proof the Herdr prompt was not sent.
+            if ledger_reserved and LEDGER:
+                LEDGER.uncertain(request_key)
             try:
                 self.send_event({"type": "RUN_ERROR", "message": str(exc)})
             except (BrokenPipeError, ConnectionResetError):
                 pass
         except (BrokenPipeError, ConnectionResetError):
+            if ledger_reserved and LEDGER:
+                LEDGER.uncertain(request_key)
             pass
         finally:
-            lock.release()
-            GLOBAL_SLOTS.release()
+            if queue_ticket is not None and pane_queue is not None:
+                with WAIT_QUEUES_GUARD:
+                    pane_queue.remove(queue_ticket)
+            if have_lock:
+                lock.release()
+            if have_slot:
+                GLOBAL_SLOTS.release()
+            if wait_enabled:
+                WAITING_SLOTS.release()
 
 
 def main() -> None:
+    global LEDGER
     if TARGET and not re.fullmatch(r"(?:w[0-9A-Za-z]+:p[0-9A-Za-z]+|[a-z][a-z0-9_-]{0,31})", TARGET):
         sys.exit("HERDR_AGENT_TARGET must be an existing agent name or pane ID")
     if not SESSIONS or any(not SESSION_RE.fullmatch(s) for s in SESSIONS):
@@ -747,6 +958,16 @@ def main() -> None:
             sys.exit("Every OPENBOT_BRIDGE_ALLOWED_ROOTS entry must be an existing absolute directory")
     if TIMEOUT_MS < 1000 or TIMEOUT_MS > 600000:
         sys.exit("OPENBOT_BRIDGE_TIMEOUT_MS must be between 1000 and 600000")
+    if BUSY_WAIT_SECONDS < 0 or BUSY_WAIT_SECONDS > 3600:
+        sys.exit("OPENBOT_BRIDGE_BUSY_WAIT_SECONDS must be between 0 and 3600")
+    if RECOVERY_SECONDS < 0 or RECOVERY_SECONDS > 3600:
+        sys.exit("OPENBOT_BRIDGE_RECOVERY_SECONDS must be between 0 and 3600")
+    if BUSY_WAIT_SECONDS and not LEDGER_PATH:
+        sys.exit("Enable a persistent OPENBOT_BRIDGE_LEDGER_PATH before enabling busy waiting")
+    if LEDGER_PATH:
+        os.umask(0o077)
+        LEDGER = RequestLedger(LEDGER_PATH)
+        LEDGER.trim_finished()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Bridge ready on http://{HOST}:{PORT}/agents | "
           f"sessions={','.join(SESSIONS)} | legacy_target={TARGET or 'disabled'}", flush=True)
