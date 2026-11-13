@@ -5,8 +5,10 @@ import importlib.util
 import json
 import os
 import re
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -14,6 +16,7 @@ from unittest.mock import patch
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PACKAGE_ROOT))
 BRIDGE_PATH = PACKAGE_ROOT / "release" / "bridge.py"
 if not BRIDGE_PATH.is_file():
     BRIDGE_PATH = PACKAGE_ROOT / "bridge.py"
@@ -220,6 +223,212 @@ class BridgeTests(unittest.TestCase):
                   if line.startswith("data: ")]
         content = next(event for event in events if event.get("type") == "TEXT_MESSAGE_CONTENT")
         self.assertEqual(content["delta"], wrapped.replace("\n", " "))
+
+    @staticmethod
+    def events(body):
+        return [json.loads(line.removeprefix("data: ")) for line in body.splitlines()
+                if line.startswith("data: ")]
+
+    def enable_bounded_queue(self, seconds=1):
+        self.bridge.BUSY_WAIT_SECONDS = seconds
+        self.bridge.HEARTBEAT_SECONDS = 0.03
+        self.bridge.STATE_POLL_SECONDS = 0.03
+
+    def test_busy_agent_waits_then_delivers_same_turn(self):
+        self.enable_bounded_queue()
+        agent = self.roster["Main"][0]
+        agent["agent_status"] = "working"
+
+        def finish_previous_work():
+            time.sleep(0.14)
+            agent["agent_status"] = "idle"
+
+        finishing = threading.Thread(target=finish_previous_work)
+        finishing.start()
+        try:
+            status, body = self.request("POST", "/ag-ui", self.message("Deliver when ready"))
+        finally:
+            finishing.join(timeout=2)
+        events = self.events(body)
+        self.assertEqual(status, 200)
+        self.assertTrue(any(event.get("name") == "agent-fabric.progress" and
+                            event["value"]["state"] == "queued" for event in events))
+        self.assertEqual(events[-1]["type"], "RUN_FINISHED")
+        self.assertEqual(len(self.prompts), 1)
+
+    def test_busy_agent_wait_expires_without_submitting(self):
+        self.enable_bounded_queue(seconds=0.12)
+        self.roster["Main"][0]["agent_status"] = "working"
+        status, body = self.request("POST", "/ag-ui", self.message("Never delivered"))
+        self.assertEqual(status, 200)  # AG-UI errors use RUN_ERROR after stream starts.
+        events = self.events(body)
+        self.assertEqual(events[-1]["type"], "RUN_ERROR")
+        self.assertIn("No prompt submitted", events[-1]["message"])
+        self.assertEqual(self.prompts, [])
+
+    def test_blocked_agent_is_not_queued_or_prompted(self):
+        self.enable_bounded_queue()
+        self.roster["Main"][0]["agent_status"] = "blocked"
+        status, body = self.request("POST", "/ag-ui", self.message("Needs approval"))
+        self.assertEqual(status, 200)
+        self.assertEqual(self.events(body)[-1]["type"], "RUN_ERROR")
+        self.assertEqual(self.prompts, [])
+
+    def test_replaced_agent_is_not_prompted_after_queue_wait(self):
+        self.enable_bounded_queue()
+        agent = self.roster["Main"][0]
+        agent["agent_status"] = "working"
+        agent["agent_session"] = {"value": "original"}
+
+        def replace_occupant():
+            time.sleep(0.12)
+            agent["agent_session"] = {"value": "replacement"}
+            agent["agent_status"] = "idle"
+
+        replacing = threading.Thread(target=replace_occupant)
+        replacing.start()
+        try:
+            status, body = self.request("POST", "/ag-ui", self.message("Wrong process must not receive this"))
+        finally:
+            replacing.join(timeout=2)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.events(body)[-1]["type"], "RUN_ERROR")
+        self.assertIn("session changed", self.events(body)[-1]["message"])
+        self.assertEqual(self.prompts, [])
+
+    def test_timed_out_submission_reconciles_without_duplicate_prompt(self):
+        self.bridge.RECOVERY_SECONDS = 1
+        self.bridge.HEARTBEAT_SECONDS = 0.02
+        base = self.fake_command
+
+        def timeout_once(*args, **kwargs):
+            if args[:2] == ("agent", "prompt"):
+                base(*args, **kwargs)  # Prompt WAS submitted.
+                raise RuntimeError('Herdr command failed: {"code":"timeout","message":"timed out waiting for agent status"}')
+            return base(*args, **kwargs)
+
+        self.bridge.command = timeout_once
+        status, body = self.request("POST", "/ag-ui", self.message("Submit once"))
+        self.assertEqual(status, 200)
+        self.assertEqual(self.events(body)[-1]["type"], "RUN_FINISHED")
+        self.assertEqual(len(self.prompts), 1)
+
+    def test_ambiguous_timeout_never_retries_submitted_prompt(self):
+        self.bridge.RECOVERY_SECONDS = 0.12
+        self.bridge.HEARTBEAT_SECONDS = 0.02
+        self.bridge.STATE_POLL_SECONDS = 0.02
+        base = self.fake_command
+
+        def timeout_without_correlated_reply(*args, **kwargs):
+            if args[:2] == ("agent", "prompt"):
+                base(*args, **kwargs)  # One submission; pretend result is not visible.
+                raise RuntimeError('timed out waiting for agent status')
+            if args[:2] == ("agent", "read"):
+                return "No correlated answer in recent terminal output"
+            return base(*args, **kwargs)
+
+        self.bridge.command = timeout_without_correlated_reply
+        status, body = self.request("POST", "/ag-ui", self.message("Do not retry"))
+        self.assertEqual(status, 200)
+        self.assertEqual(self.events(body)[-1]["type"], "RUN_ERROR")
+        self.assertIn("could not be correlated", self.events(body)[-1]["message"])
+        self.assertEqual(len(self.prompts), 1)
+
+    def test_completed_request_is_replayed_without_resubmitting(self):
+        ledger_file = str(Path(self.tmp.name) / "requests.sqlite3")
+        self.bridge.LEDGER = self.bridge.RequestLedger(ledger_file)
+        self.enable_bounded_queue()
+        request = self.message("One submission, multiple transport attempts")
+        first_status, first_body = self.request("POST", "/ag-ui", request)
+        second_status, second_body = self.request("POST", "/ag-ui", request)
+        self.assertEqual((first_status, second_status), (200, 200))
+        self.assertEqual(self.events(first_body)[-1]["type"], "RUN_FINISHED")
+        self.assertEqual(self.events(second_body)[-1]["type"], "RUN_FINISHED")
+        self.assertEqual(len(self.prompts), 1)
+        key = self.bridge.LEDGER.key("Main", "wA:p1", "t1", "r1")
+        self.assertEqual(self.bridge.LEDGER.get(key)["state"], "finished")
+        self.assertEqual(Path(ledger_file).stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.request("GET", "/requests/" + key, auth=False)[0], 401)
+        # Reinstantiate from disk: a restarted gateway still must not resend.
+        self.bridge.LEDGER = self.bridge.RequestLedger(ledger_file)
+        third_status, third_body = self.request("POST", "/ag-ui", request)
+        self.assertEqual(third_status, 200)
+        self.assertEqual(self.events(third_body)[-1]["type"], "RUN_FINISHED")
+        self.assertEqual(len(self.prompts), 1)
+
+    def test_uncertain_request_uses_stored_run_id_to_prevent_duplicate(self):
+        self.enable_bounded_queue()
+        self.bridge.LEDGER = self.bridge.RequestLedger(str(Path(self.tmp.name) / "requests.sqlite3"))
+        self.bridge.RECOVERY_SECONDS = 0
+        base = self.fake_command
+
+        def timed_out(*args, **kwargs):
+            if args[:2] == ("agent", "prompt"):
+                base(*args, **kwargs)
+                raise RuntimeError('timed out waiting for agent status')
+            return base(*args, **kwargs)
+
+        self.bridge.command = timed_out
+        request = self.message("Never submit a second time")
+        status, body = self.request("POST", "/ag-ui", request)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.events(body)[-1]["type"], "RUN_ERROR")
+        status, body = self.request("POST", "/ag-ui", request)
+        self.assertEqual(status, 200)
+        self.assertIn("No duplicate prompt sent", self.events(body)[-1]["message"])
+        self.assertEqual(len(self.prompts), 1)
+        key = self.bridge.LEDGER.key("Main", "wA:p1", "t1", "r1")
+        status, data = self.request("GET", "/requests/" + key)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(data)["state"], "uncertain")
+        self.assertIsNone(json.loads(data)["reply"])
+        status, attention = self.request("GET", "/attention")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(attention)["unresolved_requests"][0]["id"], key)
+
+    def test_same_run_identifier_with_different_input_is_rejected(self):
+        self.enable_bounded_queue()
+        self.bridge.LEDGER = self.bridge.RequestLedger(str(Path(self.tmp.name) / "requests.sqlite3"))
+        self.assertEqual(self.request("POST", "/ag-ui", self.message("Original"))[0], 200)
+        status, body = self.request("POST", "/ag-ui", self.message("Different text"))
+        self.assertEqual(status, 409)
+        self.assertIn("reused", body)
+        self.assertEqual(len(self.prompts), 1)
+
+    def test_two_messages_to_same_agent_are_serialized(self):
+        self.enable_bounded_queue(seconds=3)
+        started = threading.Event()
+        original = self.fake_command
+
+        def slow_first(*args, **kwargs):
+            if args[:2] == ("agent", "prompt") and "Message one" in args[3]:
+                started.set()
+                time.sleep(0.18)
+            return original(*args, **kwargs)
+
+        self.bridge.command = slow_first
+        results = {}
+
+        def send(index, text):
+            body = self.message(text)
+            body["runId"] = "r" + str(index)
+            results[index] = self.request("POST", "/ag-ui", body)
+
+        first = threading.Thread(target=send, args=(1, "Message one"))
+        second = threading.Thread(target=send, args=(2, "Message two"))
+        first.start()
+        try:
+            self.assertTrue(started.wait(timeout=2))
+            second.start()
+            second.join(timeout=4)
+        finally:
+            first.join(timeout=4)
+        self.assertEqual([results[i][0] for i in (1, 2)], [200, 200])
+        self.assertTrue(all(self.events(results[i][1])[-1]["type"] == "RUN_FINISHED"
+                            for i in (1, 2)))
+        self.assertEqual(len(self.prompts), 2)
+        self.assertIn("Message one", self.prompts[0][2])
+        self.assertIn("Message two", self.prompts[1][2])
 
 
 if __name__ == "__main__":
