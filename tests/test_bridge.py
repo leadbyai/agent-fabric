@@ -91,7 +91,9 @@ class BridgeTests(unittest.TestCase):
                 current = next(a for a in agents if a["pane_id"] == pane_id)
                 outbox = Path(current["cwd"]) / ".openbot-outbox" / marker
                 (outbox / "screen.png").write_bytes(ONE_PIXEL_PNG)
-                response = "Created screenshot.\nOPENBOT_IMAGE: screen.png"
+                response = "Created screenshot."
+                if "without marker" not in prompt:
+                    response += "\nOPENBOT_IMAGE: screen.png"
             else:
                 response = f"Reply from {session}/{pane_id}"
             self.replies[(session, pane_id)] = (
@@ -219,6 +221,14 @@ class BridgeTests(unittest.TestCase):
         # Inline mode exposes no unauthenticated public artifact endpoint.
         self.assertEqual(self.request("GET", "/artifacts/" + "x" * 43 + ".png", auth=False)[0], 404)
 
+    def test_screenshot_is_auto_attached_without_marker_over_agui(self):
+        status, body = self.request("POST", "/ag-ui",
+                                    self.message("Create a screenshot without marker"))
+        self.assertEqual(status, 200)
+        self.assertIn("RUN_FINISHED", body)
+        self.assertIn("data:image/png;base64,", body)
+        self.assertNotIn("OPENBOT_IMAGE:", body)
+
     def test_opt_in_capability_url_mode_is_explicit_and_retrievable(self):
         self.bridge.ARTIFACT_MODE = "signed_url"
         status, body = self.request("POST", "/ag-ui", self.message("Create a screenshot"))
@@ -239,6 +249,42 @@ class BridgeTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.bridge.persist_reply_images("OPENBOT_IMAGE: escape.png", outbox)
         self.assertFalse((root / "other" / "secret.png").exists())
+
+    def test_indented_image_declaration_is_embedded(self):
+        # Two live Blog Desk replies used 2 and then 4 spaces; indentation is
+        # now irrelevant because the per-request outbox drives image delivery.
+        outbox = Path(self.tmp.name) / "demo" / ".openbot-outbox" / "INDENT123"
+        outbox.mkdir(parents=True)
+        (outbox / "1-image.png").write_bytes(ONE_PIXEL_PNG)
+        for spaces in (0, 2, 4, 8):
+            with self.subTest(spaces=spaces):
+                reply = "Image copied.\n" + " " * spaces + "OPENBOT_IMAGE: 1-image.png\n"
+                rendered = self.bridge.persist_reply_images(reply, outbox)
+                self.assertNotIn("OPENBOT_IMAGE:", rendered)
+                self.assertEqual(rendered.count("![Screenshot](data:image/png;base64,"), 1)
+
+    def test_outbox_image_with_spaces_in_filename_is_auto_attached(self):
+        outbox = Path(self.tmp.name) / "demo" / ".openbot-outbox" / "NOMARKER123"
+        outbox.mkdir(parents=True)
+        (outbox / "Screenshot May 2026.png").write_bytes(ONE_PIXEL_PNG)
+        rendered = self.bridge.persist_reply_images("Screenshot saved.", outbox)
+        self.assertIn("Screenshot saved.", rendered)
+        self.assertIn("![Screenshot](data:image/png;base64,", rendered)
+
+    def test_more_than_four_outbox_images_are_rejected(self):
+        outbox = Path(self.tmp.name) / "demo" / ".openbot-outbox" / "OVERFLOW123"
+        outbox.mkdir(parents=True)
+        for index in range(5):
+            (outbox / f"{index}.png").write_bytes(ONE_PIXEL_PNG)
+        with self.assertRaisesRegex(RuntimeError, "more than 4 screenshots"):
+            self.bridge.persist_reply_images("Too many", outbox)
+
+    def test_image_declaration_inside_code_indent_is_not_interpreted(self):
+        # Without a saved image, a literal Markdown example stays as text.
+        outbox = Path(self.tmp.name) / "demo" / ".openbot-outbox" / "CODE123"
+        outbox.mkdir(parents=True)
+        reply = "Example:\n    OPENBOT_IMAGE: not-a-file.png"
+        self.assertEqual(self.bridge.persist_reply_images(reply, outbox), reply)
 
     def test_nul_character_has_distinct_error_and_is_not_submitted(self):
         status, body = self.request("POST", "/ag-ui", self.message("Hello\x00world"))
