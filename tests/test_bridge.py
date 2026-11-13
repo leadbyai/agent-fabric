@@ -847,8 +847,8 @@ class LedgerMigrationTests(unittest.TestCase):
         con = sqlite3.connect(self.path)
         con.execute(self.OLD_SCHEMA)
         con.executemany("INSERT INTO requests VALUES (?,?,?,?,?,?,?,?)", [
-            ("k1", "lbai", "w1:p1", "f1", "M1", "finished", "hello", int(time.time())),
-            ("k2", "lbai", "w1:p2", "f2", "M2", "uncertain", None, int(time.time())),
+            ("k1", "example-session", "w1:p1", "f1", "M1", "finished", "hello", int(time.time())),
+            ("k2", "example-session", "w1:p2", "f2", "M2", "uncertain", None, int(time.time())),
         ])
         con.commit()
         con.close()
@@ -861,7 +861,7 @@ class LedgerMigrationTests(unittest.TestCase):
         self.assertEqual(ledger.get("k1")["reply"], "hello")
         self.assertEqual(ledger.get("k2")["state"], "uncertain")
         self.assertEqual([r["id"] for r in ledger.unresolved()], ["k2"])
-        queued = ledger.enqueue("k3", "lbai", "w1:p1", "f3", "M3")
+        queued = ledger.enqueue("k3", "example-session", "w1:p1", "f3", "M3")
         self.assertTrue(queued["created"])
         self.assertEqual(queued["state"], "queued")
         # Idempotent: reopening does not migrate again or lose rows.
@@ -871,7 +871,7 @@ class LedgerMigrationTests(unittest.TestCase):
 
     def test_rollback_code_reads_migrated_ledger_and_fails_closed(self):
         """v0.7.0 code on a v0.7.1 ledger: no crash, no resend of queued rows."""
-        self.mod.RequestLedger(self.path).enqueue("k3", "lbai", "w1:p1", "f3", "M3")
+        self.mod.RequestLedger(self.path).enqueue("k3", "example-session", "w1:p1", "f3", "M3")
         import subprocess as sp
         old_src = sp.run(["git", "-C", str(PACKAGE_ROOT), "show", "ec7275c:request_ledger.py"],
                          capture_output=True, text=True)
@@ -884,21 +884,21 @@ class LedgerMigrationTests(unittest.TestCase):
         spec.loader.exec_module(old)
         ledger = old.RequestLedger(self.path)
         self.assertEqual(ledger.get("k1")["reply"], "hello")
-        record = ledger.reserve("k3", "lbai", "w1:p1", "f3", "MX")
+        record = ledger.reserve("k3", "example-session", "w1:p1", "f3", "MX")
         self.assertFalse(record["created"])           # old code refuses: no duplicate send
-        fresh = ledger.reserve("k4", "lbai", "w1:p1", "f4", "M4")
+        fresh = ledger.reserve("k4", "example-session", "w1:p1", "f4", "M4")
         self.assertTrue(fresh["created"])
 
     def test_reserve_only_promotes_own_queued_row(self):
         ledger = self.mod.RequestLedger(self.path)
-        ledger.enqueue("k5", "lbai", "w1:p1", "f5", "M5")
-        self.assertFalse(ledger.reserve("k5", "lbai", "w1:p1", "f5", "OTHER")["created"])
-        self.assertTrue(ledger.reserve("k5", "lbai", "w1:p1", "f5", "M5")["created"])
-        self.assertFalse(ledger.reserve("k5", "lbai", "w1:p1", "f5", "M5")["created"])
+        ledger.enqueue("k5", "example-session", "w1:p1", "f5", "M5")
+        self.assertFalse(ledger.reserve("k5", "example-session", "w1:p1", "f5", "OTHER")["created"])
+        self.assertTrue(ledger.reserve("k5", "example-session", "w1:p1", "f5", "M5")["created"])
+        self.assertFalse(ledger.reserve("k5", "example-session", "w1:p1", "f5", "M5")["created"])
         ledger.fail("k5", "late")                      # never downgrades a submitted row
         self.assertEqual(ledger.get("k5")["state"], "submitted")
         with self.assertRaises(ValueError):
-            ledger.enqueue("k5", "lbai", "w1:p1", "DIFFERENT", "M9")
+            ledger.enqueue("k5", "example-session", "w1:p1", "DIFFERENT", "M9")
 
 
 class DataUriStripperTests(unittest.TestCase):
