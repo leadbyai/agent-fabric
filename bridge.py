@@ -78,12 +78,11 @@ ARTIFACT_STORAGE_BYTES = int(os.environ.get("OPENBOT_BRIDGE_ARTIFACT_STORAGE_BYT
 MAX_OUTBOUND_IMAGES = 4
 MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_INLINE_IMAGES_TOTAL = 4 * 1024 * 1024
-# Claude can indent an otherwise correct declaration as ordinary prose. Accept
-# up to three leading spaces (but not a Markdown code block), and keep line
-# boundaries explicit so surrounding text can never be consumed.
-OUTBOUND_IMAGE_RE = re.compile(
-    r"(?m)^[ \t]{0,3}OPENBOT_IMAGE:[ \t]+([A-Za-z0-9][A-Za-z0-9._-]{0,95})[ \t]*$"
-)
+# Image delivery is determined by validated files in the private per-request
+# outbox, never by the model's whitespace or Markdown formatting. Strip any
+# legacy declaration after finding actual images in the outbox.
+OUTBOUND_IMAGE_RE = re.compile(r"(?m)^[ \t]*OPENBOT_IMAGE:[^\r\n]*$")
+OUTBOUND_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 ARTIFACT_RE = re.compile(r"/artifacts/([A-Za-z0-9_-]{32,64})\.(png|jpg|webp)\Z")
 
 
@@ -460,28 +459,16 @@ def image_file_type(data: bytes) -> tuple[str, str] | None:
 
 
 def persist_reply_images(reply: str, outbox: Path) -> str:
-    """Replace explicit agent image declarations with safe Markdown previews.
+    """Automatically attach images placed in this request's private outbox.
 
     Default inline mode places image bytes within OpenBot's already-authenticated
     conversation (AG-UI AssistantMessage.content remains a string). Opt-in
     signed_url mode is available for deployments approving capability links.
+    Legacy OPENBOT_IMAGE lines are removed when an actual image is available;
+    arbitrary model-generated indentation cannot suppress delivery.
     """
-    declarations = list(OUTBOUND_IMAGE_RE.finditer(reply))
-    if not declarations:
-        return reply
-    if len(declarations) > MAX_OUTBOUND_IMAGES:
-        raise RuntimeError(f"Reply contains more than {MAX_OUTBOUND_IMAGES} screenshots")
-    if ARTIFACT_MODE == "signed_url" and (not ARTIFACT_DIR or not PUBLIC_ORIGIN):
-        raise RuntimeError("Screenshot delivery is not configured on the Agent Fabric gateway")
-    artifact_root: Path | None = None
-    if ARTIFACT_MODE == "signed_url":
-        artifact_root = Path(ARTIFACT_DIR)
-        if not artifact_root.is_absolute() or artifact_root.is_symlink():
-            raise RuntimeError("Artifact directory is unsafe")
-        artifact_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(artifact_root, 0o700)
     published: list[Path] = []
-    replacements: list[tuple[str, str]] = []
+    previews: list[str] = []
     total_inline = 0
     try:
         directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
@@ -491,12 +478,28 @@ def persist_reply_images(reply: str, outbox: Path) -> str:
         if outbox.is_symlink() or outbox.parent.is_symlink():
             os.close(outbox_fd)
             raise RuntimeError("Screenshot directory is unsafe")
-        # dir_fd ensures the final component cannot be redirected through a
-        # swapped ancestor after verification. The filename has no slashes.
+        # Both the directory enumeration and file opens use the same dir_fd,
+        # preventing a swapped ancestor from redirecting the file reads.
         try:
-            for match in declarations:
-                name = match.group(1)
-                if name in (".", "..") or ".." in name or name.startswith("."):
+            with os.scandir(outbox_fd) as entries:
+                names = sorted(entry.name for entry in entries
+                               if Path(entry.name).suffix.lower() in OUTBOUND_IMAGE_EXTENSIONS)
+            if not names:
+                return reply
+            if len(names) > MAX_OUTBOUND_IMAGES:
+                raise RuntimeError(f"Outbox contains more than {MAX_OUTBOUND_IMAGES} screenshots")
+            if ARTIFACT_MODE == "signed_url" and (not ARTIFACT_DIR or not PUBLIC_ORIGIN):
+                raise RuntimeError("Screenshot delivery is not configured on the Agent Fabric gateway")
+            artifact_root: Path | None = None
+            if ARTIFACT_MODE == "signed_url":
+                artifact_root = Path(ARTIFACT_DIR)
+                if not artifact_root.is_absolute() or artifact_root.is_symlink():
+                    raise RuntimeError("Artifact directory is unsafe")
+                artifact_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+                os.chmod(artifact_root, 0o700)
+            for name in names:
+                if (name in (".", "..") or ".." in name or name.startswith(".") or
+                        len(name) > 255 or "\n" in name or "\r" in name):
                     raise RuntimeError("Unsafe screenshot filename")
                 flags = os.O_RDONLY
                 if hasattr(os, "O_NOFOLLOW"):
@@ -520,7 +523,7 @@ def persist_reply_images(reply: str, outbox: Path) -> str:
                             "Compress it to at most 2 MiB per image, 4 MiB total."
                         )
                     url = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
-                    replacements.append((match.group(0), f"![Screenshot]({url})"))
+                    previews.append(f"![Screenshot]({url})")
                     continue
                 assert artifact_root is not None
                 # Remove only bridge-generated images that have passed their
@@ -546,12 +549,11 @@ def persist_reply_images(reply: str, outbox: Path) -> str:
                 with os.fdopen(fd, "wb") as handle:
                     handle.write(data)
                 url = f"{PUBLIC_ORIGIN}/artifacts/{destination.name}"
-                replacements.append((match.group(0), f"![Screenshot]({url})\n\n[Open screenshot]({url})"))
+                previews.append(f"![Screenshot]({url})\n\n[Open screenshot]({url})")
         finally:
             os.close(outbox_fd)
-        for original, markdown in replacements:
-            reply = reply.replace(original, markdown, 1)
-        return reply
+        prose = OUTBOUND_IMAGE_RE.sub("", reply).strip()
+        return (prose + "\n\n" if prose else "") + "\n\n".join(previews)
     except (OSError, ValueError) as exc:
         for path in published:
             path.unlink(missing_ok=True)
@@ -1123,11 +1125,10 @@ class Handler(BaseHTTPRequestHandler):
                 "these exact lines, with no formatting around them:\n"
                 f"{begin}\n<your response>\n{end}\n"
                 "To return up to four screenshots, save actual PNG, JPEG, or WebP files "
-                f"into .openbot-outbox/{marker_id}/ and put one line "
-                "OPENBOT_IMAGE: filename.png in your response for each screenshot "
-                "(filename only, no directory). These image lines must be INSIDE "
-                "the response markers. This is optional; never claim a screenshot "
-                "was attached unless you saved the image. Keep the response concise."
+                f"into .openbot-outbox/{marker_id}/. The gateway automatically attaches "
+                "the image files in that directory. No OPENBOT_IMAGE declaration or "
+                "special reply formatting is needed. This is optional; never claim a "
+                "screenshot was attached unless you saved the image. Keep the response concise."
             )
             if LEDGER:
                 try:
