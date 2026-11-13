@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Authenticated AG-UI gateway to existing Herdr-managed coding agents.
 
-Version 0.6.0 adds opt-in busy-agent waiting and streamed liveness signals,
+Version 0.6.1 adds response-correlation grace and detached-stream recovery,
 preserving v0.5.1 formatting and v0.5.0 per-agent/file behavior.
 Python standard library only. It does not launch, stop, or resume Herdr agents.
 """
@@ -496,7 +496,7 @@ def normalize_prose_wrapping(text: str) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "OpenBotHerdrBridge/0.6.0"
+    server_version = "OpenBotHerdrBridge/0.6.1"
 
     def log_message(self, format_string: str, *args: object) -> None:
         # Deliberately never logs request bodies, authorization, or agent output.
@@ -519,7 +519,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path == "/health":
-            self.json_response(200, {"ok": True, "version": "0.6.0", "mode": "multi-agent",
+            self.json_response(200, {"ok": True, "version": "0.6.1", "mode": "multi-agent",
                                      "busy_wait_enabled": BUSY_WAIT_SECONDS > 0})
             return
         if not self.authorized():
@@ -554,7 +554,7 @@ class Handler(BaseHTTPRequestHandler):
                                                               if not s["online"]],
                                          "unresolved_requests": LEDGER.unresolved() if LEDGER else []})
             else:
-                self.json_response(200, {"version": "0.6.0", "sessions": sessions})
+                self.json_response(200, {"version": "0.6.1", "sessions": sessions})
             return
         if path == "/agent" and TARGET:
             try:
@@ -585,6 +585,24 @@ class Handler(BaseHTTPRequestHandler):
         self.send_event({"type": "CUSTOM", "name": "agent-fabric.progress",
                          "value": {"state": state}})
 
+    def send_submitted_event(self, payload: dict) -> None:
+        """Continue tracking a submitted run if its browser stream closes.
+
+        Once Herdr has been invoked, dropping the stream must not abandon the
+        work or release this pane's lock before the result is reconciled.
+        Waiting (not yet submitted) requests still stop on a broken stream.
+        """
+        if getattr(self, "_stream_detached", False):
+            return
+        try:
+            self.send_event(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            self._stream_detached = True
+
+    def send_submitted_progress(self, state: str) -> None:
+        self.send_submitted_event({"type": "CUSTOM", "name": "agent-fabric.progress",
+                                   "value": {"state": state}})
+
     def send_reply(self, msg_id: str, thread_id: str, run_id: str,
                    response: str) -> None:
         self.send_event({"type": "TEXT_MESSAGE_START", "messageId": msg_id,
@@ -609,7 +627,7 @@ class Handler(BaseHTTPRequestHandler):
                     submitted.result(timeout=HEARTBEAT_SECONDS)
                     break
                 except FutureTimeout:
-                    self.send_progress("working")
+                    self.send_submitted_progress("working")
                 except (RuntimeError, subprocess.TimeoutExpired) as exc:
                     timeout_error = exc
                     break
@@ -621,7 +639,11 @@ class Handler(BaseHTTPRequestHandler):
                          isinstance(timeout_error, subprocess.TimeoutExpired))):
                 raise timeout_error
 
-        deadline = time.monotonic() + (RECOVERY_SECONDS if timeout_error else 0)
+        # A successful Herdr --wait return does not guarantee the response
+        # markers are already visible in recent-unwrapped. Poll for them even
+        # without an explicit Herdr timeout; otherwise a fast status change
+        # can mark the request uncertain and release the pane to the next run.
+        deadline = time.monotonic() + RECOVERY_SECONDS
         while True:
             if normalized_state(agent_record(session, pane_id)) == "blocked":
                 raise RuntimeError(f"Agent {pane_id} needs an approval or answer in Herdr")
@@ -631,15 +653,13 @@ class Handler(BaseHTTPRequestHandler):
                                      session=session, wait_seconds=30)
                 return normalize_prose_wrapping(extract_reply(transcript, marker_id))
             except RuntimeError as exc:
-                if not timeout_error:
-                    raise
                 if time.monotonic() >= deadline:
                     raise RuntimeError(
-                        "Agent prompt may already have been submitted, but the reply "
-                        "could not be correlated. Inspect Herdr before retrying; "
+                        "Submitted agent reply could not be correlated "
+                        "within the recovery window. Inspect Herdr before retrying; "
                         "automatic resubmission is disabled."
                     ) from exc
-            self.send_progress("recovering")
+            self.send_submitted_progress("recovering")
             time.sleep(min(STATE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
 
     def read_request_body(self) -> bytes:
@@ -906,8 +926,8 @@ class Handler(BaseHTTPRequestHandler):
                                          "No duplicate prompt sent."})
                     return
                 ledger_reserved = True
-                self.send_event({"type": "CUSTOM", "name": "agent-fabric.request",
-                                 "value": {"id": request_key, "state": "submitted"}})
+                self.send_submitted_event({"type": "CUSTOM", "name": "agent-fabric.request",
+                                           "value": {"id": request_key, "state": "submitted"}})
             response = self.prompt_with_liveness(session, pane_id, prompt, marker_id)
             if LEDGER:
                 LEDGER.finish(request_key, response)
