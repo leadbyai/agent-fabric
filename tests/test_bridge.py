@@ -1,5 +1,6 @@
 """Offline tests. No real Herdr session or production endpoint is touched."""
 
+import base64
 import http.client
 import importlib.util
 import json
@@ -13,6 +14,12 @@ import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
+
+
+ONE_PIXEL_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/"
+    "5XcAAAAASUVORK5CYII="
+)
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
@@ -49,6 +56,8 @@ class BridgeTests(unittest.TestCase):
             "OPENBOT_BRIDGE_TOKEN": "Z" * 48,
             "OPENBOT_BRIDGE_ALLOWED_ROOTS": str(root),
             "OPENBOT_BRIDGE_WORKDIR": str(root / "demo"),
+            "OPENBOT_BRIDGE_ARTIFACT_DIR": str(root / "artifacts"),
+            "OPENBOT_BRIDGE_PUBLIC_ORIGIN": "https://lbai-agents.leadbyai.bot",
         }
         with patch.dict(os.environ, env):
             spec = importlib.util.spec_from_file_location("bridge_test", BRIDGE_PATH)
@@ -77,15 +86,22 @@ class BridgeTests(unittest.TestCase):
             pane_id, prompt = args[2], args[3]
             self.prompts.append((session, pane_id, prompt))
             marker = re.search(r"OPENBOT_BEGIN_([A-F0-9]{16})", prompt).group(1)
+            if "Create a screenshot" in prompt:
+                current = next(a for a in agents if a["pane_id"] == pane_id)
+                outbox = Path(current["cwd"]) / ".openbot-outbox" / marker
+                (outbox / "screen.png").write_bytes(ONE_PIXEL_PNG)
+                response = "Created screenshot.\nOPENBOT_IMAGE: screen.png"
+            else:
+                response = f"Reply from {session}/{pane_id}"
             self.replies[(session, pane_id)] = (
-                f"OPENBOT_BEGIN_{marker}\nReply from {session}/{pane_id}\nOPENBOT_END_{marker}"
+                f"OPENBOT_BEGIN_{marker}\n{response}\nOPENBOT_END_{marker}"
             )
             return '{"result":{"agent_status":"done"}}'
         if args[:2] == ("agent", "read"):
             return self.replies[(session, args[2])]
         raise AssertionError(f"Unexpected Herdr command {args}")
 
-    def request(self, method, path, data=None, auth=True):
+    def request(self, method, path, data=None, auth=True, raw=False):
         con = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=10)
         headers = {"Content-Type": "application/json"}
         if auth:
@@ -93,9 +109,9 @@ class BridgeTests(unittest.TestCase):
         con.request(method, path, body=json.dumps(data) if data is not None else None,
                     headers=headers)
         response = con.getresponse()
-        status, body = response.status, response.read().decode("utf-8")
+        status, payload = response.status, response.read()
         con.close()
-        return status, body
+        return status, payload if raw else payload.decode("utf-8")
 
     @staticmethod
     def message(text, file=None):
@@ -150,6 +166,73 @@ class BridgeTests(unittest.TestCase):
     def test_unauthorized_calls_rejected(self):
         self.assertEqual(self.request("GET", "/agents", auth=False)[0], 401)
         self.assertEqual(self.request("POST", "/ag-ui", self.message("Hello"), auth=False)[0], 401)
+        self.assertEqual(self.prompts, [])
+
+    def test_multi_page_instruction_reaches_herdr_without_truncation(self):
+        prompt = "Please complete the following checklist.\n" + ("A" * 12000)
+        status, body = self.request("POST", "/ag-ui", self.message(prompt))
+        self.assertEqual(status, 200)
+        self.assertIn("RUN_FINISHED", body)
+        self.assertIn(prompt, self.prompts[-1][2])
+
+    def test_utf8_large_instruction_is_staged_without_truncation(self):
+        # A four-byte character exceeds Linux's per-argument safe size, and
+        # must be passed as a private file rather than rejected or truncated.
+        prompt = "🚆" * ((self.bridge.MAX_PROMPT_BYTES // 4) + 1)
+        status, body = self.request("POST", "/ag-ui", self.message(prompt))
+        self.assertEqual(status, 200)
+        self.assertIn("RUN_FINISHED", body)
+        self.assertNotIn(prompt, self.prompts[-1][2])
+        self.assertIn("full-user-instructions.txt", self.prompts[-1][2])
+        staged = list((Path(self.tmp.name) / "demo" / ".openbot-inbox").glob(
+            "*/1-full-user-instructions.txt"
+        ))
+        self.assertEqual(len(staged), 1)
+        self.assertEqual(staged[0].read_text(), prompt)
+
+    def test_screenshot_sent_from_openbot_reaches_correct_agent(self):
+        message = {"threadId": "t1", "runId": "r1", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Describe the screenshot"},
+            {"type": "image", "source": {
+                "type": "data", "mimeType": "image/png",
+                "value": base64.b64encode(ONE_PIXEL_PNG).decode("ascii"),
+            }, "metadata": {"filename": "capture.png"}},
+        ]}]}
+        status, body = self.request("POST", "/sessions/Main/agents/w3:p1/ag-ui", message)
+        self.assertEqual(status, 200)
+        self.assertIn("RUN_FINISHED", body)
+        paths = list((Path(self.tmp.name) / "pricing" / ".openbot-inbox").glob(
+            "*/1-capture.png"
+        ))
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(paths[0].read_bytes(), ONE_PIXEL_PNG)
+        self.assertIn("1-capture.png", self.prompts[-1][2])
+
+    def test_screenshot_from_agent_is_previewable_without_bearer(self):
+        status, body = self.request("POST", "/ag-ui", self.message("Create a screenshot"))
+        self.assertEqual(status, 200)
+        self.assertIn("RUN_FINISHED", body)
+        match = re.search(r"https://lbai-agents.leadbyai.bot(/artifacts/[A-Za-z0-9_-]+\.png)", body)
+        self.assertIsNotNone(match)
+        artifact_path = match.group(1)
+        status, raw = self.request("GET", artifact_path, auth=False, raw=True)
+        self.assertEqual(status, 200)
+        self.assertEqual(raw, ONE_PIXEL_PNG)
+        self.assertEqual(self.request("GET", "/artifacts/" + "x" * 43 + ".png", auth=False)[0], 404)
+
+    def test_agent_must_not_export_other_paths_as_screenshots(self):
+        root = Path(self.tmp.name)
+        outbox = root / "demo" / ".openbot-outbox" / "MARKER123"
+        outbox.mkdir(parents=True)
+        (outbox / "escape.png").symlink_to(root / "other" / "secret.png")
+        with self.assertRaises(RuntimeError):
+            self.bridge.persist_reply_images("OPENBOT_IMAGE: escape.png", outbox)
+        self.assertFalse((root / "other" / "secret.png").exists())
+
+    def test_nul_character_has_distinct_error_and_is_not_submitted(self):
+        status, body = self.request("POST", "/ag-ui", self.message("Hello\x00world"))
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)["code"], "invalid_nul_character")
         self.assertEqual(self.prompts, [])
 
     def test_reflows_wrapped_prose_without_merging_paragraphs(self):
