@@ -78,7 +78,12 @@ ARTIFACT_STORAGE_BYTES = int(os.environ.get("OPENBOT_BRIDGE_ARTIFACT_STORAGE_BYT
 MAX_OUTBOUND_IMAGES = 4
 MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_INLINE_IMAGES_TOTAL = 4 * 1024 * 1024
-OUTBOUND_IMAGE_RE = re.compile(r"(?m)^OPENBOT_IMAGE: ([A-Za-z0-9][A-Za-z0-9._-]{0,95})\s*$")
+# Claude can indent an otherwise correct declaration as ordinary prose. Accept
+# up to three leading spaces (but not a Markdown code block), and keep line
+# boundaries explicit so surrounding text can never be consumed.
+OUTBOUND_IMAGE_RE = re.compile(
+    r"(?m)^[ \t]{0,3}OPENBOT_IMAGE:[ \t]+([A-Za-z0-9][A-Za-z0-9._-]{0,95})[ \t]*$"
+)
 ARTIFACT_RE = re.compile(r"/artifacts/([A-Za-z0-9_-]{32,64})\.(png|jpg|webp)\Z")
 
 
