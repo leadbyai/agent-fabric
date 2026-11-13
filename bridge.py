@@ -72,9 +72,12 @@ MAX_TOTAL_FILES = 24 * 1024 * 1024
 MAX_FILES = 4
 ARTIFACT_DIR = os.environ.get("OPENBOT_BRIDGE_ARTIFACT_DIR", "").strip()
 PUBLIC_ORIGIN = os.environ.get("OPENBOT_BRIDGE_PUBLIC_ORIGIN", "").strip().rstrip("/")
+ARTIFACT_MODE = os.environ.get("OPENBOT_BRIDGE_ARTIFACT_MODE", "inline").strip()
 ARTIFACT_TTL_SECONDS = int(os.environ.get("OPENBOT_BRIDGE_ARTIFACT_TTL_SECONDS", "2592000"))
 ARTIFACT_STORAGE_BYTES = int(os.environ.get("OPENBOT_BRIDGE_ARTIFACT_STORAGE_BYTES", str(2 * 1024 ** 3)))
 MAX_OUTBOUND_IMAGES = 4
+MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_INLINE_IMAGES_TOTAL = 4 * 1024 * 1024
 OUTBOUND_IMAGE_RE = re.compile(r"(?m)^OPENBOT_IMAGE: ([A-Za-z0-9][A-Za-z0-9._-]{0,95})\s*$")
 ARTIFACT_RE = re.compile(r"/artifacts/([A-Za-z0-9_-]{32,64})\.(png|jpg|webp)\Z")
 
@@ -452,26 +455,29 @@ def image_file_type(data: bytes) -> tuple[str, str] | None:
 
 
 def persist_reply_images(reply: str, outbox: Path) -> str:
-    """Replace explicit agent image declarations with private, expiring links.
+    """Replace explicit agent image declarations with safe Markdown previews.
 
-    Only opt-in configurations with HTTPS PUBLIC_ORIGIN enable image replies.
-    The public URLs are capability links: unguessable, expiring, no bearer leak.
-    Output is copied under the service-owned persistent state directory.
+    Default inline mode places image bytes within OpenBot's already-authenticated
+    conversation (AG-UI AssistantMessage.content remains a string). Opt-in
+    signed_url mode is available for deployments approving capability links.
     """
     declarations = list(OUTBOUND_IMAGE_RE.finditer(reply))
     if not declarations:
         return reply
     if len(declarations) > MAX_OUTBOUND_IMAGES:
         raise RuntimeError(f"Reply contains more than {MAX_OUTBOUND_IMAGES} screenshots")
-    if not ARTIFACT_DIR or not PUBLIC_ORIGIN:
+    if ARTIFACT_MODE == "signed_url" and (not ARTIFACT_DIR or not PUBLIC_ORIGIN):
         raise RuntimeError("Screenshot delivery is not configured on the Agent Fabric gateway")
-    artifact_root = Path(ARTIFACT_DIR)
-    if not artifact_root.is_absolute() or artifact_root.is_symlink():
-        raise RuntimeError("Artifact directory is unsafe")
-    artifact_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(artifact_root, 0o700)
+    artifact_root: Path | None = None
+    if ARTIFACT_MODE == "signed_url":
+        artifact_root = Path(ARTIFACT_DIR)
+        if not artifact_root.is_absolute() or artifact_root.is_symlink():
+            raise RuntimeError("Artifact directory is unsafe")
+        artifact_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(artifact_root, 0o700)
     published: list[Path] = []
     replacements: list[tuple[str, str]] = []
+    total_inline = 0
     try:
         directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         if hasattr(os, "O_NOFOLLOW"):
@@ -499,6 +505,19 @@ def persist_reply_images(reply: str, outbox: Path) -> str:
                 kind = image_file_type(data)
                 if kind is None or len(data) > MAX_FILE_SIZE:
                     raise RuntimeError("Screenshot is not a supported PNG, JPEG, or WebP image")
+                extension, mime = kind
+                if ARTIFACT_MODE == "inline":
+                    total_inline += len(data)
+                    if (len(data) > MAX_INLINE_IMAGE_BYTES or
+                            total_inline > MAX_INLINE_IMAGES_TOTAL):
+                        raise RuntimeError(
+                            "Screenshot is too large for private chat storage. "
+                            "Compress it to at most 2 MiB per image, 4 MiB total."
+                        )
+                    url = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+                    replacements.append((match.group(0), f"![Screenshot]({url})"))
+                    continue
+                assert artifact_root is not None
                 # Remove only bridge-generated images that have passed their
                 # configured retention; never evict an unexpired screenshot.
                 used = 0
@@ -512,7 +531,6 @@ def persist_reply_images(reply: str, outbox: Path) -> str:
                         used += info.st_size
                 if used + len(data) > ARTIFACT_STORAGE_BYTES:
                     raise RuntimeError("Screenshot storage is full; no unexpired images were removed")
-                extension, _mime = kind
                 secret = secrets.token_urlsafe(32)
                 destination = artifact_root / f"{secret}.{extension}"
                 write_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -656,7 +674,7 @@ class Handler(BaseHTTPRequestHandler):
         # credential. Possession of a 256-bit random path is the only grant.
         artifact = ARTIFACT_RE.fullmatch(path)
         if artifact:
-            if not ARTIFACT_DIR:
+            if ARTIFACT_MODE != "signed_url" or not ARTIFACT_DIR:
                 self.json_response(404, {"error": "not_found"})
                 return
             location = Path(ARTIFACT_DIR) / f"{artifact.group(1)}.{artifact.group(2)}"
@@ -1190,6 +1208,8 @@ def main() -> None:
             sys.exit("OPENBOT_BRIDGE_ARTIFACT_DIR must be a non-symlink absolute directory")
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(directory, 0o700)
+    if ARTIFACT_MODE not in ("inline", "signed_url"):
+        sys.exit("OPENBOT_BRIDGE_ARTIFACT_MODE must be inline or signed_url")
     origin = urlsplit(PUBLIC_ORIGIN)
     if PUBLIC_ORIGIN and (origin.scheme != "https" or not origin.hostname or
                           origin.username is not None or origin.password is not None or
