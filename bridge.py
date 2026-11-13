@@ -68,15 +68,19 @@ MAX_BODY = 64 * 1024 * 1024
 # file for the agent to read, rather than being rejected or truncated.
 MAX_PROMPT_BYTES = 64 * 1024
 MAX_FILE_SIZE = 8 * 1024 * 1024
-MAX_TOTAL_FILES = 12 * 1024 * 1024
-MAX_FILES = 2
+MAX_TOTAL_FILES = 24 * 1024 * 1024
+MAX_FILES = 4
 ARTIFACT_DIR = os.environ.get("OPENBOT_BRIDGE_ARTIFACT_DIR", "").strip()
 PUBLIC_ORIGIN = os.environ.get("OPENBOT_BRIDGE_PUBLIC_ORIGIN", "").strip().rstrip("/")
 ARTIFACT_TTL_SECONDS = int(os.environ.get("OPENBOT_BRIDGE_ARTIFACT_TTL_SECONDS", "2592000"))
 ARTIFACT_STORAGE_BYTES = int(os.environ.get("OPENBOT_BRIDGE_ARTIFACT_STORAGE_BYTES", str(2 * 1024 ** 3)))
-MAX_OUTBOUND_IMAGES = 2
+MAX_OUTBOUND_IMAGES = 4
 OUTBOUND_IMAGE_RE = re.compile(r"(?m)^OPENBOT_IMAGE: ([A-Za-z0-9][A-Za-z0-9._-]{0,95})\s*$")
 ARTIFACT_RE = re.compile(r"/artifacts/([A-Za-z0-9_-]{32,64})\.(png|jpg|webp)\Z")
+
+
+class PayloadTooLarge(ValueError):
+    """A safely bounded but too-large request, reported as HTTP 413."""
 OPENBOT_TEXT_FILE = re.compile(r'\AAttached file "([^"\r\n]{1,160})":\r?\n\r?\n([\s\S]*)\Z')
 TEXT_MIMES = {
     ".csv": "text/csv",
@@ -268,10 +272,10 @@ def parse_user_message(body: dict) -> tuple[str, list[tuple[str, str, bytes]]]:
             derived = openbot_text_attachment(part["text"]) if part_index > 0 else None
             if derived is not None:
                 if len(attachments) >= MAX_FILES:
-                    raise ValueError(f"Pilot supports at most {MAX_FILES} files per message")
+                    raise ValueError(f"At most {MAX_FILES} files per message are supported")
                 size_total += len(derived[2])
                 if size_total > MAX_TOTAL_FILES:
-                    raise ValueError("Total attachment bytes exceed the 12 MiB pilot limit")
+                    raise ValueError("Total attachment bytes exceed the 24 MiB limit")
                 attachments.append(derived)
             else:
                 texts.append(part["text"])
@@ -279,7 +283,7 @@ def parse_user_message(body: dict) -> tuple[str, list[tuple[str, str, bytes]]]:
         if kind not in ("image", "audio", "video", "document"):
             raise ValueError(f"Unsupported AG-UI content part: {str(kind)[:40]}")
         if len(attachments) >= MAX_FILES:
-            raise ValueError(f"Pilot supports at most {MAX_FILES} files per message")
+            raise ValueError(f"At most {MAX_FILES} files per message are supported")
         source = part.get("source")
         if not isinstance(source, dict) or source.get("type") != "data":
             raise ValueError("File references/URLs are not supported yet; send inline AG-UI data")
@@ -294,7 +298,7 @@ def parse_user_message(body: dict) -> tuple[str, list[tuple[str, str, bytes]]]:
             raise ValueError("Attachment exceeds the 8 MiB pilot limit or is empty")
         size_total += len(data)
         if size_total > MAX_TOTAL_FILES:
-            raise ValueError("Total attachment bytes exceed the 12 MiB pilot limit")
+            raise ValueError("Total attachment bytes exceed the 24 MiB limit")
         mime = source.get("mimeType", "application/octet-stream")
         if not isinstance(mime, str) or len(mime) > 120 or "\n" in mime:
             raise ValueError("Invalid attachment MIME type")
@@ -846,7 +850,7 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     raise ValueError("Invalid chunk size") from None
                 if size < 0 or total + size > MAX_BODY:
-                    raise ValueError("Invalid request size")
+                    raise PayloadTooLarge("Request exceeds the 64 MiB AG-UI limit")
                 if size == 0:
                     # Consume permitted trailers so the framing stays well-formed.
                     trailer_bytes = 0
@@ -867,7 +871,9 @@ class Handler(BaseHTTPRequestHandler):
             size = int(content_length or "0")
         except ValueError:
             raise ValueError("Invalid Content-Length") from None
-        if size <= 0 or size > MAX_BODY:
+        if size > MAX_BODY:
+            raise PayloadTooLarge("Request exceeds the 64 MiB AG-UI limit")
+        if size <= 0:
             raise ValueError("Invalid request size")
         data = self.rfile.read(size)
         if len(data) != size:
@@ -926,6 +932,10 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 return
             prompt_bytes = len(user_text.encode("utf-8"))
+        except PayloadTooLarge as exc:
+            self.json_response(413, {"error": str(exc), "code": "request_too_large",
+                                     "max_bytes": MAX_BODY})
+            return
         except (ValueError, json.JSONDecodeError, TypeError, TimeoutError) as exc:
             self.json_response(400, {"error": str(exc)})
             return
@@ -1089,7 +1099,7 @@ class Handler(BaseHTTPRequestHandler):
                 "For this integration test, enclose your final response between "
                 "these exact lines, with no formatting around them:\n"
                 f"{begin}\n<your response>\n{end}\n"
-                "To return up to two screenshots, save actual PNG, JPEG, or WebP files "
+                "To return up to four screenshots, save actual PNG, JPEG, or WebP files "
                 f"into .openbot-outbox/{marker_id}/ and put one line "
                 "OPENBOT_IMAGE: filename.png in your response for each screenshot "
                 "(filename only, no directory). These image lines must be INSIDE "
