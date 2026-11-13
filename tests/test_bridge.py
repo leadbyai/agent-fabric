@@ -334,6 +334,92 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("could not be correlated", self.events(body)[-1]["message"])
         self.assertEqual(len(self.prompts), 1)
 
+    def test_early_idle_status_waits_for_correlated_reply_before_next_prompt(self):
+        """A successful Herdr --wait return may precede its reply marker."""
+        self.enable_bounded_queue(seconds=2)
+        self.bridge.RECOVERY_SECONDS = 1
+        submitted = threading.Event()
+        allow_reply = threading.Event()
+        recorded = {}
+        base = self.fake_command
+
+        def early_idle(*args, **kwargs):
+            if args[:2] == ("agent", "prompt") and "Message one" in args[3]:
+                self.prompts.append((kwargs.get("session"), args[2], args[3]))
+                marker = re.search(r"OPENBOT_BEGIN_([A-F0-9]{16})", args[3]).group(1)
+                recorded["first_reply"] = (
+                    f"OPENBOT_BEGIN_{marker}\nTEST A COMPLETE\nOPENBOT_END_{marker}"
+                )
+                submitted.set()
+                return '{"result":{"agent_status":"done"}}'
+            if args[:2] == ("agent", "read") and not allow_reply.is_set():
+                return "First reply has not appeared in Herdr yet"
+            if args[:2] == ("agent", "read") and len(self.prompts) == 1:
+                return recorded["first_reply"]
+            return base(*args, **kwargs)
+
+        self.bridge.command = early_idle
+        results = {}
+
+        def send(number, text):
+            body = self.message(text)
+            body["runId"] = f"run{number}"
+            body["threadId"] = f"thread{number}"
+            results[number] = self.request("POST", "/ag-ui", body)
+
+        first = threading.Thread(target=send, args=(1, "Message one"))
+        second = threading.Thread(target=send, args=(2, "Message two"))
+        first.start()
+        self.assertTrue(submitted.wait(timeout=2))
+        second.start()
+        try:
+            time.sleep(0.15)
+            self.assertEqual(len(self.prompts), 1,
+                             "Second prompt must not bypass uncorrelated first request")
+            allow_reply.set()
+            first.join(timeout=3)
+            second.join(timeout=3)
+        finally:
+            allow_reply.set()
+            first.join(timeout=3)
+            second.join(timeout=3)
+
+        self.assertEqual([results[i][0] for i in (1, 2)], [200, 200])
+        self.assertTrue(all(self.events(results[i][1])[-1]["type"] == "RUN_FINISHED"
+                            for i in (1, 2)))
+        self.assertEqual(len(self.prompts), 2)
+        self.assertIn("TEST A COMPLETE", results[1][1])
+
+    def test_stream_disconnect_after_submission_does_not_abandon_ledger(self):
+        """A browser that cancels its stream cannot abort submitted Herdr work."""
+        self.bridge.LEDGER = self.bridge.RequestLedger(
+            str(Path(self.tmp.name) / "requests.sqlite3"))
+        self.bridge.HEARTBEAT_SECONDS = 0.02
+        original = self.fake_command
+
+        def slow_command(*args, **kwargs):
+            if args[:2] == ("agent", "prompt"):
+                time.sleep(0.10)
+            return original(*args, **kwargs)
+
+        self.bridge.command = slow_command
+        original_send_event = self.bridge.Handler.send_event
+
+        def disconnect_when_reserved(handler, payload):
+            if payload.get("name") == "agent-fabric.request":
+                raise BrokenPipeError("browser closed the AG-UI stream")
+            return original_send_event(handler, payload)
+
+        with patch.object(self.bridge.Handler, "send_event", new=disconnect_when_reserved), \
+             patch.object(self.bridge.Handler, "send_reply", side_effect=BrokenPipeError):
+            status, _ = self.request("POST", "/ag-ui", self.message("One task"))
+        self.assertEqual(status, 200)
+        self.assertEqual(len(self.prompts), 1)
+        key = self.bridge.LEDGER.key("Main", "wA:p1", "t1", "r1")
+        record = self.bridge.LEDGER.get(key)
+        self.assertEqual(record["state"], "finished")
+        self.assertIn("Reply from Main/wA:p1", record["reply"])
+
     def test_completed_request_is_replayed_without_resubmitting(self):
         ledger_file = str(Path(self.tmp.name) / "requests.sqlite3")
         self.bridge.LEDGER = self.bridge.RequestLedger(ledger_file)
