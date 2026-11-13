@@ -58,6 +58,7 @@ class BridgeTests(unittest.TestCase):
             "OPENBOT_BRIDGE_WORKDIR": str(root / "demo"),
             "OPENBOT_BRIDGE_ARTIFACT_DIR": str(root / "artifacts"),
             "OPENBOT_BRIDGE_PUBLIC_ORIGIN": "https://lbai-agents.leadbyai.bot",
+            "OPENBOT_BRIDGE_ARTIFACT_MODE": "inline",
         }
         with patch.dict(os.environ, env):
             spec = importlib.util.spec_from_file_location("bridge_test", BRIDGE_PATH)
@@ -208,10 +209,20 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(paths[0].read_bytes(), ONE_PIXEL_PNG)
         self.assertIn("1-capture.png", self.prompts[-1][2])
 
-    def test_screenshot_from_agent_is_previewable_without_bearer(self):
+    def test_screenshot_from_agent_is_embedded_in_authenticated_chat(self):
         status, body = self.request("POST", "/ag-ui", self.message("Create a screenshot"))
         self.assertEqual(status, 200)
         self.assertIn("RUN_FINISHED", body)
+        self.assertIn("data:image/png;base64,", body)
+        self.assertIn(base64.b64encode(ONE_PIXEL_PNG).decode("ascii"), body)
+        self.assertNotIn("https://lbai-agents.leadbyai.bot/artifacts/", body)
+        # Inline mode exposes no unauthenticated public artifact endpoint.
+        self.assertEqual(self.request("GET", "/artifacts/" + "x" * 43 + ".png", auth=False)[0], 404)
+
+    def test_opt_in_capability_url_mode_is_explicit_and_retrievable(self):
+        self.bridge.ARTIFACT_MODE = "signed_url"
+        status, body = self.request("POST", "/ag-ui", self.message("Create a screenshot"))
+        self.assertEqual(status, 200)
         match = re.search(r"https://lbai-agents.leadbyai.bot(/artifacts/[A-Za-z0-9_-]+\.png)", body)
         self.assertIsNotNone(match)
         artifact_path = match.group(1)
