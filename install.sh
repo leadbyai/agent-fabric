@@ -3,10 +3,10 @@
 # Does NOT modify any existing Herdr session or openbot-herdr-pilot.service.
 set -euo pipefail
 
-RELEASE_VERSION="v0.7.0-rc3"
+RELEASE_VERSION="v0.7.1-rc1"
 RELEASE_URL="https://raw.githubusercontent.com/leadbyai/agent-fabric/${RELEASE_VERSION}"
-BRIDGE_SHA256="7c211224a2532335a21b0b97e25c0197c97631d4d29e515b365e361f4be71676"
-LEDGER_SHA256="c675b60a26a462690361951e6569848831f3efecf15577bb34dcb71babf2f49d"
+BRIDGE_SHA256="71245d5bd38a637c403fb3745d133e0ad4c6654581a859832ea8b6d5ecaa1c43"
+LEDGER_SHA256="e8d189feb578e2246d2af1bc75986534653ac3d3eefaaf8f1fa7f9edcbe5f008"
 RUN_USER=""
 HERDR_SESSIONS=""
 UPLOAD_ROOTS=""
@@ -199,6 +199,17 @@ StateDirectoryMode=0700
 WantedBy=multi-user.target
 EOF
 chmod 0644 "$UNIT_FILE"
+# v0.7.1 migrates the request ledger schema on first start. Take a consistent
+# online copy first (sqlite backup API; safe while the old gateway runs).
+LEDGER_DB="$STATE_DIR/requests.sqlite3"
+if [[ -f "$LEDGER_DB" && ! -L "$LEDGER_DB" ]]; then
+  python3 -I -c 'import sqlite3,sys
+src=sqlite3.connect("file:"+sys.argv[1]+"?mode=ro",uri=True); dst=sqlite3.connect(sys.argv[2])
+src.backup(dst); dst.close(); src.close()' "$LEDGER_DB" "$LEDGER_DB.bak.$BACKUP_STAMP" \
+    || die "Could not back up the request ledger; nothing restarted"
+  chown "$RUN_USER:$(id -gn "$RUN_USER")" "$LEDGER_DB.bak.$BACKUP_STAMP"
+  chmod 0600 "$LEDGER_DB.bak.$BACKUP_STAMP"
+fi
 systemctl daemon-reload
 if ((SKIP_START == 0)); then
   systemctl enable openbot-herdr-gateway.service
