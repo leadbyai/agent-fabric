@@ -26,6 +26,33 @@ usage() {
 }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Backend choice. herdr (default) is the unchanged Herdr gateway install below.
+#   --backend hermes  delegates to install-hermes.sh (run as the Hermes user, no sudo); every other
+#                     option is passed through unchanged.
+#   --backend both    runs the Herdr install, then install-hermes.sh as --user with the options
+#                     given as --hermes-<option> (e.g. --hermes-profiles NAME --hermes-bind IP).
+BACKEND="herdr"
+HERMES_ARGS=()
+REST_ARGS=()
+while (($#)); do
+  case "$1" in
+    --backend) (($# >= 2)) || die "Missing value for --backend"; BACKEND="$2"; shift 2 ;;
+    --hermes-no-start|--hermes-uninstall) HERMES_ARGS+=("--${1#--hermes-}"); shift ;;
+    --hermes-*) (($# >= 2)) || die "Missing value for $1"; HERMES_ARGS+=("--${1#--hermes-}" "$2"); shift 2 ;;
+    *) REST_ARGS+=("$1"); shift ;;
+  esac
+done
+set -- ${REST_ARGS[@]+"${REST_ARGS[@]}"}
+HERMES_INSTALLER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/install-hermes.sh"
+case "$BACKEND" in
+  herdr) ((${#HERMES_ARGS[@]} == 0)) || die "--hermes-* options need --backend both" ;;
+  hermes)
+    [[ -f "$HERMES_INSTALLER" ]] || die "install-hermes.sh not found next to install.sh"
+    exec bash "$HERMES_INSTALLER" "$@" ;;
+  both) [[ -f "$HERMES_INSTALLER" ]] || die "install-hermes.sh not found next to install.sh" ;;
+  *) die "--backend must be herdr, hermes or both" ;;
+esac
+
 while (($#)); do
   case "$1" in
     --user|--sessions|--roots|--legacy-target|--legacy-workdir|--token-file|--port|--busy-wait-seconds|--recovery-seconds|--source-dir|--public-origin|--artifact-mode)
@@ -235,3 +262,9 @@ printf 'Gateway installed: %s, user=%s, sessions=%s, port=%s\n' "$RELEASE_VERSIO
 printf 'Busy wait=%ss, recovery=%ss; run ledger stays on this server when either is enabled.\n' "$BUSY_WAIT_SECONDS" "$RECOVERY_SECONDS"
 printf 'Bearer token stored locally at %s (not printed).\n' "$CONF_DIR/bridge.token"
 printf 'Existing pilot bridge and Herdr sessions were not modified.\n'
+
+if [[ "$BACKEND" == both ]]; then
+  # Additive Hermes bridge, installed as the same user's own systemd --user service.
+  runuser -u "$RUN_USER" -- env XDG_RUNTIME_DIR="/run/user/$(id -u "$RUN_USER")" \
+    bash "$HERMES_INSTALLER" "${HERMES_ARGS[@]}"
+fi

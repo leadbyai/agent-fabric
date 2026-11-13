@@ -1,0 +1,47 @@
+# Hermes backend (draft, pilot)
+
+`hermes_bridge.py` serves AG-UI for **existing Hermes Agent profiles** on the same server, next to the
+Herdr gateway (which is unchanged). It attaches to the already-running Hermes gateway using Hermes'
+own supported local client:
+
+1. `hermes_cli.gateway_runtime.discover_gateway_endpoint(profile_home)`: read-only, never spawns a gateway;
+2. a one-use ticket from the gateway's private control socket (same Unix user only);
+3. the loopback canonical WebSocket (`hermes-gateway-v1`).
+
+## What is a permanent agent
+A **served Hermes profile**. Its stable identity is `(install_id, profile_id)`: the install id comes from
+`profiles.list`, and the profile id is the profile home. `instance_id` changes per gateway run and is only
+runtime state. Cron executions, subagents (`delegate_task` children) and individual conversations are
+never listed as agents. Only profiles named in `HERMES_PROFILES` are exposed.
+
+## Routes
+| Route | Auth | Purpose |
+| --- | --- | --- |
+| `GET /health` | none | liveness |
+| `GET /agents` | bearer | allowed, served profiles with stable identity and display name |
+| `POST /profiles/<name>/ag-ui` | bearer | one AG-UI run |
+| `GET /requests/<id>` | bearer | ledger state of a run |
+
+## Sessions and safety
+- Each OpenBot thread gets **its own new Hermes session**, with `session.create` and source `gui`. The
+  thread → session map lives in the private ledger, and later runs resume that session. The bridge never
+  attaches to TUI, messaging, cron or subagent sessions it did not create.
+- **Existing-session binding** (off by default): an operator can bind a thread to an existing native
+  session id (`origin = bound`). It is resumed only with `HERMES_ALLOW_NATIVE_ATTACH=1`. The Hermes REST
+  sessions API is never used to claim sessions.
+- **Idempotency:** `prompt.submit` carries `input_id = H(profile, thread, run)`, and the ledger replays a
+  finished run or refuses an in-doubt one. A run is never resent.
+- **Approvals:** surfaced as a CUSTOM `agent-fabric.approval` event plus a text notice, then answered
+  with the offered deny choice. `unattended` is never set, because it would auto-approve.
+  Clarify prompts are answered as skipped.
+- **Tool activity:** reported as CUSTOM `agent-fabric.tool` events, not AG-UI `TOOL_CALL_*`. OpenBot
+  would treat those as tools for it to run.
+- **Binding:** loopback or the host's Tailscale (100.64.0.0/10) address only. Text only for now;
+  attachments are refused with a clear error.
+
+## Install (as the profiles' Unix user; additive user service)
+```bash
+bash install-hermes.sh --source-dir <reviewed checkout> --profiles <name> --bind <tailscale-ip> --port 8767
+bash install-hermes.sh --uninstall   # rollback
+```
+`install.sh --backend hermes|both` delegates here. `--backend herdr` (the default) is the unchanged Herdr install.
