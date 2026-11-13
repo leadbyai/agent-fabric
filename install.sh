@@ -3,9 +3,10 @@
 # Does NOT modify any existing Herdr session or openbot-herdr-pilot.service.
 set -euo pipefail
 
-RELEASE_VERSION="v0.5.1"
+RELEASE_VERSION="v0.6.0"
 RELEASE_URL="https://raw.githubusercontent.com/leadbyai/agent-fabric/${RELEASE_VERSION}"
-BRIDGE_SHA256="fae6cb09f3bfece64559b85db64a95136df7f23a50be356041dcd91446639680"
+BRIDGE_SHA256="3031160dc0336f496654e627c00c8c2bf81081be6f29dbc6aba2a400ae772ee1"
+LEDGER_SHA256="c675b60a26a462690361951e6569848831f3efecf15577bb34dcb71babf2f49d"
 RUN_USER=""
 HERDR_SESSIONS=""
 UPLOAD_ROOTS=""
@@ -13,17 +14,19 @@ LEGACY_TARGET=""
 LEGACY_WORKDIR=""
 TOKEN_SOURCE=""
 GATEWAY_PORT="8766"
+BUSY_WAIT_SECONDS="0"
+RECOVERY_SECONDS="0"
 SOURCE_DIR=""
 SKIP_START=0
 
 usage() {
-  printf 'Usage: sudo bash install.sh --user USER --sessions NAME[,NAME] --roots DIR[:DIR] [--legacy-target NAME --legacy-workdir DIR] [--token-file PATH] [--port 8766] [--source-dir DIR] [--no-start]\n'
+  printf 'Usage: sudo bash install.sh --user USER --sessions NAME[,NAME] --roots DIR[:DIR] [--legacy-target NAME --legacy-workdir DIR] [--token-file PATH] [--port 8766] [--busy-wait-seconds 600] [--recovery-seconds 600] [--source-dir DIR] [--no-start]\n'
 }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 while (($#)); do
   case "$1" in
-    --user|--sessions|--roots|--legacy-target|--legacy-workdir|--token-file|--port|--source-dir)
+    --user|--sessions|--roots|--legacy-target|--legacy-workdir|--token-file|--port|--busy-wait-seconds|--recovery-seconds|--source-dir)
       (($# >= 2)) || die "Missing value for $1"
       case "$1" in
         --user) RUN_USER="$2" ;;
@@ -33,6 +36,8 @@ while (($#)); do
         --legacy-workdir) LEGACY_WORKDIR="$2" ;;
         --token-file) TOKEN_SOURCE="$2" ;;
         --port) GATEWAY_PORT="$2" ;;
+        --busy-wait-seconds) BUSY_WAIT_SECONDS="$2" ;;
+        --recovery-seconds) RECOVERY_SECONDS="$2" ;;
         --source-dir) SOURCE_DIR="$2" ;;
       esac
       shift 2 ;;
@@ -47,6 +52,9 @@ done
 id -u "$RUN_USER" >/dev/null 2>&1 || die "User $RUN_USER does not exist"
 [[ "$GATEWAY_PORT" =~ ^[0-9]{4,5}$ ]] || die "Invalid port"
 ((GATEWAY_PORT >= 1024 && GATEWAY_PORT <= 65535)) || die "Invalid port"
+[[ "$BUSY_WAIT_SECONDS" =~ ^[0-9]{1,4}$ ]] || die "Invalid busy wait"
+[[ "$RECOVERY_SECONDS" =~ ^[0-9]{1,4}$ ]] || die "Invalid recovery wait"
+((BUSY_WAIT_SECONDS <= 3600 && RECOVERY_SECONDS <= 3600)) || die "Waits must be at most 3600 seconds"
 [[ "$HERDR_SESSIONS" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]] || die "Invalid --sessions"
 [[ -n "$UPLOAD_ROOTS" && "$UPLOAD_ROOTS" =~ ^[A-Za-z0-9_./,:-]+$ ]] || die "Invalid --roots"
 [[ -z "$LEGACY_TARGET" || "$LEGACY_TARGET" =~ ^([a-z][a-z0-9_-]{0,31}|w[0-9A-Za-z]+:p[0-9A-Za-z]+)$ ]] || die "Invalid legacy target"
@@ -71,12 +79,14 @@ HERDR_EXEC="$RUN_HOME/.local/bin/herdr"
 [[ -x "$HERDR_EXEC" ]] || die "Herdr binary not executable at $HERDR_EXEC"
 if [[ -n "$SOURCE_DIR" ]]; then
   [[ -f "$SOURCE_DIR/bridge.py" ]] || die "Missing bridge.py in source directory"
+  [[ -f "$SOURCE_DIR/request_ledger.py" ]] || die "Missing request_ledger.py in source directory"
 fi
 
 APP_DIR="/opt/openbot-herdr-bridge"
 CONF_DIR="/etc/openbot-herdr-bridge"
+STATE_DIR="/var/lib/openbot-herdr-gateway"
 UNIT_FILE="/etc/systemd/system/openbot-herdr-gateway.service"
-[[ ! -L "$APP_DIR" && ! -L "$CONF_DIR" && ! -L "$UNIT_FILE" ]] || die "Managed destination cannot be a symlink"
+[[ ! -L "$APP_DIR" && ! -L "$CONF_DIR" && ! -L "$STATE_DIR" && ! -L "$UNIT_FILE" ]] || die "Managed destination cannot be a symlink"
 if [[ -f "$UNIT_FILE" ]] && ! grep -q 'Managed by openbot-herdr-bridge installer' "$UNIT_FILE"; then
   die "Unmanaged service already exists at $UNIT_FILE"
 fi
@@ -86,26 +96,37 @@ fi
 
 install -d -m 0755 "$APP_DIR"
 install -d -m 0700 "$CONF_DIR"
+install -d -o "$RUN_USER" -g "$(id -gn "$RUN_USER")" -m 0700 "$STATE_DIR"
 TEMP_FILE="$(mktemp "$APP_DIR/.bridge.py.XXXXXX")"
-trap 'test ! -e "$TEMP_FILE" || rm -f -- "$TEMP_FILE"' EXIT
+TEMP_LEDGER="$(mktemp "$APP_DIR/.request_ledger.py.XXXXXX")"
+trap 'test ! -e "$TEMP_FILE" || rm -f -- "$TEMP_FILE"; test ! -e "$TEMP_LEDGER" || rm -f -- "$TEMP_LEDGER"' EXIT
 if [[ -n "$SOURCE_DIR" ]]; then
   cp -- "$SOURCE_DIR/bridge.py" "$TEMP_FILE"
+  cp -- "$SOURCE_DIR/request_ledger.py" "$TEMP_LEDGER"
 else
   command -v curl >/dev/null || die "curl required"
   curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --max-time 30 \
     "$RELEASE_URL/bridge.py" -o "$TEMP_FILE"
+  curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --max-time 30 \
+    "$RELEASE_URL/request_ledger.py" -o "$TEMP_LEDGER"
 fi
 
-if [[ "$BRIDGE_SHA256" != __BRIDGE_SHA256__ ]]; then
+if [[ "$BRIDGE_SHA256" != __BRIDGE_SHA256__ && "$LEDGER_SHA256" != __LEDGER_SHA256__ ]]; then
   printf '%s  %s\n' "$BRIDGE_SHA256" "$TEMP_FILE" | sha256sum -c - >/dev/null || die "Bridge SHA256 mismatch"
+  printf '%s  %s\n' "$LEDGER_SHA256" "$TEMP_LEDGER" | sha256sum -c - >/dev/null || die "Ledger SHA256 mismatch"
 elif [[ -z "$SOURCE_DIR" ]]; then
   die "Release checksum not finalized; use a signed release or --source-dir"
 fi
-python3 -m py_compile "$TEMP_FILE" || die "Gateway code did not compile"
+python3 -m py_compile "$TEMP_FILE" "$TEMP_LEDGER" || die "Gateway code did not compile"
+BACKUP_STAMP="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 if [[ -f "$APP_DIR/bridge.py" ]]; then
-  cp -p -- "$APP_DIR/bridge.py" "$APP_DIR/bridge.py.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+  cp -p -- "$APP_DIR/bridge.py" "$APP_DIR/bridge.py.bak.$BACKUP_STAMP"
+fi
+if [[ -f "$APP_DIR/request_ledger.py" ]]; then
+  cp -p -- "$APP_DIR/request_ledger.py" "$APP_DIR/request_ledger.py.bak.$BACKUP_STAMP"
 fi
 install -m 0755 "$TEMP_FILE" "$APP_DIR/bridge.py"
+install -m 0644 "$TEMP_LEDGER" "$APP_DIR/request_ledger.py"
 
 if [[ -n "$TOKEN_SOURCE" ]]; then
   install -m 0600 "$TOKEN_SOURCE" "$CONF_DIR/bridge.token"
@@ -116,7 +137,13 @@ fi
 [[ $(wc -c < "$CONF_DIR/bridge.token") -ge 24 ]] || die "Existing bearer token too short"
 
 CONFIG_TEMP="$(mktemp "$CONF_DIR/.config.env.XXXXXX")"
-trap 'test ! -e "$CONFIG_TEMP" || rm -f -- "$CONFIG_TEMP"; test ! -e "$TEMP_FILE" || rm -f -- "$TEMP_FILE"' EXIT
+trap 'test ! -e "$CONFIG_TEMP" || rm -f -- "$CONFIG_TEMP"; test ! -e "$TEMP_FILE" || rm -f -- "$TEMP_FILE"; test ! -e "$TEMP_LEDGER" || rm -f -- "$TEMP_LEDGER"' EXIT
+if [[ -f "$CONF_DIR/config.env" ]]; then
+  cp -p -- "$CONF_DIR/config.env" "$CONF_DIR/config.env.bak.$BACKUP_STAMP"
+fi
+if [[ -f "$UNIT_FILE" ]]; then
+  cp -p -- "$UNIT_FILE" "$UNIT_FILE.bak.$BACKUP_STAMP"
+fi
 {
   printf 'HERDR_SESSIONS=%s\n' "$HERDR_SESSIONS"
   printf 'HERDR_SESSION=%s\n' "${HERDR_SESSIONS%%,*}"
@@ -126,6 +153,11 @@ trap 'test ! -e "$CONFIG_TEMP" || rm -f -- "$CONFIG_TEMP"; test ! -e "$TEMP_FILE
   printf 'OPENBOT_BRIDGE_ALLOWED_ROOTS=%s\n' "$UPLOAD_ROOTS"
   printf 'OPENBOT_BRIDGE_WORKDIR=%s\n' "$LEGACY_WORKDIR"
   printf 'OPENBOT_BRIDGE_HOST=127.0.0.1\n'
+  printf 'OPENBOT_BRIDGE_BUSY_WAIT_SECONDS=%s\n' "$BUSY_WAIT_SECONDS"
+  printf 'OPENBOT_BRIDGE_RECOVERY_SECONDS=%s\n' "$RECOVERY_SECONDS"
+  if (( BUSY_WAIT_SECONDS > 0 || RECOVERY_SECONDS > 0 )); then
+    printf 'OPENBOT_BRIDGE_LEDGER_PATH=%s/requests.sqlite3\n' "$STATE_DIR"
+  fi
 } > "$CONFIG_TEMP"
 install -m 0600 "$CONFIG_TEMP" "$CONF_DIR/config.env"
 
@@ -148,6 +180,8 @@ Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
 PrivateTmp=true
+StateDirectory=openbot-herdr-gateway
+StateDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target
@@ -166,11 +200,26 @@ if ((SKIP_START == 0)); then
     fi
     sleep 1
   done
-  ((HEALTHY == 1)) || die "Gateway did not pass local health check"
-  systemctl is-active --quiet openbot-herdr-gateway.service || die "Gateway failed to start"
+  if ((HEALTHY != 1)) || ! systemctl is-active --quiet openbot-herdr-gateway.service; then
+    if [[ -f "$APP_DIR/bridge.py.bak.$BACKUP_STAMP" &&
+          -f "$CONF_DIR/config.env.bak.$BACKUP_STAMP" &&
+          -f "$UNIT_FILE.bak.$BACKUP_STAMP" ]]; then
+      cp -p -- "$APP_DIR/bridge.py.bak.$BACKUP_STAMP" "$APP_DIR/bridge.py"
+      cp -p -- "$CONF_DIR/config.env.bak.$BACKUP_STAMP" "$CONF_DIR/config.env"
+      cp -p -- "$UNIT_FILE.bak.$BACKUP_STAMP" "$UNIT_FILE"
+      if [[ -f "$APP_DIR/request_ledger.py.bak.$BACKUP_STAMP" ]]; then
+        cp -p -- "$APP_DIR/request_ledger.py.bak.$BACKUP_STAMP" "$APP_DIR/request_ledger.py"
+      fi
+      systemctl daemon-reload
+      systemctl restart openbot-herdr-gateway.service || true
+      die "Gateway failed health check; attempted restoration of previous code, config and service"
+    fi
+    die "Gateway failed health check; no previous deployment available to restore"
+  fi
 else
   printf 'Prepared; run sudo systemctl enable --now openbot-herdr-gateway.service after review.\n'
 fi
 printf 'Gateway installed: %s, user=%s, sessions=%s, port=%s\n' "$RELEASE_VERSION" "$RUN_USER" "$HERDR_SESSIONS" "$GATEWAY_PORT"
+printf 'Busy wait=%ss, recovery=%ss; run ledger stays on this server when either is enabled.\n' "$BUSY_WAIT_SECONDS" "$RECOVERY_SECONDS"
 printf 'Bearer token stored locally at %s (not printed).\n' "$CONF_DIR/bridge.token"
 printf 'Existing pilot bridge and Herdr sessions were not modified.\n'
