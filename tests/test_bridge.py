@@ -668,5 +668,280 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("Message two", self.prompts[1][2])
 
 
+    # ---- v0.7.1: durable queued state -----------------------------------
+    def ledger(self):
+        self.bridge.LEDGER = self.bridge.RequestLedger(str(Path(self.tmp.name) / "requests.sqlite3"))
+        return self.bridge.LEDGER
+
+    def test_queued_request_is_durable_while_waiting_then_submitted(self):
+        ledger = self.ledger()
+        self.enable_bounded_queue(seconds=3)
+        agent = self.roster["Main"][0]
+        agent["agent_status"] = "working"
+        key = ledger.key("Main", "wA:p1", "t1", "r1")
+        seen = {}
+
+        def observe_then_release():
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                record = ledger.get(key)
+                if record:
+                    seen["state"] = record["state"]
+                    seen["attention"] = json.loads(self.request("GET", "/attention")[1])
+                    break
+                time.sleep(0.01)
+            agent["agent_status"] = "idle"
+
+        watcher = threading.Thread(target=observe_then_release)
+        watcher.start()
+        status, body = self.request("POST", "/ag-ui", self.message("Wait your turn"))
+        watcher.join(timeout=3)
+        self.assertEqual(status, 200)
+        self.assertEqual(seen["state"], "queued")
+        self.assertEqual([r["id"] for r in seen["attention"]["queued_requests"]], [key])
+        events = self.events(body)
+        self.assertTrue(any(e.get("name") == "agent-fabric.request" and
+                            e["value"]["state"] == "queued" for e in events))
+        self.assertEqual(events[-1]["type"], "RUN_FINISHED")
+        self.assertEqual(ledger.get(key)["state"], "finished")
+        self.assertEqual(len(self.prompts), 1)
+
+    def test_expired_wait_is_recorded_failed_and_retry_is_allowed(self):
+        ledger = self.ledger()
+        self.enable_bounded_queue(seconds=0.12)
+        self.roster["Main"][0]["agent_status"] = "working"
+        status, body = self.request("POST", "/ag-ui", self.message("Too early"))
+        self.assertEqual(self.events(body)[-1]["type"], "RUN_ERROR")
+        key = ledger.key("Main", "wA:p1", "t1", "r1")
+        record = ledger.get(key)
+        self.assertEqual(record["state"], "failed")
+        self.assertIn("waiting expired", record["reason"])
+        detail = json.loads(self.request("GET", "/requests/" + key)[1])
+        self.assertEqual(detail["state"], "failed")
+        failures = json.loads(self.request("GET", "/attention")[1])["recent_failed_requests"]
+        self.assertEqual([f["id"] for f in failures], [key])
+        self.assertEqual(self.prompts, [])
+        # Same run retried once the agent is free: provably unsent, so allowed.
+        self.roster["Main"][0]["agent_status"] = "idle"
+        status, body = self.request("POST", "/ag-ui", self.message("Too early"))
+        self.assertEqual(self.events(body)[-1]["type"], "RUN_FINISHED")
+        self.assertEqual(ledger.get(key)["state"], "finished")
+        self.assertEqual(len(self.prompts), 1)
+
+    def test_restart_while_queued_marks_request_failed_not_lost(self):
+        """B waits behind A; the gateway dies. On start, B is explicitly failed."""
+        ledger_file = str(Path(self.tmp.name) / "requests.sqlite3")
+        ledger = self.bridge.RequestLedger(ledger_file)
+        key_a = ledger.key("Main", "wA:p1", "t1", "rA")
+        key_b = ledger.key("Main", "wA:p1", "t1", "rB")
+        ledger.enqueue(key_a, "Main", "wA:p1", "fa", "MA")
+        ledger.reserve(key_a, "Main", "wA:p1", "fa", "MA")       # A was submitted
+        ledger.enqueue(key_b, "Main", "wA:p1", "fb", "MB")       # B still waiting
+        # Process killed here. New process:
+        restarted = self.bridge.RequestLedger(ledger_file)
+        self.assertEqual(restarted.fail_abandoned_queue(), 1)
+        self.assertEqual(restarted.get(key_a)["state"], "submitted")   # untouched
+        b = restarted.get(key_b)
+        self.assertEqual((b["state"], b["reason"]), ("failed", "gateway_restarted_before_submit"))
+        self.assertEqual(restarted.queued(), [])
+        self.assertEqual([f["id"] for f in restarted.recent_failures()], [key_b])
+
+    def test_sigterm_releases_queued_waiter_with_error_and_refuses_new_runs(self):
+        ledger = self.ledger()
+        self.enable_bounded_queue(seconds=3)
+        self.roster["Main"][0]["agent_status"] = "working"
+        key = ledger.key("Main", "wA:p1", "t1", "r1")
+
+        def shut_down_when_queued():
+            deadline = time.time() + 2
+            while time.time() < deadline and not ledger.queued():
+                time.sleep(0.01)
+            self.bridge.SHUTTING_DOWN.set()
+
+        trigger = threading.Thread(target=shut_down_when_queued)
+        trigger.start()
+        status, body = self.request("POST", "/ag-ui", self.message("Queued during restart"))
+        trigger.join(timeout=3)
+        events = self.events(body)
+        self.assertEqual(events[-1]["type"], "RUN_ERROR")
+        self.assertIn("Gateway is restarting", events[-1]["message"])
+        record = ledger.get(key)
+        self.assertEqual(record["state"], "failed")
+        self.assertIn("restarting", record["reason"])
+        self.assertEqual(self.prompts, [])
+        body2 = self.message("New during restart")
+        body2["runId"] = "r2"
+        status, payload = self.request("POST", "/ag-ui", body2)
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(payload)["code"], "gateway_restarting")
+        self.assertEqual(self.prompts, [])
+
+    def test_client_disconnect_while_queued_is_recorded_failed(self):
+        ledger = self.ledger()
+        self.enable_bounded_queue(seconds=3)
+        self.roster["Main"][0]["agent_status"] = "working"
+        original_progress = self.bridge.Handler.send_progress
+
+        def broken_progress(handler, state):
+            raise BrokenPipeError("browser closed")
+
+        with patch.object(self.bridge.Handler, "send_progress", new=broken_progress):
+            self.request("POST", "/ag-ui", self.message("Gone"))
+        record = ledger.get(ledger.key("Main", "wA:p1", "t1", "r1"))
+        self.assertEqual((record["state"], record["reason"]),
+                         ("failed", "client_disconnected_before_submit"))
+        self.assertEqual(self.prompts, [])
+
+    def test_fifo_two_messages_both_tracked_in_ledger(self):
+        ledger = self.ledger()
+        self.test_two_messages_to_same_agent_are_serialized()
+        states = [ledger.get(ledger.key("Main", "wA:p1", "t1", f"r{i}"))["state"] for i in (1, 2)]
+        self.assertEqual(states, ["finished", "finished"])
+
+    # ---- v0.7.1: history data-URI stripping ------------------------------
+    def test_history_screenshots_are_stripped_before_body_limit(self):
+        self.bridge.MAX_BODY = 512 * 1024
+        big = base64.b64encode(os.urandom(3 * 1024 * 1024)).decode()
+        body = {"threadId": "t1", "runId": "r1", "messages": [
+            {"role": "user", "content": "take a screenshot"},
+            {"role": "assistant", "content": f"Here:\n\n![Screenshot](data:image/png;base64,{big})"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Thanks, now this one"},
+                {"type": "image", "source": {"type": "data", "mimeType": "image/png",
+                                             "value": base64.b64encode(ONE_PIXEL_PNG).decode()}}]},
+        ]}
+        status, payload = self.request("POST", "/ag-ui", body)
+        self.assertEqual(status, 200, payload[:300])
+        self.assertEqual(self.events(payload)[-1]["type"], "RUN_FINISHED")
+        self.assertEqual(len(self.prompts), 1)
+        prompt = self.prompts[0][2]
+        self.assertIn("Thanks, now this one", prompt)
+        self.assertNotIn(big[:200], prompt)
+        staged = [p for p in (Path(self.tmp.name) / "demo" / ".openbot-inbox").rglob("1-*") if p.is_file()]
+        self.assertEqual([p.read_bytes() for p in staged], [ONE_PIXEL_PNG])  # real upload intact
+
+    def test_latest_message_over_limit_still_413(self):
+        self.bridge.MAX_BODY = 4096
+        body = self.message("A" * 8000)
+        status, payload = self.request("POST", "/ag-ui", body)
+        self.assertEqual(status, 413)
+        self.assertEqual(self.prompts, [])
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class LedgerMigrationTests(unittest.TestCase):
+    OLD_SCHEMA = """CREATE TABLE requests (
+      key TEXT PRIMARY KEY, session TEXT NOT NULL, pane TEXT NOT NULL,
+      fingerprint TEXT NOT NULL, marker TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('submitted', 'finished', 'uncertain')),
+      reply TEXT, updated_at INTEGER NOT NULL)"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = str(Path(self.tmp.name) / "requests.sqlite3")
+        import sqlite3
+        con = sqlite3.connect(self.path)
+        con.execute(self.OLD_SCHEMA)
+        con.executemany("INSERT INTO requests VALUES (?,?,?,?,?,?,?,?)", [
+            ("k1", "lbai", "w1:p1", "f1", "M1", "finished", "hello", int(time.time())),
+            ("k2", "lbai", "w1:p2", "f2", "M2", "uncertain", None, int(time.time())),
+        ])
+        con.commit()
+        con.close()
+        spec = importlib.util.spec_from_file_location("ledger_test", PACKAGE_ROOT / "request_ledger.py")
+        self.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+
+    def test_v070_ledger_migrates_preserving_rows(self):
+        ledger = self.mod.RequestLedger(self.path)
+        self.assertEqual(ledger.get("k1")["reply"], "hello")
+        self.assertEqual(ledger.get("k2")["state"], "uncertain")
+        self.assertEqual([r["id"] for r in ledger.unresolved()], ["k2"])
+        queued = ledger.enqueue("k3", "lbai", "w1:p1", "f3", "M3")
+        self.assertTrue(queued["created"])
+        self.assertEqual(queued["state"], "queued")
+        # Idempotent: reopening does not migrate again or lose rows.
+        again = self.mod.RequestLedger(self.path)
+        self.assertEqual(again.get("k3")["state"], "queued")
+        self.assertEqual(Path(self.path).stat().st_mode & 0o777, 0o600)
+
+    def test_rollback_code_reads_migrated_ledger_and_fails_closed(self):
+        """v0.7.0 code on a v0.7.1 ledger: no crash, no resend of queued rows."""
+        self.mod.RequestLedger(self.path).enqueue("k3", "lbai", "w1:p1", "f3", "M3")
+        import subprocess as sp
+        old_src = sp.run(["git", "-C", str(PACKAGE_ROOT), "show", "ec7275c:request_ledger.py"],
+                         capture_output=True, text=True)
+        if old_src.returncode != 0:
+            self.skipTest("v0.7.0 source not available in this checkout")
+        old_path = Path(self.tmp.name) / "old_ledger.py"
+        old_path.write_text(old_src.stdout)
+        spec = importlib.util.spec_from_file_location("old_ledger", old_path)
+        old = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(old)
+        ledger = old.RequestLedger(self.path)
+        self.assertEqual(ledger.get("k1")["reply"], "hello")
+        record = ledger.reserve("k3", "lbai", "w1:p1", "f3", "MX")
+        self.assertFalse(record["created"])           # old code refuses: no duplicate send
+        fresh = ledger.reserve("k4", "lbai", "w1:p1", "f4", "M4")
+        self.assertTrue(fresh["created"])
+
+    def test_reserve_only_promotes_own_queued_row(self):
+        ledger = self.mod.RequestLedger(self.path)
+        ledger.enqueue("k5", "lbai", "w1:p1", "f5", "M5")
+        self.assertFalse(ledger.reserve("k5", "lbai", "w1:p1", "f5", "OTHER")["created"])
+        self.assertTrue(ledger.reserve("k5", "lbai", "w1:p1", "f5", "M5")["created"])
+        self.assertFalse(ledger.reserve("k5", "lbai", "w1:p1", "f5", "M5")["created"])
+        ledger.fail("k5", "late")                      # never downgrades a submitted row
+        self.assertEqual(ledger.get("k5")["state"], "submitted")
+        with self.assertRaises(ValueError):
+            ledger.enqueue("k5", "lbai", "w1:p1", "DIFFERENT", "M9")
+
+
+class DataUriStripperTests(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("bridge_strip", BRIDGE_PATH)
+        env = {"HERDR_SESSIONS": "Main", "OPENBOT_BRIDGE_TOKEN": "Z" * 48}
+        with patch.dict(os.environ, env):
+            self.bridge = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(self.bridge)
+
+    def run_stripper(self, data: bytes, chunk: int, min_run: int = 64) -> tuple[bytes, int]:
+        s = self.bridge.DataUriStripper(min_run=min_run)
+        out = b"".join(s.feed(data[i:i + chunk]) for i in range(0, len(data), chunk)) + s.finish()
+        return out, s.stripped
+
+    def test_strips_large_runs_at_every_chunk_size(self):
+        payload = base64.b64encode(os.urandom(3000)).decode()
+        escaped = payload.replace("/", "\\/")
+        doc = {"messages": [{"role": "assistant",
+                             "content": f"a ![x](data:image/png;base64,{payload}) b"},
+                            {"role": "assistant",
+                             "content": f"![y](data:image/webp;base64,{payload})"},
+                            {"role": "user", "content": "keep me data:image/png;base64,QUJD short"}]}
+        variants = [json.dumps(doc).encode(), json.dumps(doc).replace("/", "\\/").encode()]
+        for raw in variants:
+            for chunk in (1, 2, 3, 7, 13, 64, 1000, len(raw)):
+                out, count = self.run_stripper(raw, chunk)
+                parsed = json.loads(out)
+                self.assertEqual(count, 2, chunk)
+                self.assertEqual(parsed["messages"][0]["content"],
+                                 "a ![x](data:image/png;base64,OPENBOT_OMITTED) b")
+                self.assertIn("OPENBOT_OMITTED", parsed["messages"][1]["content"])
+                self.assertEqual(parsed["messages"][2]["content"],
+                                 "keep me data:image/png;base64,QUJD short")
+        self.assertTrue(escaped)
+
+    def test_passthrough_without_data_uris_is_identical(self):
+        raw = json.dumps({"messages": [{"role": "user", "content": "data: image/ nothing; base64"},
+                                       {"role": "user", "content": "x" * 5000 + "data:imag"}]}).encode()
+        for chunk in (1, 5, 4096):
+            self.assertEqual(self.run_stripper(raw, chunk)[0], raw)
+
+    def test_bare_base64_attachment_values_untouched(self):
+        value = base64.b64encode(os.urandom(5000)).decode()
+        raw = json.dumps({"source": {"type": "data", "value": value}}).encode()
+        self.assertEqual(self.run_stripper(raw, 17)[0], raw)
