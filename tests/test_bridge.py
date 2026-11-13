@@ -149,6 +149,78 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.request("POST", "/ag-ui", self.message("Hello"), auth=False)[0], 401)
         self.assertEqual(self.prompts, [])
 
+    def test_reflows_wrapped_prose_without_merging_paragraphs(self):
+        original = (
+            "One change I'd push for: don't name Microsoft or Copilot in the fake chat. Microsoft hasn't said what caused the\n"
+            "outage. A made-up chat between a Microsoft engineer\n"
+            "and Copilot suggests an AI agent caused it, which we can't back up. It would also break our rule against running\n"
+            "down named vendors, on a public post with\n"
+            "LeadByAI's name on it.\n\n"
+            "Instead, I'd label it as satire: an on-call engineer at a very large software company and their AI assistant. The\n"
+            "assistant breaks things with total confidence,\n"
+            "the engineer calls it out, and it answers with the same mistake again. Everyone\n"
+            "will know who we mean. Right after the chat, we\n"
+            "state plainly that the real cause hasn't been disclosed."
+        )
+        expected = (
+            "One change I'd push for: don't name Microsoft or Copilot in the fake chat. Microsoft hasn't said what caused the "
+            "outage. A made-up chat between a Microsoft engineer "
+            "and Copilot suggests an AI agent caused it, which we can't back up. It would also break our rule against running "
+            "down named vendors, on a public post with LeadByAI's name on it.\n\n"
+            "Instead, I'd label it as satire: an on-call engineer at a very large software company and their AI assistant. The "
+            "assistant breaks things with total confidence, "
+            "the engineer calls it out, and it answers with the same mistake again. Everyone "
+            "will know who we mean. Right after the chat, we "
+            "state plainly that the real cause hasn't been disclosed."
+        )
+        self.assertEqual(self.bridge.normalize_prose_wrapping(original), expected)
+        self.assertEqual(self.bridge.normalize_prose_wrapping(expected), expected)
+
+    def test_preserves_markdown_and_intentional_line_breaks(self):
+        message = (
+            "# Release notes\n"
+            "- First item has quite a lot of text which wraps visually when the window is small\n"
+            "  and is an indented continuation of the list\n"
+            "- Second item is preserved\n\n"
+            "| Key | Value |\n| --- | --- |\n| a | b |\n\n"
+            "```python\n"
+            "def handle_text():\n"
+            "    return 'A relatively long line that should never be reflowed because it belongs to code'\n"
+            "```\n\n"
+            "> This quote is a deliberate long line with a single newline before the next line\n"
+            "> It remains a quote\n\n"
+            "Engineer: This dialogue line is intentionally separate from the next one.\n"
+            "Agent: You're right, I should leave this conversation formatted exactly as written.\n\n"
+            "This is a deliberately long line with an explicit Markdown hard line break.  \n"
+            "The next line must remain separate.\n\n"
+            "Short verse\nLike poetry\nStays apart"
+        )
+        self.assertEqual(self.bridge.normalize_prose_wrapping(message), message)
+
+    def test_preserves_json_logs_and_unfenced_commands(self):
+        message = (
+            '{"message":"A long JSON record with all sorts of content and spacing"}\n'
+            '{"level":"warning","code":409}\n\n'
+            '2026-11-12 ERROR the first process had a failure that must be inspected\n'
+            '2026-11-12 INFO second process resumed normally\n\n'
+            'sudo systemctl status openbot-herdr-gateway.service\n'
+            'sudo journalctl -u openbot-herdr-gateway.service'
+        )
+        self.assertEqual(self.bridge.normalize_prose_wrapping(message), message)
+
+    def test_agent_reply_is_normalized_before_ag_ui_stream(self):
+        wrapped = (
+            "This message has a deliberately lengthy initial line that wraps awkwardly halfway through a single\n"
+            "sentence and leaves a strange short final line in the OpenBot interface."
+        )
+        with patch.object(self.bridge, "extract_reply", return_value=wrapped):
+            status, body = self.request("POST", "/ag-ui", self.message("Hi"))
+        self.assertEqual(status, 200)
+        events = [json.loads(line.removeprefix("data: ")) for line in body.splitlines()
+                  if line.startswith("data: ")]
+        content = next(event for event in events if event.get("type") == "TEXT_MESSAGE_CONTENT")
+        self.assertEqual(content["delta"], wrapped.replace("\n", " "))
+
 
 if __name__ == "__main__":
     unittest.main()
