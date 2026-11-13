@@ -5,7 +5,7 @@ set -euo pipefail
 
 RELEASE_VERSION="v0.7.0-rc1"
 RELEASE_URL="https://raw.githubusercontent.com/leadbyai/agent-fabric/${RELEASE_VERSION}"
-BRIDGE_SHA256="84843ba2aba9d2a0cf62c405757c4b84db9ff28c9a119f345ed90416bafb3823"
+BRIDGE_SHA256="fccbe8f1a4ee015fdb4b5009c3ecf82f204dc6a4d19401ce4207d2ae2d0e90eb"
 LEDGER_SHA256="c675b60a26a462690361951e6569848831f3efecf15577bb34dcb71babf2f49d"
 RUN_USER=""
 HERDR_SESSIONS=""
