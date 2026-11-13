@@ -3,9 +3,9 @@
 # Does NOT modify any existing Herdr session or openbot-herdr-pilot.service.
 set -euo pipefail
 
-RELEASE_VERSION="v0.6.1"
+RELEASE_VERSION="v0.7.0"
 RELEASE_URL="https://raw.githubusercontent.com/leadbyai/agent-fabric/${RELEASE_VERSION}"
-BRIDGE_SHA256="6ad5908d15ec53f7461f90baa1d2673666574c98003869b95b4c6567e501086b"
+BRIDGE_SHA256="fd65930a9f518b415a34a0f76b655122adc27a10828f88b62599d94a593e0b1d"
 LEDGER_SHA256="c675b60a26a462690361951e6569848831f3efecf15577bb34dcb71babf2f49d"
 RUN_USER=""
 HERDR_SESSIONS=""
@@ -17,16 +17,18 @@ GATEWAY_PORT="8766"
 BUSY_WAIT_SECONDS="0"
 RECOVERY_SECONDS="0"
 SOURCE_DIR=""
+PUBLIC_ORIGIN=""
+ARTIFACT_MODE="inline"
 SKIP_START=0
 
 usage() {
-  printf 'Usage: sudo bash install.sh --user USER --sessions NAME[,NAME] --roots DIR[:DIR] [--legacy-target NAME --legacy-workdir DIR] [--token-file PATH] [--port 8766] [--busy-wait-seconds 600] [--recovery-seconds 600] [--source-dir DIR] [--no-start]\n'
+  printf 'Usage: sudo bash install.sh --user USER --sessions NAME[,NAME] --roots DIR[:DIR] [--artifact-mode inline|signed_url --public-origin https://AGENT-HOST] [--legacy-target NAME --legacy-workdir DIR] [--token-file PATH] [--port 8766] [--busy-wait-seconds 600] [--recovery-seconds 600] [--source-dir DIR] [--no-start]\n'
 }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 while (($#)); do
   case "$1" in
-    --user|--sessions|--roots|--legacy-target|--legacy-workdir|--token-file|--port|--busy-wait-seconds|--recovery-seconds|--source-dir)
+    --user|--sessions|--roots|--legacy-target|--legacy-workdir|--token-file|--port|--busy-wait-seconds|--recovery-seconds|--source-dir|--public-origin|--artifact-mode)
       (($# >= 2)) || die "Missing value for $1"
       case "$1" in
         --user) RUN_USER="$2" ;;
@@ -39,6 +41,8 @@ while (($#)); do
         --busy-wait-seconds) BUSY_WAIT_SECONDS="$2" ;;
         --recovery-seconds) RECOVERY_SECONDS="$2" ;;
         --source-dir) SOURCE_DIR="$2" ;;
+        --public-origin) PUBLIC_ORIGIN="$2" ;;
+        --artifact-mode) ARTIFACT_MODE="$2" ;;
       esac
       shift 2 ;;
     --no-start) SKIP_START=1; shift ;;
@@ -62,6 +66,9 @@ id -u "$RUN_USER" >/dev/null 2>&1 || die "User $RUN_USER does not exist"
 [[ -z "$LEGACY_TARGET" || -n "$LEGACY_WORKDIR" ]] || die "Specify --legacy-workdir with --legacy-target"
 [[ -z "$LEGACY_WORKDIR" || -n "$LEGACY_TARGET" ]] || die "Specify --legacy-target with --legacy-workdir"
 [[ -z "$TOKEN_SOURCE" || -f "$TOKEN_SOURCE" ]] || die "Token file does not exist"
+[[ -z "$PUBLIC_ORIGIN" || "$PUBLIC_ORIGIN" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{2,5})?$ ]] || die "--public-origin must be a bare HTTPS origin"
+[[ "$ARTIFACT_MODE" = "inline" || "$ARTIFACT_MODE" = "signed_url" ]] || die "--artifact-mode must be inline or signed_url"
+[[ "$ARTIFACT_MODE" != "signed_url" || -n "$PUBLIC_ORIGIN" ]] || die "signed_url mode requires --public-origin"
 command -v curl >/dev/null || die "curl required"
 command -v systemctl >/dev/null || die "systemd required"
 
@@ -85,6 +92,7 @@ fi
 APP_DIR="/opt/openbot-herdr-bridge"
 CONF_DIR="/etc/openbot-herdr-bridge"
 STATE_DIR="/var/lib/openbot-herdr-gateway"
+ARTIFACT_DIR="$STATE_DIR/artifacts"
 UNIT_FILE="/etc/systemd/system/openbot-herdr-gateway.service"
 [[ ! -L "$APP_DIR" && ! -L "$CONF_DIR" && ! -L "$STATE_DIR" && ! -L "$UNIT_FILE" ]] || die "Managed destination cannot be a symlink"
 if [[ -f "$UNIT_FILE" ]] && ! grep -q 'Managed by openbot-herdr-bridge installer' "$UNIT_FILE"; then
@@ -97,6 +105,7 @@ fi
 install -d -m 0755 "$APP_DIR"
 install -d -m 0700 "$CONF_DIR"
 install -d -o "$RUN_USER" -g "$(id -gn "$RUN_USER")" -m 0700 "$STATE_DIR"
+install -d -o "$RUN_USER" -g "$(id -gn "$RUN_USER")" -m 0700 "$ARTIFACT_DIR"
 TEMP_FILE="$(mktemp "$APP_DIR/.bridge.py.XXXXXX")"
 TEMP_LEDGER="$(mktemp "$APP_DIR/.request_ledger.py.XXXXXX")"
 trap 'test ! -e "$TEMP_FILE" || rm -f -- "$TEMP_FILE"; test ! -e "$TEMP_LEDGER" || rm -f -- "$TEMP_LEDGER"' EXIT
@@ -155,6 +164,9 @@ fi
   printf 'OPENBOT_BRIDGE_HOST=127.0.0.1\n'
   printf 'OPENBOT_BRIDGE_BUSY_WAIT_SECONDS=%s\n' "$BUSY_WAIT_SECONDS"
   printf 'OPENBOT_BRIDGE_RECOVERY_SECONDS=%s\n' "$RECOVERY_SECONDS"
+  printf 'OPENBOT_BRIDGE_ARTIFACT_DIR=%s\n' "$ARTIFACT_DIR"
+  printf 'OPENBOT_BRIDGE_ARTIFACT_MODE=%s\n' "$ARTIFACT_MODE"
+  printf 'OPENBOT_BRIDGE_PUBLIC_ORIGIN=%s\n' "$PUBLIC_ORIGIN"
   if (( BUSY_WAIT_SECONDS > 0 || RECOVERY_SECONDS > 0 )); then
     printf 'OPENBOT_BRIDGE_LEDGER_PATH=%s/requests.sqlite3\n' "$STATE_DIR"
   fi
