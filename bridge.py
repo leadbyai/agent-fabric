@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Authenticated AG-UI gateway to existing Herdr-managed coding agents.
 
-Version 0.6.1 adds response-correlation grace and detached-stream recovery,
-preserving v0.5.1 formatting and v0.5.0 per-agent/file behavior.
+Version 0.7.0 supports long instructions and bidirectional image handoff,
+preserving FIFO queueing, correlation, recovery, and idempotency.
 Python standard library only. It does not launch, stop, or resume Herdr agents.
 """
 
@@ -16,6 +16,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import threading
@@ -60,11 +61,22 @@ WAIT_QUEUES: dict[tuple[str, str], deque[object]] = {}
 WAIT_QUEUES_GUARD = threading.Lock()
 GLOBAL_SLOTS = threading.BoundedSemaphore(8)
 WAITING_SLOTS = threading.BoundedSemaphore(64)
-MAX_BODY = 24 * 1024 * 1024
-MAX_PROMPT = 4000
+# OpenBot may inline up to 32 MiB of recent attachments; base64 plus history
+# makes a full AG-UI request larger than those original bytes.
+MAX_BODY = 64 * 1024 * 1024
+# The Herdr CLI prompt is an OS argument. Longer text is saved as a private
+# file for the agent to read, rather than being rejected or truncated.
+MAX_PROMPT_BYTES = 64 * 1024
 MAX_FILE_SIZE = 8 * 1024 * 1024
 MAX_TOTAL_FILES = 12 * 1024 * 1024
 MAX_FILES = 2
+ARTIFACT_DIR = os.environ.get("OPENBOT_BRIDGE_ARTIFACT_DIR", "").strip()
+PUBLIC_ORIGIN = os.environ.get("OPENBOT_BRIDGE_PUBLIC_ORIGIN", "").strip().rstrip("/")
+ARTIFACT_TTL_SECONDS = int(os.environ.get("OPENBOT_BRIDGE_ARTIFACT_TTL_SECONDS", "2592000"))
+ARTIFACT_STORAGE_BYTES = int(os.environ.get("OPENBOT_BRIDGE_ARTIFACT_STORAGE_BYTES", str(2 * 1024 ** 3)))
+MAX_OUTBOUND_IMAGES = 2
+OUTBOUND_IMAGE_RE = re.compile(r"(?m)^OPENBOT_IMAGE: ([A-Za-z0-9][A-Za-z0-9._-]{0,95})\s*$")
+ARTIFACT_RE = re.compile(r"/artifacts/([A-Za-z0-9_-]{32,64})\.(png|jpg|webp)\Z")
 OPENBOT_TEXT_FILE = re.compile(r'\AAttached file "([^"\r\n]{1,160})":\r?\n\r?\n([\s\S]*)\Z')
 TEXT_MIMES = {
     ".csv": "text/csv",
@@ -363,11 +375,8 @@ def redacted_request_shape(body: object) -> dict:
     return result
 
 
-def stage_attachments(attachments: list[tuple[str, str, bytes]],
-                      marker_id: str, workdir: str, *, dynamic: bool = False) -> list[str]:
-    """Write into the selected agent's workdir, never a supplied HTTP path."""
-    if not attachments:
-        return []
+def agent_workdir(workdir: str, *, dynamic: bool = False) -> Path:
+    """Resolve the agent's trusted root, never a path from a model or HTTP body."""
     if not workdir:
         raise ValueError("Agent has no known working directory for attachments")
     root = Path(workdir).expanduser()
@@ -380,13 +389,27 @@ def stage_attachments(attachments: list[tuple[str, str, bytes]],
         if not any(canonical.is_relative_to(Path(path).resolve(strict=True))
                    for path in ALLOWED_ROOTS):
             raise ValueError("Agent working directory is outside allowed upload roots")
-    inbox = root / ".openbot-inbox"
-    if inbox.is_symlink():
-        raise ValueError("The attachment inbox cannot be a symlink")
-    inbox.mkdir(mode=0o700, exist_ok=True)
-    os.chmod(inbox, 0o700)
-    target = inbox / marker_id
-    target.mkdir(mode=0o700)
+    return root
+
+
+def private_marker_directory(root: Path, name: str, marker_id: str) -> Path:
+    parent = root / name
+    if parent.is_symlink():
+        raise ValueError(f"{name} cannot be a symlink")
+    parent.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(parent, 0o700)
+    marker_dir = parent / marker_id
+    marker_dir.mkdir(mode=0o700)
+    return marker_dir
+
+
+def stage_attachments(attachments: list[tuple[str, str, bytes]],
+                      marker_id: str, workdir: str, *, dynamic: bool = False) -> list[str]:
+    """Write into the selected agent's workdir, never a supplied HTTP path."""
+    if not attachments:
+        return []
+    root = agent_workdir(workdir, dynamic=dynamic)
+    target = private_marker_directory(root, ".openbot-inbox", marker_id)
     written: list[Path] = []
     try:
         for i, (name, mime, data) in enumerate(attachments, 1):
@@ -406,6 +429,109 @@ def stage_attachments(attachments: list[tuple[str, str, bytes]],
         for path in written:
             path.unlink(missing_ok=True)
         target.rmdir()
+        raise
+
+
+def prepare_outbox(marker_id: str, workdir: str, *, dynamic: bool = False) -> Path:
+    root = agent_workdir(workdir, dynamic=dynamic)
+    return private_marker_directory(root, ".openbot-outbox", marker_id)
+
+
+def image_file_type(data: bytes) -> tuple[str, str] | None:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png", "image/png"
+    if data.startswith(b"\xff\xd8\xff") and data.endswith(b"\xff\xd9"):
+        return "jpg", "image/jpeg"
+    if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
+        return "webp", "image/webp"
+    return None
+
+
+def persist_reply_images(reply: str, outbox: Path) -> str:
+    """Replace explicit agent image declarations with private, expiring links.
+
+    Only opt-in configurations with HTTPS PUBLIC_ORIGIN enable image replies.
+    The public URLs are capability links: unguessable, expiring, no bearer leak.
+    Output is copied under the service-owned persistent state directory.
+    """
+    declarations = list(OUTBOUND_IMAGE_RE.finditer(reply))
+    if not declarations:
+        return reply
+    if len(declarations) > MAX_OUTBOUND_IMAGES:
+        raise RuntimeError(f"Reply contains more than {MAX_OUTBOUND_IMAGES} screenshots")
+    if not ARTIFACT_DIR or not PUBLIC_ORIGIN:
+        raise RuntimeError("Screenshot delivery is not configured on the Agent Fabric gateway")
+    artifact_root = Path(ARTIFACT_DIR)
+    if not artifact_root.is_absolute() or artifact_root.is_symlink():
+        raise RuntimeError("Artifact directory is unsafe")
+    artifact_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(artifact_root, 0o700)
+    published: list[Path] = []
+    replacements: list[tuple[str, str]] = []
+    try:
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        outbox_fd = os.open(outbox, directory_flags)
+        if outbox.is_symlink() or outbox.parent.is_symlink():
+            os.close(outbox_fd)
+            raise RuntimeError("Screenshot directory is unsafe")
+        # dir_fd ensures the final component cannot be redirected through a
+        # swapped ancestor after verification. The filename has no slashes.
+        try:
+            for match in declarations:
+                name = match.group(1)
+                if name in (".", "..") or ".." in name or name.startswith("."):
+                    raise RuntimeError("Unsafe screenshot filename")
+                flags = os.O_RDONLY
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                fd = os.open(name, flags, dir_fd=outbox_fd)
+                with os.fdopen(fd, "rb") as handle:
+                    metadata = os.fstat(handle.fileno())
+                    if not stat.S_ISREG(metadata.st_mode) or not (0 < metadata.st_size <= MAX_FILE_SIZE):
+                        raise RuntimeError("Screenshot must be a regular file of at most 8 MiB")
+                    data = handle.read(MAX_FILE_SIZE + 1)
+                kind = image_file_type(data)
+                if kind is None or len(data) > MAX_FILE_SIZE:
+                    raise RuntimeError("Screenshot is not a supported PNG, JPEG, or WebP image")
+                # Remove only bridge-generated images that have passed their
+                # configured retention; never evict an unexpired screenshot.
+                used = 0
+                for existing in artifact_root.iterdir():
+                    if not ARTIFACT_RE.fullmatch("/artifacts/" + existing.name) or existing.is_symlink():
+                        continue
+                    info = existing.stat()
+                    if time.time() - info.st_mtime > ARTIFACT_TTL_SECONDS:
+                        existing.unlink(missing_ok=True)
+                    elif stat.S_ISREG(info.st_mode):
+                        used += info.st_size
+                if used + len(data) > ARTIFACT_STORAGE_BYTES:
+                    raise RuntimeError("Screenshot storage is full; no unexpired images were removed")
+                extension, _mime = kind
+                secret = secrets.token_urlsafe(32)
+                destination = artifact_root / f"{secret}.{extension}"
+                write_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                if hasattr(os, "O_NOFOLLOW"):
+                    write_flags |= os.O_NOFOLLOW
+                fd = os.open(destination, write_flags, 0o600)
+                published.append(destination)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(data)
+                url = f"{PUBLIC_ORIGIN}/artifacts/{destination.name}"
+                replacements.append((match.group(0), f"![Screenshot]({url})\n\n[Open screenshot]({url})"))
+        finally:
+            os.close(outbox_fd)
+        for original, markdown in replacements:
+            reply = reply.replace(original, markdown, 1)
+        return reply
+    except (OSError, ValueError) as exc:
+        for path in published:
+            path.unlink(missing_ok=True)
+        raise RuntimeError("Could not safely deliver the agent screenshot") from exc
+    except Exception:
+        for path in published:
+            path.unlink(missing_ok=True)
         raise
 
 
@@ -496,7 +622,7 @@ def normalize_prose_wrapping(text: str) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "OpenBotHerdrBridge/0.6.1"
+    server_version = "OpenBotHerdrBridge/0.7.0"
 
     def log_message(self, format_string: str, *args: object) -> None:
         # Deliberately never logs request bodies, authorization, or agent output.
@@ -519,8 +645,45 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path == "/health":
-            self.json_response(200, {"ok": True, "version": "0.6.1", "mode": "multi-agent",
+            self.json_response(200, {"ok": True, "version": "0.7.0", "mode": "multi-agent",
                                      "busy_wait_enabled": BUSY_WAIT_SECONDS > 0})
+            return
+        # Public capability links do not carry the gateway's broad bearer
+        # credential. Possession of a 256-bit random path is the only grant.
+        artifact = ARTIFACT_RE.fullmatch(path)
+        if artifact:
+            if not ARTIFACT_DIR:
+                self.json_response(404, {"error": "not_found"})
+                return
+            location = Path(ARTIFACT_DIR) / f"{artifact.group(1)}.{artifact.group(2)}"
+            try:
+                flags = os.O_RDONLY
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                fd = os.open(location, flags)
+                with os.fdopen(fd, "rb") as handle:
+                    info = os.fstat(handle.fileno())
+                    if (not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_SIZE or
+                            time.time() - info.st_mtime > ARTIFACT_TTL_SECONDS):
+                        self.json_response(404, {"error": "not_found"})
+                        return
+                    data = handle.read(MAX_FILE_SIZE + 1)
+                kind = image_file_type(data)
+                if not kind or kind[0] != artifact.group(2):
+                    self.json_response(404, {"error": "not_found"})
+                    return
+            except OSError:
+                self.json_response(404, {"error": "not_found"})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", kind[1])
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", "inline")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Cache-Control", "private, max-age=3600")
+            self.end_headers()
+            self.wfile.write(data)
             return
         if not self.authorized():
             self.json_response(401, {"error": "unauthorized"})
@@ -554,7 +717,7 @@ class Handler(BaseHTTPRequestHandler):
                                                               if not s["online"]],
                                          "unresolved_requests": LEDGER.unresolved() if LEDGER else []})
             else:
-                self.json_response(200, {"version": "0.6.1", "sessions": sessions})
+                self.json_response(200, {"version": "0.7.0", "sessions": sessions})
             return
         if path == "/agent" and TARGET:
             try:
@@ -756,8 +919,13 @@ class Handler(BaseHTTPRequestHandler):
             self.log_message("AGUI request shape: %s",
                              json.dumps(redacted_request_shape(body), separators=(",", ":")))
             user_text, attachments = parse_user_message(body)
-            if len(user_text) > MAX_PROMPT or "\x00" in user_text:
-                raise ValueError("User message too large or contains null characters")
+            if "\x00" in user_text:
+                self.json_response(400, {
+                    "error": "User message contains an invalid NUL character",
+                    "code": "invalid_nul_character",
+                })
+                return
+            prompt_bytes = len(user_text.encode("utf-8"))
         except (ValueError, json.JSONDecodeError, TypeError, TimeoutError) as exc:
             self.json_response(400, {"error": str(exc)})
             return
@@ -883,8 +1051,14 @@ class Handler(BaseHTTPRequestHandler):
                 if state not in ("idle", "done"):
                     raise RuntimeError(f"Agent became {state} while queued. No prompt submitted.")
             try:
-                staged = stage_attachments(attachments, marker_id, workdir,
+                long_text = prompt_bytes > MAX_PROMPT_BYTES
+                staged_items = list(attachments)
+                if long_text:
+                    staged_items.append(("full-user-instructions.txt", "text/plain",
+                                         user_text.encode("utf-8")))
+                staged = stage_attachments(staged_items, marker_id, workdir,
                                            dynamic=dynamic)
+                outbox = prepare_outbox(marker_id, workdir, dynamic=dynamic)
             except (ValueError, OSError) as exc:
                 if stream_started:
                     raise RuntimeError(f"Could not prepare attachment: {exc}") from exc
@@ -893,10 +1067,16 @@ class Handler(BaseHTTPRequestHandler):
             if not stream_started:
                 self.start_stream(thread_id, run_id)
                 stream_started = True
+            if long_text:
+                user_text = (
+                    "The complete user instruction is in the attached full-user-instructions.txt "
+                    "file below. Read the entire file before doing any work; do not "
+                    "answer from this summary alone."
+                )
             attachment_instructions = ""
             if staged:
                 attachment_instructions = (
-                    "\n\nThe user uploaded these files into your working directory. "
+                    "\n\nThe user provided these files in your working directory. "
                     "Read them with your normal file tools as needed; the files are not "
                     "included verbatim in this prompt. A file marked "
                     "source=openbot-derived-text is a reconstructed UTF-8 text copy, "
@@ -909,7 +1089,12 @@ class Handler(BaseHTTPRequestHandler):
                 "For this integration test, enclose your final response between "
                 "these exact lines, with no formatting around them:\n"
                 f"{begin}\n<your response>\n{end}\n"
-                "Keep the response concise."
+                "To return up to two screenshots, save actual PNG, JPEG, or WebP files "
+                f"into .openbot-outbox/{marker_id}/ and put one line "
+                "OPENBOT_IMAGE: filename.png in your response for each screenshot "
+                "(filename only, no directory). These image lines must be INSIDE "
+                "the response markers. This is optional; never claim a screenshot "
+                "was attached unless you saved the image. Keep the response concise."
             )
             if LEDGER:
                 try:
@@ -929,6 +1114,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_submitted_event({"type": "CUSTOM", "name": "agent-fabric.request",
                                            "value": {"id": request_key, "state": "submitted"}})
             response = self.prompt_with_liveness(session, pane_id, prompt, marker_id)
+            response = persist_reply_images(response, outbox)
             if LEDGER:
                 LEDGER.finish(request_key, response)
                 ledger_reserved = False
@@ -988,6 +1174,21 @@ def main() -> None:
         os.umask(0o077)
         LEDGER = RequestLedger(LEDGER_PATH)
         LEDGER.trim_finished()
+    if ARTIFACT_DIR:
+        directory = Path(ARTIFACT_DIR)
+        if not directory.is_absolute() or directory.is_symlink():
+            sys.exit("OPENBOT_BRIDGE_ARTIFACT_DIR must be a non-symlink absolute directory")
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(directory, 0o700)
+    origin = urlsplit(PUBLIC_ORIGIN)
+    if PUBLIC_ORIGIN and (origin.scheme != "https" or not origin.hostname or
+                          origin.username is not None or origin.password is not None or
+                          origin.path not in ("", "/") or origin.query or origin.fragment):
+        sys.exit("OPENBOT_BRIDGE_PUBLIC_ORIGIN must be an HTTPS origin without path/query")
+    if ARTIFACT_TTL_SECONDS < 3600 or ARTIFACT_TTL_SECONDS > 90 * 86400:
+        sys.exit("OPENBOT_BRIDGE_ARTIFACT_TTL_SECONDS must be between one hour and 90 days")
+    if ARTIFACT_STORAGE_BYTES < MAX_FILE_SIZE:
+        sys.exit("OPENBOT_BRIDGE_ARTIFACT_STORAGE_BYTES must allow at least one screenshot")
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Bridge ready on http://{HOST}:{PORT}/agents | "
           f"sessions={','.join(SESSIONS)} | legacy_target={TARGET or 'disabled'}", flush=True)
