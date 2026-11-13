@@ -235,6 +235,17 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(json.loads(body)["code"], "invalid_nul_character")
         self.assertEqual(self.prompts, [])
 
+    def test_request_body_limit_is_explicit_413_not_ambiguous_400(self):
+        original_limit = self.bridge.MAX_BODY
+        try:
+            self.bridge.MAX_BODY = 100
+            status, body = self.request("POST", "/ag-ui", self.message("A" * 500))
+            self.assertEqual(status, 413)
+            self.assertEqual(json.loads(body)["code"], "request_too_large")
+            self.assertEqual(self.prompts, [])
+        finally:
+            self.bridge.MAX_BODY = original_limit
+
     def test_reflows_wrapped_prose_without_merging_paragraphs(self):
         original = (
             "One change I'd push for: don't name Microsoft or Copilot in the fake chat. Microsoft hasn't said what caused the\n"
