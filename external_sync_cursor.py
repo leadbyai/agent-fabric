@@ -21,7 +21,9 @@ import time
 from external_sync_events import ImportEvent, TranscriptState, classify_claude_records
 
 
-MAX_JSONL_RECORD_BYTES = 512 * 1024
+# Claude stores inline tool results and attachment metadata in the same JSONL
+# as text turns. The classifier discards those blocks after parsing.
+MAX_JSONL_RECORD_BYTES = 2 * 1024 * 1024
 
 
 class SourceChanged(RuntimeError):
