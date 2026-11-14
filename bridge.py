@@ -37,6 +37,10 @@ MACHINE = os.environ.get("HERDR_MACHINE", "").strip()
 SESSION = os.environ.get("HERDR_SESSION", "").strip()
 SESSIONS = tuple(dict.fromkeys(s.strip() for s in
     os.environ.get("HERDR_SESSIONS", SESSION).split(",") if s.strip()))
+# HERDR_SESSIONS=auto serves every running Herdr session; HERDR_SESSIONS_DENY is never served.
+AUTO_SESSIONS = SESSIONS == ("auto",)
+SESSIONS_DENY = frozenset(s.strip() for s in os.environ.get("HERDR_SESSIONS_DENY", "").split(",") if s.strip())
+AUTO_CACHE_SECONDS = 30.0
 SOCKET_PATH = os.environ.get("HERDR_SOCKET_PATH", "").strip()
 HERDR_BIN = os.environ.get("HERDR_BIN", "herdr")
 TOKEN_FILE = os.environ.get("OPENBOT_BRIDGE_TOKEN_FILE", "").strip()
@@ -51,6 +55,11 @@ if _TOKEN_SHA256_FILE and not TOKEN_SHA256:
     TOKEN_SHA256 = Path(_TOKEN_SHA256_FILE).read_text(encoding="utf-8").strip().lower()
 # Per-agent tokens: "<session>/<pane> <sha256>" per line. Only hashes are stored.
 ROUTE_TOKENS_FILE = os.environ.get("OPENBOT_BRIDGE_ROUTE_TOKENS_FILE", "").strip()
+# Discovery-only credential (hash): may list agents, can never prompt one or read a request.
+DISCOVERY_SHA256 = os.environ.get("OPENBOT_BRIDGE_DISCOVERY_TOKEN_SHA256", "").strip().lower()
+_DISCOVERY_SHA256_FILE = os.environ.get("OPENBOT_BRIDGE_DISCOVERY_TOKEN_SHA256_FILE", "").strip()
+if _DISCOVERY_SHA256_FILE and not DISCOVERY_SHA256:
+    DISCOVERY_SHA256 = Path(_DISCOVERY_SHA256_FILE).read_text(encoding="utf-8").strip().lower()
 HOST = os.environ.get("OPENBOT_BRIDGE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("OPENBOT_BRIDGE_PORT", "8765"))
 TIMEOUT_MS = int(os.environ.get("OPENBOT_BRIDGE_TIMEOUT_MS", "120000"))
@@ -111,6 +120,7 @@ PANE_RE = re.compile(r"w[0-9A-Za-z]+:p[0-9A-Za-z]+\Z")
 SESSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 AGENT_ROUTE = re.compile(r"/sessions/([A-Za-z0-9][A-Za-z0-9_-]{0,63})/agents/(w[0-9A-Za-z]+:p[0-9A-Za-z]+)/ag-ui\Z")
 ALL_ROUTES = "*"  # scope of a bridge-wide credential
+DISCOVERY = "discovery"  # scope of the discovery-only credential: GET /agents and /attention only
 
 
 def parse_route_hashes(text: str) -> dict[tuple[str, str], str]:
@@ -140,12 +150,16 @@ ROUTE_HASHES: dict[tuple[str, str], str] = (
 
 
 def credential_scope(header: str, token: str = "", token_sha256: str = "",
-                     route_hashes: dict | None = None):
+                     route_hashes: dict | None = None, discovery_sha256: str = ""):
     """ALL_ROUTES for a bridge-wide credential, a frozenset of (session, pane) for a per-agent
-    token, or None when unauthorized. Constant-time comparisons; no early exit across entries."""
+    token, DISCOVERY for the discovery-only credential, or None when unauthorized.
+    Constant-time comparisons; no early exit across entries."""
     if not header.startswith("Bearer ") or len(header) > 4096:
         return None
     presented = header[len("Bearer "):]
+    if discovery_sha256 and hmac.compare_digest(
+            hashlib.sha256(presented.encode("utf-8")).hexdigest(), discovery_sha256):
+        return DISCOVERY
     if route_hashes:
         digest = hashlib.sha256(presented.encode("utf-8")).hexdigest()
         matched = None
@@ -160,7 +174,36 @@ def credential_scope(header: str, token: str = "", token_sha256: str = "",
 
 
 def in_scope(scope, session: str, pane: str) -> bool:
-    return scope == ALL_ROUTES or (scope is not None and (session, pane) in scope)
+    """May this credential reach (prompt, or read requests of) this agent route? Discovery never may."""
+    return scope == ALL_ROUTES or (isinstance(scope, frozenset) and (session, pane) in scope)
+
+
+def may_list(scope, session: str, pane: str) -> bool:
+    return scope == DISCOVERY or in_scope(scope, session, pane)
+
+
+_auto_cache: dict = {"at": 0.0, "sessions": None}
+
+
+def running_sessions() -> tuple[str, ...]:
+    """Running Herdr sessions (`herdr session list --json`), cached briefly. Raises when Herdr cannot
+    be asked and nothing recent is cached, so a failed listing is never mistaken for 'no agents'."""
+    now = time.monotonic()
+    if _auto_cache["sessions"] is not None and now - _auto_cache["at"] < AUTO_CACHE_SECONDS:
+        return _auto_cache["sessions"]
+    data = json.loads(command("session", "list", "--json"))
+    names = tuple(row["name"] for row in data.get("sessions", [])
+                  if isinstance(row, dict) and row.get("running") is True
+                  and isinstance(row.get("name"), str) and SESSION_RE.fullmatch(row["name"]))
+    _auto_cache.update(at=now, sessions=names)
+    return names
+
+
+def served_sessions() -> tuple[str, ...]:
+    """Sessions this gateway serves: the configured list, or every running one in auto mode; never
+    a denied one."""
+    configured = running_sessions() if AUTO_SESSIONS else SESSIONS
+    return tuple(s for s in configured if s not in SESSIONS_DENY)
 
 
 def check_bind_host(host: str) -> None:
@@ -230,13 +273,14 @@ def public_agent_info(session: str, agent: dict) -> dict:
             "name": agent.get("name") or "",
             "title": agent.get("terminal_title_stripped") or agent.get("name") or pane,
             "status": normalized_state(agent),
+            "agent": agent.get("agent") or "",
             "cwd": agent.get("foreground_cwd") or agent.get("cwd") or "",
             "ag_ui_path": f"/sessions/{session}/agents/{pane}/ag-ui"}
 
 
 def live_target(session: str, pane_id: str) -> dict:
     """Allow only currently recognized agents in an explicitly allowed session."""
-    if session not in SESSIONS or not PANE_RE.fullmatch(pane_id):
+    if session not in served_sessions() or not PANE_RE.fullmatch(pane_id):
         raise LookupError("Unknown agent route")
     for agent in list_agents(session):
         if agent["pane_id"] == pane_id:
@@ -725,7 +769,8 @@ class Handler(BaseHTTPRequestHandler):
                                           format_string % args))
 
     def scope(self):
-        return credential_scope(self.headers.get("Authorization", ""), TOKEN, TOKEN_SHA256, ROUTE_HASHES)
+        return credential_scope(self.headers.get("Authorization", ""), TOKEN, TOKEN_SHA256, ROUTE_HASHES,
+                                DISCOVERY_SHA256)
 
     def authorized(self) -> bool:
         return self.scope() is not None
@@ -786,6 +831,9 @@ class Handler(BaseHTTPRequestHandler):
         if scope is None:
             self.json_response(401, {"error": "unauthorized"})
             return
+        if scope == DISCOVERY and path not in ("/agents", "/attention"):
+            self.json_response(404, {"error": "not_found"})
+            return
         if path.startswith("/requests/") and LEDGER is not None:
             key = path.removeprefix("/requests/")
             if not re.fullmatch(r"[a-f0-9]{64}", key):
@@ -802,12 +850,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path in ("/agents", "/attention"):
             sessions = []
-            visible = SESSIONS if scope == ALL_ROUTES else tuple(s for s in SESSIONS
-                                                                   if any(r[0] == s for r in scope))
+            try:
+                served = served_sessions()
+            except (RuntimeError, OSError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError):
+                self.json_response(503, {"error": "Herdr session list unavailable"})
+                return
+            visible = served if scope in (ALL_ROUTES, DISCOVERY) else tuple(
+                s for s in served if any(r[0] == s for r in scope))
             for session in visible:
                 try:
                     agents = [public_agent_info(session, a) for a in list_agents(session)
-                              if in_scope(scope, session, a["pane_id"])]
+                              if may_list(scope, session, a["pane_id"])]
                     sessions.append({"name": session, "online": True, "agents": agents})
                 except (RuntimeError, OSError, subprocess.TimeoutExpired,
                         ValueError, json.JSONDecodeError):
@@ -821,7 +874,8 @@ class Handler(BaseHTTPRequestHandler):
                                          "unresolved_requests": [r for r in (LEDGER.unresolved() if LEDGER else [])
                                                                  if in_scope(scope, r["session"], r["pane"])]})
             else:
-                self.json_response(200, {"version": "0.7.0", "sessions": sessions})
+                self.json_response(200, {"version": "0.7.0", "sessions": sessions,
+                                         "session_mode": "auto" if AUTO_SESSIONS else "configured"})
             return
         if path == "/agent" and TARGET and scope == ALL_ROUTES:
             try:
@@ -991,7 +1045,7 @@ class Handler(BaseHTTPRequestHandler):
         if scope is None:
             self.json_response(401, {"error": "unauthorized"})
             return
-        if (match and not in_scope(scope, *match.groups())) or (legacy and scope != ALL_ROUTES):
+        if scope == DISCOVERY or (match and not in_scope(scope, *match.groups())) or (legacy and scope != ALL_ROUTES):
             self.json_response(404, {"error": "agent_not_found"})
             return
         if match:
@@ -1260,19 +1314,33 @@ def main() -> None:
     global LEDGER
     if TARGET and not re.fullmatch(r"(?:w[0-9A-Za-z]+:p[0-9A-Za-z]+|[a-z][a-z0-9_-]{0,31})", TARGET):
         sys.exit("HERDR_AGENT_TARGET must be an existing agent name or pane ID")
-    if not SESSIONS or any(not SESSION_RE.fullmatch(s) for s in SESSIONS):
-        sys.exit("Set HERDR_SESSIONS to one or more named Herdr sessions")
-    if TARGET and SESSION not in SESSIONS:
-        sys.exit("HERDR_SESSION must belong to HERDR_SESSIONS when using legacy /ag-ui")
+    if AUTO_SESSIONS:
+        if MACHINE or SOCKET_PATH:
+            sys.exit("HERDR_SESSIONS=auto needs local Herdr sessions (no machine/socket override)")
+        if TARGET and (not SESSION_RE.fullmatch(SESSION or "") or SESSION in SESSIONS_DENY):
+            sys.exit("Legacy /ag-ui with HERDR_SESSIONS=auto needs an allowed HERDR_SESSION")
+    else:
+        if not SESSIONS or any(not SESSION_RE.fullmatch(s) for s in SESSIONS):
+            sys.exit("Set HERDR_SESSIONS to one or more named Herdr sessions, or to auto")
+        if TARGET and SESSION not in SESSIONS:
+            sys.exit("HERDR_SESSION must belong to HERDR_SESSIONS when using legacy /ag-ui")
+    if any(not SESSION_RE.fullmatch(s) for s in SESSIONS_DENY):
+        sys.exit("HERDR_SESSIONS_DENY must list Herdr session names")
+    if DISCOVERY_SHA256 and not re.fullmatch(r"[0-9a-f]{64}", DISCOVERY_SHA256):
+        sys.exit("OPENBOT_BRIDGE_DISCOVERY_TOKEN_SHA256(_FILE) must be a 64-character hex SHA-256")
     configured = [bool(TOKEN), bool(TOKEN_SHA256), bool(ROUTE_HASHES)]
     if sum(configured) != 1:
         sys.exit("Configure exactly one of OPENBOT_BRIDGE_TOKEN(_FILE), OPENBOT_BRIDGE_TOKEN_SHA256(_FILE) "
                  "or OPENBOT_BRIDGE_ROUTE_TOKENS_FILE")
     if TOKEN and len(TOKEN) < 24:
         sys.exit("Set OPENBOT_BRIDGE_TOKEN to a random secret of at least 24 characters")
+    if DISCOVERY_SHA256 and DISCOVERY_SHA256 in (
+            {TOKEN_SHA256, hashlib.sha256(TOKEN.encode("utf-8")).hexdigest() if TOKEN else ""} | set(ROUTE_HASHES.values())):
+        sys.exit("The discovery token must differ from every prompt-capable token")
     if TOKEN_SHA256 and not re.fullmatch(r"[0-9a-f]{64}", TOKEN_SHA256):
         sys.exit("OPENBOT_BRIDGE_TOKEN_SHA256(_FILE) must be a 64-character hex SHA-256")
-    if any(session not in SESSIONS for session, _ in ROUTE_HASHES):
+    if any((session not in SESSIONS and not AUTO_SESSIONS) or session in SESSIONS_DENY
+           for session, _ in ROUTE_HASHES):
         sys.exit("OPENBOT_BRIDGE_ROUTE_TOKENS_FILE names a session that is not in HERDR_SESSIONS")
     try:
         check_bind_host(HOST)
@@ -1316,7 +1384,8 @@ def main() -> None:
         sys.exit("OPENBOT_BRIDGE_ARTIFACT_STORAGE_BYTES must allow at least one screenshot")
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Bridge ready on http://{HOST}:{PORT}/agents | "
-          f"sessions={','.join(SESSIONS)} | legacy_target={TARGET or 'disabled'}", flush=True)
+          f"sessions={'auto' if AUTO_SESSIONS else ','.join(SESSIONS)} deny={len(SESSIONS_DENY)} "
+          f"discovery={'on' if DISCOVERY_SHA256 else 'off'} | legacy_target={TARGET or 'disabled'}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

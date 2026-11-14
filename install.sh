@@ -24,9 +24,11 @@ BIND_HOST="127.0.0.1"
 TOKEN_SHA256=""
 ROUTE_HASHES=()
 EXPECT_BRIDGE_SHA256=""
+DENY_SESSIONS=""
+DISCOVERY_SHA256=""
 
 usage() {
-  printf 'Usage: sudo bash install.sh --user USER --sessions NAME[,NAME] --roots DIR[:DIR] [--artifact-mode inline|signed_url --public-origin https://AGENT-HOST] [--legacy-target NAME --legacy-workdir DIR] [--token-file PATH] [--port 8766] [--busy-wait-seconds 600] [--recovery-seconds 600] [--source-dir DIR [--expect-bridge-sha256 HEX]] [--bind 127.0.0.1|TAILSCALE-IP] [--token-sha256 HEX | --route-token-sha256 SESSION/PANE=HEX ...] [--no-start]\n'
+  printf 'Usage: sudo bash install.sh --user USER --sessions NAME[,NAME] --roots DIR[:DIR] [--artifact-mode inline|signed_url --public-origin https://AGENT-HOST] [--legacy-target NAME --legacy-workdir DIR] [--token-file PATH] [--port 8766] [--busy-wait-seconds 600] [--recovery-seconds 600] [--source-dir DIR [--expect-bridge-sha256 HEX]] [--bind 127.0.0.1|TAILSCALE-IP] [--token-sha256 HEX | --route-token-sha256 SESSION/PANE=HEX ...] [--sessions auto --deny-sessions NAME[,NAME]] [--discovery-token-sha256 HEX] [--no-start]\n'
 }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -59,7 +61,7 @@ esac
 
 while (($#)); do
   case "$1" in
-    --user|--sessions|--roots|--legacy-target|--legacy-workdir|--token-file|--port|--busy-wait-seconds|--recovery-seconds|--source-dir|--public-origin|--artifact-mode|--bind|--token-sha256|--route-token-sha256|--expect-bridge-sha256)
+    --user|--sessions|--roots|--legacy-target|--legacy-workdir|--token-file|--port|--busy-wait-seconds|--recovery-seconds|--source-dir|--public-origin|--artifact-mode|--bind|--token-sha256|--route-token-sha256|--expect-bridge-sha256|--deny-sessions|--discovery-token-sha256)
       (($# >= 2)) || die "Missing value for $1"
       case "$1" in
         --user) RUN_USER="$2" ;;
@@ -78,6 +80,8 @@ while (($#)); do
         --token-sha256) TOKEN_SHA256="$2" ;;
         --route-token-sha256) ROUTE_HASHES+=("$2") ;;
         --expect-bridge-sha256) EXPECT_BRIDGE_SHA256="$2" ;;
+        --deny-sessions) DENY_SESSIONS="$2" ;;
+        --discovery-token-sha256) DISCOVERY_SHA256="$2" ;;
       esac
       shift 2 ;;
     --no-start) SKIP_START=1; shift ;;
@@ -95,6 +99,11 @@ id -u "$RUN_USER" >/dev/null 2>&1 || die "User $RUN_USER does not exist"
 [[ "$RECOVERY_SECONDS" =~ ^[0-9]{1,4}$ ]] || die "Invalid recovery wait"
 ((BUSY_WAIT_SECONDS <= 3600 && RECOVERY_SECONDS <= 3600)) || die "Waits must be at most 3600 seconds"
 [[ "$HERDR_SESSIONS" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]] || die "Invalid --sessions"
+[[ -z "$DENY_SESSIONS" || "$DENY_SESSIONS" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]] || die "Invalid --deny-sessions"
+if [[ "$HERDR_SESSIONS" == auto ]]; then
+  [[ -z "$LEGACY_TARGET" ]] || die "--legacy-target cannot be combined with --sessions auto"
+fi
+[[ -z "$DISCOVERY_SHA256" || "$DISCOVERY_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--discovery-token-sha256 must be 64 lowercase hex characters"
 [[ -n "$UPLOAD_ROOTS" && "$UPLOAD_ROOTS" =~ ^[A-Za-z0-9_./,:-]+$ ]] || die "Invalid --roots"
 [[ -z "$LEGACY_TARGET" || "$LEGACY_TARGET" =~ ^([a-z][a-z0-9_-]{0,31}|w[0-9A-Za-z]+:p[0-9A-Za-z]+)$ ]] || die "Invalid legacy target"
 [[ -z "$LEGACY_WORKDIR" || "$LEGACY_WORKDIR" =~ ^[A-Za-z0-9_./-]+$ ]] || die "Invalid legacy workdir"
@@ -123,9 +132,11 @@ if ((${#ROUTE_HASHES[@]})); then
     [[ "$entry" =~ ^([A-Za-z0-9][A-Za-z0-9_-]{0,63})/(w[0-9A-Za-z]+:p[0-9A-Za-z]+)=([0-9a-f]{64})$ ]] \
       || die "--route-token-sha256 must be SESSION/PANE=<64 lowercase hex>"
     route="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"; digest="${BASH_REMATCH[3]}"
-    [[ ",$HERDR_SESSIONS," == *",${BASH_REMATCH[1]},"* ]] || die "--route-token-sha256 names a session that is not in --sessions"
+    [[ "$HERDR_SESSIONS" == auto || ",$HERDR_SESSIONS," == *",${BASH_REMATCH[1]},"* ]] || die "--route-token-sha256 names a session that is not in --sessions"
+    [[ ",$DENY_SESSIONS," != *",${BASH_REMATCH[1]},"* ]] || die "--route-token-sha256 names a denied session"
     [[ -z "${seen_route[$route]:-}" ]] || die "--route-token-sha256 given twice for one route"
     [[ -z "${seen_hash[$digest]:-}" ]] || die "The same token hash is given for two routes"
+    [[ "$digest" != "$DISCOVERY_SHA256" ]] || die "The discovery token must differ from every agent token"
     seen_route[$route]=1; seen_hash[$digest]=1
     ROUTE_TOKENS+="$route $digest"$'\n'
   done
@@ -133,6 +144,7 @@ fi
 [[ -z "$EXPECT_BRIDGE_SHA256" || "$EXPECT_BRIDGE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--expect-bridge-sha256 must be 64 lowercase hex characters"
 [[ -z "$EXPECT_BRIDGE_SHA256" || -n "$SOURCE_DIR" ]] || die "--expect-bridge-sha256 needs --source-dir"
 [[ -n "$EXPECT_BRIDGE_SHA256" ]] && BRIDGE_SHA256="$EXPECT_BRIDGE_SHA256"
+[[ -z "$DISCOVERY_SHA256" || "$DISCOVERY_SHA256" != "$TOKEN_SHA256" ]] || die "The discovery token must differ from the bridge-wide token"
 
 IFS=: read -r -a root_list <<< "$UPLOAD_ROOTS"
 for path in "${root_list[@]}"; do
@@ -228,6 +240,15 @@ else
   [[ $(wc -c < "$CONF_DIR/bridge.token") -ge 24 ]] || die "Existing bearer token too short"
 fi
 
+DISCOVERY_UNIT_LINES=""
+if [[ -n "$DISCOVERY_SHA256" ]]; then
+  printf '%s\n' "$DISCOVERY_SHA256" > "$CONF_DIR/discovery-token.sha256"
+  chmod 0600 "$CONF_DIR/discovery-token.sha256"
+  DISCOVERY_UNIT_LINES=$'\nEnvironment=OPENBOT_BRIDGE_DISCOVERY_TOKEN_SHA256_FILE=%d/discovery-token.sha256'
+  DISCOVERY_UNIT_LINES+=$'\n'"LoadCredential=discovery-token.sha256:$CONF_DIR/discovery-token.sha256"
+else
+  rm -f "$CONF_DIR/discovery-token.sha256"
+fi
 CONFIG_TEMP="$(mktemp "$CONF_DIR/.config.env.XXXXXX")"
 trap 'test ! -e "$CONFIG_TEMP" || rm -f -- "$CONFIG_TEMP"; test ! -e "$TEMP_FILE" || rm -f -- "$TEMP_FILE"; test ! -e "$TEMP_LEDGER" || rm -f -- "$TEMP_LEDGER"' EXIT
 if [[ -f "$CONF_DIR/config.env" ]]; then
@@ -238,7 +259,8 @@ if [[ -f "$UNIT_FILE" ]]; then
 fi
 {
   printf 'HERDR_SESSIONS=%s\n' "$HERDR_SESSIONS"
-  printf 'HERDR_SESSION=%s\n' "${HERDR_SESSIONS%%,*}"
+  if [[ "$HERDR_SESSIONS" == auto ]]; then printf 'HERDR_SESSION=\n'; else printf 'HERDR_SESSION=%s\n' "${HERDR_SESSIONS%%,*}"; fi
+  [[ -z "$DENY_SESSIONS" ]] || printf 'HERDR_SESSIONS_DENY=%s\n' "$DENY_SESSIONS"
   printf 'HERDR_AGENT_TARGET=%s\n' "$LEGACY_TARGET"
   printf 'HERDR_BIN=%s\n' "$HERDR_EXEC"
   printf 'OPENBOT_BRIDGE_PORT=%s\n' "$GATEWAY_PORT"
@@ -269,7 +291,7 @@ User=$RUN_USER
 WorkingDirectory=$RUN_HOME
 EnvironmentFile=$CONF_DIR/config.env
 Environment=$CREDENTIAL_ENV
-LoadCredential=$CREDENTIAL_LOAD
+LoadCredential=$CREDENTIAL_LOAD$DISCOVERY_UNIT_LINES
 ExecStart=/usr/bin/python3 $APP_DIR/bridge.py
 Restart=on-failure
 RestartSec=3

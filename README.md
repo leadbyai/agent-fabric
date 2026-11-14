@@ -93,6 +93,17 @@ Without these options the install is exactly as above (loopback bind, one bridge
 - `--expect-bridge-sha256 <sha256>` with `--source-dir`: install a reviewed `bridge.py` that is not the
   pinned release, after checking its hash.
 
+### Automatic sessions and a discovery-only credential (optional)
+- `--sessions auto`: serve every *running* Herdr session (from `herdr session list --json`, cached 30 s)
+  instead of a fixed list, so new sessions need no configuration. A failed session listing answers 503,
+  never an empty roster.
+- `--deny-sessions NAME[,NAME]`: never served or routed, in either mode. With `auto`, the bridge-wide token
+  reaches every served session, so keep this list strict.
+- `--discovery-token-sha256 <sha256>`: an extra, hash-only credential that can `GET /agents` and
+  `GET /attention` only. Every POST, `/requests` and `/agent` is 404 for it. It is meant for an automatic
+  reconciler that must never be able to prompt an agent. It must differ from every other token.
+- `/agents` reports each agent's Herdr kind (`agent`, e.g. `claude`, `hermes`) and `session_mode`.
+
 `--backend both` runs this install and then `install-hermes.sh` with the `--hermes-*` options
 (see `docs/hermes-backend.md`).
 

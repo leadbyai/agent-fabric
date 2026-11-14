@@ -72,6 +72,12 @@ class BridgeTests(unittest.TestCase):
         self.addCleanup(self.server.shutdown)
 
     def fake_command(self, *args, session=None, **kwargs):
+        if args[:2] == ("session", "list"):
+            if getattr(self, "session_list_fails", False):
+                raise RuntimeError("server_not_running")
+            running = getattr(self, "running", ["Main", "Other"])
+            return json.dumps({"sessions": [{"name": n, "running": n in running}
+                                            for n in ["Main", "Other", "Review", "Secret", "New"]]})
         if session == "Review":
             raise RuntimeError("server_not_running")
         agents = self.roster.get(session, [])
@@ -236,6 +242,65 @@ class BridgeTests(unittest.TestCase):
         status, body = self.request("GET", "/attention", token=self.tok_other)
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["offline_sessions"], [])  # Review is outside this token's scope
+
+    def use_auto(self, deny=("Secret",)):
+        self.bridge.AUTO_SESSIONS = True
+        self.bridge.SESSIONS_DENY = frozenset(deny)
+        self.bridge._auto_cache.update(at=0.0, sessions=None)
+
+    def test_auto_mode_serves_running_sessions_minus_deny(self):
+        self.running = ["Main", "Other", "Secret", "New"]
+        self.roster["New"] = [{"pane_id": "w2:p1", "agent": "claude", "agent_status": "idle",
+                               "terminal_title_stripped": "New Agent", "cwd": self.tmp.name}]
+        self.roster["Secret"] = [{"pane_id": "w1:p1", "agent": "claude", "agent_status": "idle",
+                                  "terminal_title_stripped": "Hidden", "cwd": self.tmp.name}]
+        self.use_auto()
+        status, body = self.request("GET", "/agents")
+        self.assertEqual(status, 200)
+        listing = json.loads(body)
+        self.assertEqual(listing["session_mode"], "auto")
+        self.assertEqual([s["name"] for s in listing["sessions"]], ["Main", "Other", "New"])  # stopped Review absent
+        # A denied session is never routed, even with the bridge-wide token.
+        self.assertEqual(self.request("POST", "/sessions/Secret/agents/w1:p1/ag-ui", self.message("x"))[0], 404)
+        self.assertEqual(self.prompts, [])
+        status, body = self.request("POST", "/sessions/New/agents/w2:p1/ag-ui", self.message("Hello"))
+        self.assertEqual(status, 200)
+        self.assertIn("Reply from New/w2:p1", body)
+
+    def test_auto_mode_failed_session_list_is_503_not_empty(self):
+        self.use_auto()
+        self.session_list_fails = True
+        self.assertEqual(self.request("GET", "/agents")[0], 503)
+
+    def test_configured_mode_still_honours_deny(self):
+        self.bridge.SESSIONS_DENY = frozenset({"Other"})
+        status, body = self.request("GET", "/agents")
+        self.assertNotIn("Other", [s["name"] for s in json.loads(body)["sessions"]])
+        self.assertEqual(self.request("POST", "/sessions/Other/agents/w1:p2/ag-ui", self.message("x"))[0], 404)
+
+    def test_discovery_credential_lists_but_never_prompts(self):
+        import hashlib
+        disc = "D" * 43
+        self.bridge.DISCOVERY_SHA256 = hashlib.sha256(disc.encode()).hexdigest()
+        self.bridge.LEDGER = self.bridge.RequestLedger(str(Path(self.tmp.name) / "disc.sqlite3"))
+        status, body = self.request("GET", "/agents", token=disc)
+        self.assertEqual(status, 200)
+        names = {s["name"]: [a["pane_id"] for a in s["agents"]] for s in json.loads(body)["sessions"]}
+        self.assertEqual(names["Main"], ["wA:p1", "w3:p1"])
+        self.assertEqual(self.request("GET", "/attention", token=disc)[0], 200)
+        for method, path in (("POST", "/sessions/Main/agents/w3:p1/ag-ui"), ("POST", "/ag-ui"),
+                             ("GET", "/agent"), ("GET", "/requests/" + "a" * 64)):
+            self.assertEqual(self.request(method, path, self.message("x") if method == "POST" else None,
+                                          token=disc)[0], 404, path)
+        self.assertEqual(self.prompts, [])
+        self.assertEqual(self.request("GET", "/agents")[0], 200)  # the bridge-wide token still works
+
+    def test_discovery_reports_agent_kind(self):
+        self.roster["Main"][0]["agent"] = "claude"
+        self.roster["Main"][1]["agent"] = "hermes"
+        body = json.loads(self.request("GET", "/agents")[1])
+        main = next(s for s in body["sessions"] if s["name"] == "Main")
+        self.assertEqual([a["agent"] for a in main["agents"]], ["claude", "hermes"])
 
     def test_bind_host_policy(self):
         self.bridge.check_bind_host("127.0.0.1")
