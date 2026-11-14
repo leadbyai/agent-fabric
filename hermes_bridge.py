@@ -372,17 +372,19 @@ class Turn:
             if time.monotonic() - last_beat >= HEARTBEAT_SECONDS:
                 self.emit({"type": "CUSTOM", "name": "agent-fabric.progress", "value": {"state": "working"}})
                 last_beat = time.monotonic()
-        if self.failure:
-            raise RuntimeError(f"Hermes turn failed: {self.failure}")
-        if outbox is not None:
-            screenshots = bridge.persist_reply_images("", outbox, mode="inline")
-            if screenshots:
-                preview = ("\n\n" if self.final else "") + screenshots
-                self._text(preview)
-                self.final += preview
-        if self.started_text:
-            self.emit({"type": "TEXT_MESSAGE_END", "messageId": self.message_id})
-        return self.final
+        try:
+            if self.failure:
+                raise RuntimeError(f"Hermes turn failed: {self.failure}")
+            if outbox is not None:
+                screenshots = bridge.persist_reply_images("", outbox, mode="inline")
+                if screenshots:
+                    preview = ("\n\n" if self.final else "") + screenshots
+                    self._text(preview)
+                    self.final += preview
+            return self.final
+        finally:
+            if self.started_text:
+                self.emit({"type": "TEXT_MESSAGE_END", "messageId": self.message_id})
 
 
 def session_title(profile_id: str, thread_id: str) -> str:
