@@ -29,12 +29,13 @@ def _lineage(db, root_id):
     ).fetchone()
     if root is None or root["origin"] not in ("cli", "tui"):
         raise SourceUnavailable("binding does not identify a native Hermes session")
+    origin = root["origin"]
     chain = [root["id"]]
     while root["end_reason"] == "compression":
         children = db.execute(
             "SELECT id, source, end_reason FROM sessions WHERE parent_session_id=? "
             "AND COALESCE(created_source, source)=? LIMIT 2",
-            (chain[-1], root["source"]),
+            (chain[-1], origin),
         ).fetchall()
         if not children:
             break
