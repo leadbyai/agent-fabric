@@ -72,6 +72,8 @@ def env_config() -> dict:
         "timeout": int(os.environ.get("OPENBOT_BRIDGE_TIMEOUT_SECONDS", "900")),
         "approval_wait": int(os.environ.get("HERMES_APPROVAL_WAIT_SECONDS", "0")),
         "allow_native": os.environ.get("HERMES_ALLOW_NATIVE_ATTACH", "0").strip() == "1",
+        "bound_thread": os.environ.get("HERMES_BOUND_THREAD_ID", "").strip(),
+        "bound_session": os.environ.get("HERMES_BOUND_SESSION_ID", "").strip(),
         "follow_profile": os.environ.get("HERMES_FOLLOW_PROFILE_CONFIG", "1").strip() != "0",
     }
 
@@ -393,12 +395,19 @@ def foreign_session(snapshot: dict, sent: dict) -> str | None:
 
 
 async def open_session(client, ledger: HermesLedger, profile_id: str, thread_id: str,
-                       *, allow_native: bool = False, follow_profile: bool = True) -> tuple[str, bool]:
+                       *, allow_native: bool = False, follow_profile: bool = True,
+                       bound_session: str = "") -> tuple[str, bool]:
     """The Hermes session this OpenBot thread owns: resume ours, or create a new one.
 
     A thread an operator explicitly bound to an existing native session (origin 'bound',
     e.g. one a TUI also opens by id) is resumed only when native attachment is enabled
     (HERMES_ALLOW_NATIVE_ATTACH=1, off by default). Nothing here discovers or adopts other sessions."""
+    if bound_session:
+        snapshot = await client.rpc("session.resume", session_id=bound_session, omit_messages=True,
+                                    defer_history=True)
+        if (snapshot.get("stored_session_id") or snapshot.get("session_id")) != bound_session:
+            raise PermissionError("Hermes returned a different session than the configured binding")
+        return bound_session, False
     mapping = ledger.thread_session(profile_id, thread_id)
     known = None
     if mapping:
@@ -495,13 +504,16 @@ class HermesHandler(bridge.Handler):
             self.json_response(400, {"error": "Attachments are not supported by the Hermes backend yet",
                                      "code": "attachments_unsupported"})
             return
+        thread_id = str(body.get("threadId") or uuid.uuid4())
+        if self.config.get("bound_thread") and thread_id != self.config["bound_thread"]:
+            self.json_response(404, {"error": "not_found"})
+            return
         found = self.connector.discover(name)
         if found.endpoint is None or found.state != "ready":
             self.json_response(503, {"error": f"Hermes gateway for this profile is {found.state}",
                                      "code": found.reason_code or "not_ready"})
             return
         endpoint = found.endpoint
-        thread_id = str(body.get("threadId") or uuid.uuid4())
         run_id = str(body.get("runId") or uuid.uuid4())
         key = RequestLedger.key(endpoint.profile_id, "hermes", thread_id, run_id)
         fingerprint = RequestLedger.fingerprint(text, [])
@@ -533,7 +545,8 @@ class HermesHandler(bridge.Handler):
             async with self.connector.connect(endpoint) as client:
                 session_id, created = await open_session(client, self.ledger, endpoint.profile_id, thread_id,
                                                          allow_native=self.config.get("allow_native", False),
-                                                         follow_profile=self.config.get("follow_profile", True))
+                                                         follow_profile=self.config.get("follow_profile", True),
+                                                         bound_session=self.config.get("bound_session", ""))
                 emit({"type": "CUSTOM", "name": "agent-fabric.progress",
                       "value": {"state": "submitted", "session": "created" if created else "resumed"}})
                 turn = Turn(client, emit, session_id=session_id,
@@ -580,6 +593,10 @@ def main() -> None:
         sys.exit(str(exc))
     if not config["profiles"] or any(not PROFILE_RE.fullmatch(p) for p in config["profiles"]):
         sys.exit("Set HERMES_PROFILES to the comma-separated profiles to expose")
+    if config["bound_thread"] or config["bound_session"]:
+        if (not config["bound_thread"] or not config["bound_session"] or not config["allow_native"]
+                or config["profiles"] != ("default",)):
+            sys.exit("A pinned bridge requires native attach, a thread, a session and one dedicated HERMES_HOME")
     if not config["ledger"]:
         sys.exit("Set OPENBOT_BRIDGE_LEDGER_PATH to a private absolute path")
     if not 30 <= config["timeout"] <= 3600:

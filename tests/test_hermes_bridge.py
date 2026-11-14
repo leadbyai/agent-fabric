@@ -261,6 +261,19 @@ class HermesBridgeTests(unittest.TestCase):
         self.assertEqual(self.gateway.sessions["NATIVE"], ["hi"])
         self.assertEqual(self.gateway.created, 0)
 
+    def test_pinned_bridge_accepts_only_its_exact_thread_and_existing_session(self):
+        self.gateway.sessions["NATIVE"] = []
+        self.server.RequestHandlerClass.config.update(
+            bound_thread="bound-thread", bound_session="NATIVE", allow_native=True,
+        )
+        self.assertEqual(self.run_turn(thread="other-thread")[0], 404)
+        self.assertEqual(self.gateway.calls, [])
+        self.assertIn("RUN_FINISHED", self.run_turn(thread="bound-thread")[1])
+        self.assertEqual(self.gateway.sessions["NATIVE"], ["hi"])
+        del self.gateway.sessions["NATIVE"]
+        self.assertIn("RUN_ERROR", self.run_turn(thread="bound-thread", run="r2")[1])
+        self.assertEqual(self.gateway.created, 0)
+
     def test_hash_only_bearer(self):
         import hashlib
         real = "r" * 43
