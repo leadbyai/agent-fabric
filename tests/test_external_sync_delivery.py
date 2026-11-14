@@ -8,10 +8,13 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from external_sync_cursor import CursorLedger
 from external_sync_hermes import sync_hermes
-from external_sync_watcher import Binding, ImportClient, ImportFailed, Source, sync_source
+from external_sync_watcher import (
+    Binding, ImportClient, ImportFailed, Source, SourceUnavailable, resolve_claude, sync_source,
+)
 from test_external_sync_cursor import SID, answer, prompt
 
 
@@ -111,3 +114,31 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(self.received[0], self.received[1])
         self.assertEqual([e["content"] for e in self.stored.values()], ["a question", "an answer"])
         self.assertEqual({e["session_id"] for e in self.stored.values()}, {"first"})
+
+    def test_resolver_follows_current_session_and_rejects_reused_pid(self):
+        config = self.root / "claude"
+        (config / "sessions").mkdir(parents=True)
+        process = self.root / "proc" / "42"
+        process.mkdir(parents=True)
+        (process / "stat").write_text("42 (claude) " + " ".join(["0"] * 19 + ["97"]))
+        (process / "environ").write_bytes(f"CLAUDE_CONFIG_DIR={config}\0".encode())
+        metadata = config / "sessions" / "42.json"
+        binding = Binding("fixture", "staging", "w1:p1", config, Path("/scratch"))
+        envelope = {"result": {"process_info": {
+            "pane_id": "w1:p1", "foreground_processes": [{"name": "claude", "pid": 42}],
+        }}}
+        with patch("external_sync_watcher.subprocess.run") as run, patch(
+            "external_sync_watcher.Path", side_effect=lambda path: (
+                self.root / "proc" if path == "/proc" else Path(path)
+            )
+        ):
+            run.return_value.stdout = json.dumps(envelope)
+            for prefix in ("a", "b"):
+                sid = f"{prefix}0000000-0000-0000-0000-000000000000"
+                metadata.write_text(json.dumps({
+                    "sessionId": sid, "pid": 42, "procStart": "97", "cwd": str(binding.cwd),
+                }))
+                self.assertEqual(resolve_claude(binding).session_id, sid)
+            (process / "stat").write_text("42 (claude) " + " ".join(["0"] * 19 + ["98"]))
+            with self.assertRaises(SourceUnavailable):
+                resolve_claude(binding)
