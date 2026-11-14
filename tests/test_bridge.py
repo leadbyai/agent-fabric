@@ -302,6 +302,35 @@ class BridgeTests(unittest.TestCase):
         main = next(s for s in body["sessions"] if s["name"] == "Main")
         self.assertEqual([a["agent"] for a in main["agents"]], ["claude", "hermes"])
 
+    def test_session_less_calls_drop_an_empty_herdr_session(self):
+        # The installer writes HERDR_SESSION= (empty) in auto mode. Real Herdr then fails
+        # `session list` with "session name cannot be empty"; the fake below behaves the same way.
+        fake = Path(self.tmp.name) / "herdr"
+        fake.write_text("""#!/usr/bin/env python3
+import json, os, sys
+if "HERDR_SESSION" in os.environ and not os.environ["HERDR_SESSION"]:
+    print("error: session name cannot be empty", file=sys.stderr); sys.exit(2)
+a = sys.argv[1:]
+if a[:3] == ["session", "list", "--json"]:
+    print(json.dumps({"sessions": [{"name": "Main", "running": True}, {"name": "Off", "running": False}]})); sys.exit()
+if "agent" in a and "list" in a:
+    print(json.dumps({"result": {"agents": [], "session": os.environ.get("HERDR_SESSION")}})); sys.exit()
+sys.exit(1)
+""")
+        fake.chmod(0o755)
+        env = {"HERDR_SESSION": "", "HERDR_SESSIONS": "auto", "HERDR_BIN": str(fake),
+               "OPENBOT_BRIDGE_TOKEN": "Z" * 48, "OPENBOT_BRIDGE_ALLOWED_ROOTS": self.tmp.name}
+        with patch.dict(os.environ, env):
+            spec = importlib.util.spec_from_file_location("bridge_env_test", BRIDGE_PATH)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self.assertTrue(module.AUTO_SESSIONS)
+            self.assertEqual(module.running_sessions(), ("Main",))
+            self.assertEqual(module.served_sessions(), ("Main",))
+            # Per-session calls still set the session explicitly.
+            listed = json.loads(module.command("agent", "list", session="Main"))
+            self.assertEqual(listed["result"]["session"], "Main")
+
     def test_bind_host_policy(self):
         self.bridge.check_bind_host("127.0.0.1")
         self.bridge.check_bind_host("100.100.1.2")

@@ -26,6 +26,7 @@ ROUTE_HASHES=()
 EXPECT_BRIDGE_SHA256=""
 DENY_SESSIONS=""
 DISCOVERY_SHA256=""
+VERIFY_TOKEN_FILE=""
 
 usage() {
   printf 'Usage: sudo bash install.sh --user USER --sessions NAME[,NAME] --roots DIR[:DIR] [--artifact-mode inline|signed_url --public-origin https://AGENT-HOST] [--legacy-target NAME --legacy-workdir DIR] [--token-file PATH] [--port 8766] [--busy-wait-seconds 600] [--recovery-seconds 600] [--source-dir DIR [--expect-bridge-sha256 HEX]] [--bind 127.0.0.1|TAILSCALE-IP] [--token-sha256 HEX | --route-token-sha256 SESSION/PANE=HEX ...] [--sessions auto --deny-sessions NAME[,NAME]] [--discovery-token-sha256 HEX] [--no-start]\n'
@@ -61,7 +62,7 @@ esac
 
 while (($#)); do
   case "$1" in
-    --user|--sessions|--roots|--legacy-target|--legacy-workdir|--token-file|--port|--busy-wait-seconds|--recovery-seconds|--source-dir|--public-origin|--artifact-mode|--bind|--token-sha256|--route-token-sha256|--expect-bridge-sha256|--deny-sessions|--discovery-token-sha256)
+    --user|--sessions|--roots|--legacy-target|--legacy-workdir|--token-file|--port|--busy-wait-seconds|--recovery-seconds|--source-dir|--public-origin|--artifact-mode|--bind|--token-sha256|--route-token-sha256|--expect-bridge-sha256|--deny-sessions|--discovery-token-sha256|--verify-token-file)
       (($# >= 2)) || die "Missing value for $1"
       case "$1" in
         --user) RUN_USER="$2" ;;
@@ -82,6 +83,7 @@ while (($#)); do
         --expect-bridge-sha256) EXPECT_BRIDGE_SHA256="$2" ;;
         --deny-sessions) DENY_SESSIONS="$2" ;;
         --discovery-token-sha256) DISCOVERY_SHA256="$2" ;;
+        --verify-token-file) VERIFY_TOKEN_FILE="$2" ;;
       esac
       shift 2 ;;
     --no-start) SKIP_START=1; shift ;;
@@ -104,6 +106,10 @@ if [[ "$HERDR_SESSIONS" == auto ]]; then
   [[ -z "$LEGACY_TARGET" ]] || die "--legacy-target cannot be combined with --sessions auto"
 fi
 [[ -z "$DISCOVERY_SHA256" || "$DISCOVERY_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--discovery-token-sha256 must be 64 lowercase hex characters"
+[[ -z "$VERIFY_TOKEN_FILE" || ( -f "$VERIFY_TOKEN_FILE" && -s "$VERIFY_TOKEN_FILE" ) ]] || die "--verify-token-file must be a non-empty file"
+if [[ "$HERDR_SESSIONS" == auto || -n "$DISCOVERY_SHA256" ]]; then
+  [[ -n "$VERIFY_TOKEN_FILE" ]] || die "--sessions auto / --discovery-token-sha256 need --verify-token-file (a token the new gateway must accept for GET /agents)"
+fi
 [[ -n "$UPLOAD_ROOTS" && "$UPLOAD_ROOTS" =~ ^[A-Za-z0-9_./,:-]+$ ]] || die "Invalid --roots"
 [[ -z "$LEGACY_TARGET" || "$LEGACY_TARGET" =~ ^([a-z][a-z0-9_-]{0,31}|w[0-9A-Za-z]+:p[0-9A-Za-z]+)$ ]] || die "Invalid legacy target"
 [[ -z "$LEGACY_WORKDIR" || "$LEGACY_WORKDIR" =~ ^[A-Za-z0-9_./-]+$ ]] || die "Invalid legacy workdir"
@@ -259,7 +265,8 @@ if [[ -f "$UNIT_FILE" ]]; then
 fi
 {
   printf 'HERDR_SESSIONS=%s\n' "$HERDR_SESSIONS"
-  if [[ "$HERDR_SESSIONS" == auto ]]; then printf 'HERDR_SESSION=\n'; else printf 'HERDR_SESSION=%s\n' "${HERDR_SESSIONS%%,*}"; fi
+  # Auto mode writes no HERDR_SESSION line: an empty value breaks session-less Herdr calls.
+  [[ "$HERDR_SESSIONS" == auto ]] || printf 'HERDR_SESSION=%s\n' "${HERDR_SESSIONS%%,*}"
   [[ -z "$DENY_SESSIONS" ]] || printf 'HERDR_SESSIONS_DENY=%s\n' "$DENY_SESSIONS"
   printf 'HERDR_AGENT_TARGET=%s\n' "$LEGACY_TARGET"
   printf 'HERDR_BIN=%s\n' "$HERDR_EXEC"
@@ -317,6 +324,20 @@ if ((SKIP_START == 0)); then
     fi
     sleep 1
   done
+  # Health alone is not enough: the roster must answer. With a verify token, GET /agents must be 200 and
+  # (in auto mode) list at least one session. The header goes through a 0600 file, never argv.
+  if ((HEALTHY == 1)) && [[ -n "$VERIFY_TOKEN_FILE" ]]; then
+    HEADER_FILE="$(mktemp)"; chmod 0600 "$HEADER_FILE"
+    printf 'Authorization: Bearer %s\n' "$(tr -d '\r\n' < "$VERIFY_TOKEN_FILE")" > "$HEADER_FILE"
+    AGENTS_JSON="$(curl -fsS --max-time 20 -H @"$HEADER_FILE" "http://$BIND_HOST:$GATEWAY_PORT/agents" 2>/dev/null || true)"
+    rm -f "$HEADER_FILE"
+    if ! printf '%s' "$AGENTS_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); s=d.get("sessions"); sys.exit(0 if isinstance(s, list) and (s or d.get("session_mode") != "auto") else 1)' 2>/dev/null; then
+      printf 'Gateway is healthy but GET /agents failed or listed no sessions; restoring the previous deployment.\n' >&2
+      HEALTHY=0
+    else
+      printf 'GET /agents verified (%s sessions).\n' "$(printf '%s' "$AGENTS_JSON" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["sessions"]))')"
+    fi
+  fi
   if ((HEALTHY != 1)) || ! systemctl is-active --quiet openbot-herdr-gateway.service; then
     if [[ -f "$APP_DIR/bridge.py.bak.$BACKUP_STAMP" &&
           -f "$CONF_DIR/config.env.bak.$BACKUP_STAMP" &&

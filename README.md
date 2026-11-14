@@ -102,6 +102,9 @@ Without these options the install is exactly as above (loopback bind, one bridge
 - `--discovery-token-sha256 <sha256>`: an extra, hash-only credential that can `GET /agents` and
   `GET /attention` only. Every POST, `/requests` and `/agent` is 404 for it. It is meant for an automatic
   reconciler that must never be able to prompt an agent. It must differ from every other token.
+- With `--sessions auto` or `--discovery-token-sha256`, also pass `--verify-token-file PATH` (a token the
+  new gateway must accept, e.g. the discovery token). After the restart the installer requires
+  `GET /agents` to answer 200 with a session list, not only `/health`; otherwise it restores its backups.
 - `/agents` reports each agent's Herdr kind (`agent`, e.g. `claude`, `hermes`) and `session_mode`.
 
 `--backend both` runs this install and then `install-hermes.sh` with the `--hermes-*` options

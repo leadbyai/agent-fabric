@@ -223,6 +223,10 @@ def command(*args: str, session: str | None = None, wait_seconds: float = 15) ->
     env = os.environ.copy()
     if session and not MACHINE:
         env["HERDR_SESSION"] = session
+    else:
+        # A session-less call (e.g. `session list`) must not inherit HERDR_SESSION: Herdr reads even an
+        # empty value as a session name and fails ("session name cannot be empty").
+        env.pop("HERDR_SESSION", None)
     result = subprocess.run(
         cmd, capture_output=True, text=True, check=False, timeout=wait_seconds,
         env=env
