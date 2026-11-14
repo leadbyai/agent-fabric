@@ -14,6 +14,9 @@ Current scope:
   exchanges, including across batch boundaries.
 - Obvious credential redaction and a 4 KiB byte cap per event.
 - No peer messages, subagent transcripts, tool input/output or thinking.
+- A separate SQLite cursor helper that stores **positions only**, reads bounded
+  complete JSONL records, refuses rotated/truncated sources, and commits its
+  cursor and echo-suppression state only after downstream ACK.
 
 ## Required before deployment
 
@@ -37,5 +40,5 @@ Derek has explicitly approved the Bot and its data scope. No production use.
 Run tests:
 
 ```bash
-python3 -m unittest discover -s tests -p 'test_external_sync_events.py'
+python3 -m unittest discover -s tests -p 'test_external_sync_*.py'
 ```
