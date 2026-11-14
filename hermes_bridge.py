@@ -318,8 +318,14 @@ async def list_profiles(connector, allowed: tuple[str, ...]) -> dict:
     async with connector.connect(root.endpoint) as client:
         roster = await client.rpc("profiles.list")
     install_id = roster.get("install_id") or ""
+    rows = [row for row in roster.get("profiles") or [] if isinstance(row, dict)]
+    dedicated = getattr(connector, "dedicated_profile", None)
+    if dedicated and dedicated in allowed and not any(row.get("name") == dedicated for row in rows):
+        # A dedicated bridge serves its one home under its own route name. A standalone home outside
+        # <root>/profiles/ calls itself "default" in its roster, so that row is this route.
+        rows = [{**row, "name": dedicated, "display_name": dedicated} for row in rows if row.get("name") == "default"]
     profiles = []
-    for row in roster.get("profiles") or []:
+    for row in rows:
         name = row.get("name")
         if not isinstance(name, str) or name not in allowed:
             continue

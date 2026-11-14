@@ -622,3 +622,19 @@ class IsolatedHandlerTests(HermesBridgeTests):
         data = self.run_turn(thread="bound-thread")[1]
         self.assertIn("RUN_ERROR", data)
         self.assertNotIn("NATIVE", [p.get("session_id") for m, p in self.gateway.calls if m == "prompt.submit"])
+
+
+class DedicatedListingTests(HermesBridgeTests):
+    """A dedicated (pinned or isolated) bridge lists its one home under its route name."""
+
+    def test_standalone_home_listed_under_its_route_name(self):
+        self.gateway.dedicated_profile = "solo"
+        self.server.RequestHandlerClass.config = {**self.server.RequestHandlerClass.config, "profiles": ("solo",)}
+        listing = json.loads(self.request("GET", "/agents")[1])
+        self.assertEqual([(p["name"], p["display_name"], p["ag_ui_path"]) for p in listing["profiles"]],
+                         [("solo", "solo", "/profiles/solo/ag-ui")])
+
+    def test_roster_that_names_the_route_is_unchanged(self):
+        self.gateway.dedicated_profile = "pilot"
+        listing = json.loads(self.request("GET", "/agents")[1])
+        self.assertEqual([(p["name"], p["display_name"]) for p in listing["profiles"]], [("pilot", "Pilot Bot")])
