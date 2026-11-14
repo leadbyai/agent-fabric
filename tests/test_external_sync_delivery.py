@@ -14,6 +14,7 @@ from unittest.mock import patch
 from external_sync_cursor import CursorLedger
 from external_sync_backfill import backfill, _timestamp
 from external_sync_hermes import sync_hermes
+from external_sync_supervisor import desired_sources
 from external_sync_watcher import (
     Binding, ImportClient, ImportFailed, Source, SourceUnavailable, resolve_claude, sync_source,
 )
@@ -21,6 +22,16 @@ from test_external_sync_cursor import SID, answer, prompt
 
 
 SECRET = "synthetic-secret-" * 3
+
+
+class ManifestTests(unittest.TestCase):
+    def test_only_explicit_unique_bindings_are_started(self):
+        row = dict(enabled=True, runtime="claude", botId="test", nativeSessionId=SID,
+                   herdrSession="staging", paneId="w1:p1", claudeConfigDir="/tmp/claude",
+                   cwd="/tmp/project", openbotOrigin="http://127.0.0.1:3001")
+        self.assertEqual(len(desired_sources({"bindings": [row, {"enabled": False}]})), 1)
+        with self.assertRaisesRegex(ValueError, "source claimed"):
+            desired_sources({"bindings": [row, dict(row, botId="other")]})
 
 
 class DeliveryTests(unittest.TestCase):

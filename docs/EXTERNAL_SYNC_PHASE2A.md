@@ -52,6 +52,29 @@ and uses durable transcript message IDs so gateway replay resets do not create
 duplicates. Bind a dedicated native conversation for mirroring. OpenBot-created
 Hermes sessions are outside this source.
 
+### Fleet rollout components
+
+The same explicit source config accepts `backfillOnFirstStart: true`. Claude
+requires `nativeSessionId` for this mode. The initial import uses the existing
+durable cursor and can resume after a failed request. The switch does not rewind
+an existing cursor.
+
+Use `external_sync_backfill.py` for a time-bounded import on an already-running
+Claude binding. Supply `--config`, `--herdr`, `--from-time` and `--before-time`
+with timezone-aware timestamps. The default is a count-only preview. Supply
+`--apply --job-ledger <private-directory>` to deliver; repeat the same command
+to resume the job. Use a cutoff before the live watcher's activation and the
+same sender setting. Older messages are appended with their original timestamp
+because the OpenBot thread is append-only.
+
+`external_sync_supervisor.py --manifest <file> --state <private-directory>`
+starts pinned Claude or Hermes readers from an operator-owned JSON object with
+a `bindings` array. Each entry includes `runtime`, its reader config and
+`enabled: true`. Validate with `--check`. Publish manifests by atomic rename.
+The supervisor does not discover agents, set OpenBot opt-in flags or verify
+that a historical source belongs to a Bot owner. A provisioning integration
+must resolve and validate those facts before writing the manifest.
+
 ## Required before production
 
 1. Per-Bot explicit opt-in (default OFF), using a synthetic staging Bot first.
