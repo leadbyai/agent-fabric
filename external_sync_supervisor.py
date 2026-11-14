@@ -11,6 +11,30 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
+from urllib.request import Request, build_opener
+
+from external_sync_watcher import NoRedirect
+
+
+def fetch_manifest(origin, secret):
+    url = urlsplit(origin)
+    if (url.scheme != "https" or not url.hostname or url.username or url.password
+            or url.path not in ("", "/") or url.query or url.fragment):
+        raise ValueError("enrollment origin must be a bare HTTPS origin")
+    request = Request(
+        origin.rstrip("/") + "/api/agent-fabric/enrollments",
+        headers={"Authorization": "Bearer " + secret, "Accept": "application/json"},
+    )
+    with build_opener(NoRedirect()).open(request, timeout=10) as response:
+        raw = response.read(1_000_001)
+    if len(raw) > 1_000_000:
+        raise ValueError("enrollment manifest exceeds 1 MB")
+    payload = json.loads(raw)
+    # Keep both enrollment and import credentials on the configured origin.
+    return {"bindings": [
+        {**entry, "openbotOrigin": origin} for entry in payload["bindings"]
+    ]}
 
 
 def desired_sources(manifest):
@@ -44,19 +68,27 @@ def desired_sources(manifest):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--manifest", type=Path)
+    source.add_argument("--enrollment-origin")
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--herdr", default="herdr")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
-    def load():
-        return desired_sources(json.loads(args.manifest.read_bytes()))
-    desired = load()
-    if args.check:
-        print(json.dumps({"bindings": len(desired)}))
-        return
-    if not os.environ.get("AGENT_FABRIC_IMPORT_SECRET"):
+    secret = os.environ.get("AGENT_FABRIC_IMPORT_SECRET")
+    if (args.enrollment_origin or not args.check) and not secret:
         parser.error("AGENT_FABRIC_IMPORT_SECRET is required")
+
+    def load():
+        manifest = (
+            fetch_manifest(args.enrollment_origin, secret)
+            if args.enrollment_origin else json.loads(args.manifest.read_bytes())
+        )
+        return desired_sources(manifest)
+
+    if args.check:
+        print(json.dumps({"bindings": len(load())}))
+        return
     os.umask(0o077)
     args.state.mkdir(parents=True, exist_ok=True, mode=0o700)
     workers = {}
