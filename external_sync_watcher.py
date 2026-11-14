@@ -44,6 +44,7 @@ class Binding:
     pane_id: str
     claude_config_dir: Path
     cwd: Path
+    native_session_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,8 @@ def resolve_claude(binding: Binding, *, herdr_bin: str = "herdr") -> Source:
                 or _process_start(proc) != started
                 or cwd != binding.cwd or not SESSION_ID.fullmatch(sid)):
             raise SourceUnavailable("live Claude session identity differs from binding")
+        if binding.native_session_id is not None and sid != binding.native_session_id:
+            raise SourceUnavailable("Claude session differs from the pinned native session")
         projects = binding.claude_config_dir / "projects"
         directory = projects / re.sub(r"[^a-zA-Z0-9-]", "-", str(cwd))
         if directory.resolve().parent != projects or directory.is_symlink():
@@ -210,10 +213,14 @@ def main():
     binding = Binding(
         cfg["botId"], cfg["herdrSession"], cfg["paneId"],
         Path(cfg["claudeConfigDir"]).resolve(), Path(cfg["cwd"]).resolve(),
+        cfg.get("nativeSessionId"),
     )
     if (not re.fullmatch(r"[\w.-]{1,128}", binding.bot_id, flags=re.ASCII)
             or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", binding.herdr_session)
-            or not re.fullmatch(r"w[0-9A-Za-z]+:p[0-9A-Za-z]+", binding.pane_id)):
+            or not re.fullmatch(r"w[0-9A-Za-z]+:p[0-9A-Za-z]+", binding.pane_id)
+            or (binding.native_session_id is not None and
+                (not isinstance(binding.native_session_id, str)
+                 or not SESSION_ID.fullmatch(binding.native_session_id)))):
         parser.error("invalid Bot or Herdr binding")
     client = ImportClient(cfg["openbotOrigin"], os.environ["AGENT_FABRIC_IMPORT_SECRET"])
     ledger = CursorLedger(args.ledger)

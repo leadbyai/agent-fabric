@@ -1,6 +1,7 @@
 """Exercise real HTTP delivery and durable offsets using synthetic sources."""
 
 import contextlib
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -140,6 +141,10 @@ class DeliveryTests(unittest.TestCase):
                     "sessionId": sid, "pid": 42, "procStart": "97", "cwd": str(binding.cwd),
                 }))
                 self.assertEqual(resolve_claude(binding).session_id, sid)
+            pinned = replace(binding, native_session_id=sid)
+            self.assertEqual(resolve_claude(pinned).session_id, sid)
+            with self.assertRaisesRegex(SourceUnavailable, "pinned native session"):
+                resolve_claude(replace(pinned, native_session_id="a" + sid[1:]))
             (process / "stat").write_text("42 (claude) " + " ".join(["0"] * 19 + ["98"]))
             with self.assertRaises(SourceUnavailable):
                 resolve_claude(binding)
