@@ -95,7 +95,9 @@ class BridgeTests(unittest.TestCase):
             marker = re.search(r"OPENBOT_BEGIN_([A-F0-9]{16})", prompt).group(1)
             if "Create a screenshot" in prompt:
                 current = next(a for a in agents if a["pane_id"] == pane_id)
-                outbox = Path(current["cwd"]) / ".openbot-outbox" / marker
+                outbox = Path(re.search(r"into (.*?)/\. The gateway automatically attaches", prompt)[1])
+                if not outbox.is_absolute():
+                    outbox = Path(current["cwd"]) / outbox
                 (outbox / "screen.png").write_bytes(ONE_PIXEL_PNG)
                 response = "Created screenshot."
                 if "without marker" not in prompt:
@@ -156,6 +158,38 @@ class BridgeTests(unittest.TestCase):
         inbox = Path(self.tmp.name) / "pricing" / ".openbot-inbox"
         self.assertEqual(len(list(inbox.glob("*/1-test.csv"))), 1)
         self.assertFalse((Path(self.tmp.name) / "demo" / ".openbot-inbox").exists())
+
+    def test_text_reaches_agent_outside_upload_roots_but_uploads_stay_blocked(self):
+        path = "/sessions/Main/agents/w3:p1/ag-ui"
+        root = Path(self.tmp.name)
+        self.bridge.ALLOWED_ROOTS = (str(root / "demo"),)
+        status, body = self.request("POST", path, self.message("Hello from the group"))
+        self.assertEqual(status, 200)
+        self.assertIn("RUN_FINISHED", body)
+        self.assertIn("Hello from the group", self.prompts[0][2])
+        self.assertNotIn("OPENBOT_IMAGE", self.prompts[0][2])
+        self.assertFalse((root / "pricing" / ".openbot-outbox").exists())
+
+        _, body = self.request("POST", path, self.message("With a file", "upload\n"))
+        self.assertIn("outside allowed upload roots", body)
+        self.assertEqual(len(self.prompts), 1)
+        self.assertFalse((root / "pricing" / ".openbot-inbox").exists())
+
+    def test_pinned_route_provisions_screenshots_and_uploads_outside_agent_cwd(self):
+        path = "/sessions/Main/agents/w3:p1/ag-ui"
+        root = Path(self.tmp.name)
+        self.bridge.ALLOWED_ROOTS = (str(root / "demo"),)
+        self.bridge.MEDIA_ROOT = str(root / "demo")
+        self.bridge.MEDIA_ROUTES = {"Main/w3:p1"}
+        status, body = self.request("POST", path, self.message("Create a screenshot", "sample CSV\n"))
+        self.assertEqual(status, 200)
+        self.assertIn("RUN_FINISHED", body)
+        self.assertIn("data:image/png;base64,", body)
+        route_directory = self.bridge.route_media_directory("Main/w3:p1")
+        upload, = route_directory.glob(".openbot-inbox/*/1-*")
+        self.assertEqual(upload.read_text(), "sample CSV\n")
+        self.assertIn(str(upload), self.prompts[0][2])
+        self.assertFalse((root / "pricing" / ".openbot-outbox").exists())
 
     def test_stopped_or_unknown_agent_never_gets_prompt(self):
         status, body = self.request("POST", "/sessions/Review/agents/w1:p1/ag-ui",
