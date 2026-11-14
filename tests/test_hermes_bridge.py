@@ -267,6 +267,60 @@ class HermesBridgeTests(unittest.TestCase):
         conn.request("GET", "/agents")
         self.assertEqual(conn.getresponse().status, 401)
 
+    def test_profile_hash_file_parsing(self):
+        import hashlib
+        a, b = (hashlib.sha256(x.encode()).hexdigest() for x in ("a" * 43, "b" * 43))
+        parsed = hermes_bridge.parse_profile_hashes(f"# comment\npilot {a}\n\nother {b.upper()}  # trailing\n")
+        self.assertEqual(parsed, {"pilot": a, "other": b})
+        for bad in (f"pilot {a}\npilot {b}\n",     # profile listed twice
+                    f"pilot {a}\nother {a}\n",     # one token for two profiles
+                    f"pilot {a[:-1]}\n",            # not a sha256
+                    f"Pilot! {a}\n",                # not a profile name
+                    f"pilot {a} extra\n"):
+            with self.assertRaises(ValueError):
+                hermes_bridge.parse_profile_hashes(bad)
+
+    def test_per_profile_scope_function(self):
+        import hashlib
+        config = {"profiles": ("pilot", "other"), "token": "", "token_sha256": "",
+                  "profile_hashes": {"pilot": hashlib.sha256(b"A" * 43).hexdigest(),
+                                     "other": hashlib.sha256(b"B" * 43).hexdigest(),
+                                     "hidden": hashlib.sha256(b"C" * 43).hexdigest()}}
+        self.assertEqual(hermes_bridge.bearer_scope("Bearer " + "A" * 43, config), ("pilot",))
+        self.assertEqual(hermes_bridge.bearer_scope("Bearer " + "B" * 43, config), ("other",))
+        self.assertEqual(hermes_bridge.bearer_scope("Bearer " + "C" * 43, config), ())  # profile not exposed
+        self.assertEqual(hermes_bridge.bearer_scope("Bearer " + config["profile_hashes"]["pilot"], config), ())
+        self.assertEqual(hermes_bridge.bearer_scope("A" * 43, config), ())
+        legacy = {"profiles": ("pilot", "other"), "token": TOKEN, "token_sha256": "", "profile_hashes": {}}
+        self.assertEqual(hermes_bridge.bearer_scope("Bearer " + TOKEN, legacy), ("pilot", "other"))
+
+    def test_per_profile_tokens_over_http(self):
+        import hashlib
+        tok_pilot, tok_other = "p" * 43, "o" * 43
+        self.server.RequestHandlerClass.config = {
+            **self.server.RequestHandlerClass.config, "token": "", "token_sha256": "",
+            "profiles": ("pilot", "other"),
+            "profile_hashes": {"pilot": hashlib.sha256(tok_pilot.encode()).hexdigest(),
+                               "other": hashlib.sha256(tok_other.encode()).hexdigest()}}
+        # Discovery shows only the token's own profile.
+        for token, name in ((tok_pilot, "pilot"), (tok_other, "other")):
+            status, data = self.request("GET", "/agents", token=token)
+            self.assertEqual(status, 200)
+            self.assertEqual([p["name"] for p in json.loads(data)["profiles"]], [name])
+        self.assertEqual(self.request("GET", "/agents", token=TOKEN)[0], 401)  # old bridge-wide token is gone
+        # A token cannot drive another profile; Hermes is never contacted for it.
+        body = {"threadId": "t-x", "runId": "r-x", "messages": [{"id": "m", "role": "user", "content": "hi"}]}
+        self.gateway.calls.clear()
+        self.assertEqual(self.request("POST", "/profiles/other/ag-ui", body, token=tok_pilot)[0], 404)
+        self.assertEqual(self.gateway.calls, [])
+        status, data = self.request("POST", "/profiles/pilot/ag-ui", body, token=tok_pilot)
+        self.assertEqual(status, 200)
+        self.assertIn("RUN_FINISHED", [e["type"] for e in self.events(data)])
+        # Request status is visible only within the owning profile's scope.
+        key = hermes_bridge.RequestLedger.key(PROFILE_ID, "hermes", "t-x", "r-x")
+        self.assertEqual(self.request("GET", f"/requests/{key}", token=tok_pilot)[0], 200)
+        self.assertEqual(self.request("GET", f"/requests/{key}", token=tok_other)[0], 404)
+
     def test_bind_host_policy(self):
         hermes_bridge.check_bind_host("127.0.0.1")
         hermes_bridge.check_bind_host("100.100.1.2")

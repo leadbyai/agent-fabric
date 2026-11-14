@@ -37,7 +37,7 @@ from urllib.parse import urlsplit
 import bridge
 from request_ledger import RequestLedger
 
-VERSION = "0.8.0-hermes.1"
+VERSION = "0.8.0-hermes.2"
 PROFILE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 ROUTE_RE = re.compile(r"/profiles/([a-z0-9][a-z0-9_-]{0,63})/ag-ui\Z")
 SESSION_SOURCE = "gui"
@@ -54,9 +54,13 @@ def env_config() -> dict:
     sha_file = os.environ.get("OPENBOT_BRIDGE_TOKEN_SHA256_FILE", "").strip()
     if sha_file and not token_sha256:
         token_sha256 = Path(sha_file).read_text(encoding="utf-8").strip().lower()
+    profile_tokens_file = os.environ.get("OPENBOT_BRIDGE_PROFILE_TOKENS_FILE", "").strip()
+    profile_hashes = parse_profile_hashes(Path(profile_tokens_file).read_text(encoding="utf-8")) \
+        if profile_tokens_file else {}
     return {
         "token": token,
         "token_sha256": token_sha256,
+        "profile_hashes": profile_hashes,
         "host": os.environ.get("OPENBOT_BRIDGE_HOST", "127.0.0.1").strip(),
         "port": int(os.environ.get("OPENBOT_BRIDGE_PORT", "8767")),
         "hermes_home": os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")).strip(),
@@ -111,6 +115,45 @@ class HermesLedger(RequestLedger):
                 ON CONFLICT(profile_id, thread_id) DO UPDATE SET session_id=excluded.session_id,
                   origin=excluded.origin
             """, (profile_id, thread_id, session_id, origin, int(time.time())))
+
+
+def parse_profile_hashes(text: str) -> dict[str, str]:
+    """Per-profile token hashes: one ``<profile> <sha256-hex>`` per line; ``#`` starts a comment.
+    Each token is scoped to exactly one profile, so a hash may appear only once."""
+    hashes: dict[str, str] = {}
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) != 2 or not PROFILE_RE.fullmatch(parts[0]) or not re.fullmatch(r"[0-9a-f]{64}", parts[1].lower()):
+            raise ValueError(f"profile token file line {number}: expected '<profile> <64-hex sha256>'")
+        name, digest = parts[0], parts[1].lower()
+        if name in hashes:
+            raise ValueError(f"profile token file line {number}: profile listed twice")
+        if digest in hashes.values():
+            raise ValueError(f"profile token file line {number}: the same token hash is used for two profiles")
+        hashes[name] = digest
+    return hashes
+
+
+def bearer_scope(header: str, config: dict) -> tuple[str, ...]:
+    """Profiles the presented bearer may use (empty tuple = unauthorized).
+    With per-profile hashes a token reaches only its own profile; a single bridge-wide token or
+    hash (the older configuration) reaches every exposed profile."""
+    import hmac
+    profiles = tuple(config.get("profiles") or ())
+    hashes: dict = config.get("profile_hashes") or {}
+    if not hashes:
+        return profiles if bearer_ok(header, config) else ()
+    if not header.startswith("Bearer ") or len(header) > 4096:
+        return ()
+    digest = hashlib.sha256(header[len("Bearer "):].encode("utf-8")).hexdigest()
+    matched = ()
+    for name, expected in hashes.items():  # compare against every entry: no early exit
+        if hmac.compare_digest(digest, expected) and name in profiles:
+            matched = (name,)
+    return matched
 
 
 def bearer_ok(header: str, config: dict) -> bool:
@@ -337,20 +380,24 @@ class HermesHandler(bridge.Handler):
     connector: HermesConnector | None = None
     ledger: HermesLedger | None = None
 
-    def authorized(self) -> bool:
-        return bearer_ok(self.headers.get("Authorization", ""), self.config)
+    def scope(self) -> tuple[str, ...]:
+        return bearer_scope(self.headers.get("Authorization", ""), self.config)
+
+    def profile_id_scope(self, scope: tuple[str, ...]) -> set[str]:
+        return {str(self.connector.profile_home(name)) for name in scope}
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path == "/health":
             self.json_response(200, {"ok": True, "version": VERSION, "mode": "hermes"})
             return
-        if not self.authorized():
+        scope = self.scope()
+        if not scope:
             self.json_response(401, {"error": "unauthorized"})
             return
         if path == "/agents":
             try:
-                listing = asyncio.run(list_profiles(self.connector, self.config["profiles"]))
+                listing = asyncio.run(list_profiles(self.connector, scope))
             except Exception as exc:
                 self.json_response(503, {"error": "Hermes gateway unavailable", "detail": type(exc).__name__})
                 return
@@ -359,6 +406,8 @@ class HermesHandler(bridge.Handler):
         if path.startswith("/requests/"):
             key = path.removeprefix("/requests/")
             record = self.ledger.get(key) if re.fullmatch(r"[a-f0-9]{64}", key) else None
+            if record is not None and record["session"] not in self.profile_id_scope(scope):
+                record = None  # another profile's request: indistinguishable from unknown
             if record is None:
                 self.json_response(404, {"error": "not_found"})
             else:
@@ -368,11 +417,12 @@ class HermesHandler(bridge.Handler):
         self.json_response(404, {"error": "not_found"})
 
     def do_POST(self) -> None:
-        if not self.authorized():
+        scope = self.scope()
+        if not scope:
             self.json_response(401, {"error": "unauthorized"})
             return
         match = ROUTE_RE.fullmatch(urlsplit(self.path).path)
-        if not match or match.group(1) not in self.config["profiles"]:
+        if not match or match.group(1) not in scope:
             self.json_response(404, {"error": "Unknown or not allowed Hermes profile"})
             return
         name = match.group(1)
@@ -448,14 +498,24 @@ class HermesHandler(bridge.Handler):
 
 
 def main() -> None:
-    config = env_config()
-    if config["token_sha256"]:
+    try:
+        config = env_config()
+    except ValueError as exc:
+        sys.exit(str(exc))
+    if config["profile_hashes"]:
+        if config["token"] or config["token_sha256"]:
+            sys.exit("Configure per-profile token hashes or a bridge-wide token, not both")
+        unknown = sorted(set(config["profile_hashes"]) - set(config["profiles"]))
+        if unknown:
+            sys.exit("OPENBOT_BRIDGE_PROFILE_TOKENS_FILE names profiles that are not in HERMES_PROFILES")
+    elif config["token_sha256"]:
         if config["token"]:
             sys.exit("Configure either a token or a token SHA-256, not both")
         if not re.fullmatch(r"[0-9a-f]{64}", config["token_sha256"]):
             sys.exit("OPENBOT_BRIDGE_TOKEN_SHA256(_FILE) must be a 64-character hex SHA-256")
     elif not config["token"] or len(config["token"]) < 24:
-        sys.exit("Set OPENBOT_BRIDGE_TOKEN(_FILE) to a random secret of at least 24 characters, "
+        sys.exit("Set OPENBOT_BRIDGE_PROFILE_TOKENS_FILE (per-profile SHA-256 hashes), "
+                 "OPENBOT_BRIDGE_TOKEN(_FILE) to a random secret of at least 24 characters, "
                  "or OPENBOT_BRIDGE_TOKEN_SHA256(_FILE) to the SHA-256 of one")
     try:
         check_bind_host(config["host"])
@@ -476,7 +536,8 @@ def main() -> None:
     HermesHandler.connector = HermesConnector(config["hermes_home"], config["agent_dir"])
     server = ThreadingHTTPServer((config["host"], config["port"]), HermesHandler)
     print(f"Agent Fabric Hermes bridge {VERSION} ready on {config['host']}:{config['port']} "
-          f"| profiles={len(config['profiles'])}", flush=True)
+          f"| profiles={len(config['profiles'])} "
+          f"| auth={'per-profile' if config['profile_hashes'] else 'bridge-wide'}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

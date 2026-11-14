@@ -6,7 +6,8 @@
 #
 #   bash install-hermes.sh --source-dir DIR --profiles NAME[,NAME] --bind IP [--port 8767]
 #        [--hermes-home ~/.hermes] [--hermes-agent-dir DIR] [--python PATH]
-#        [--token-sha256 HEX | --token-file PATH]   # hash-only: the bridge never stores the token
+#        [--profile-token-sha256 NAME=HEX ...]     # per-profile hashes: each token reaches one profile
+#        [--token-sha256 HEX | --token-file PATH]   # bridge-wide: one token reaches every listed profile
 #        [--timeout-seconds 900] [--no-start]
 #   bash install-hermes.sh --uninstall        # rollback: stop, disable and remove the unit and files
 set -euo pipefail
@@ -17,19 +18,20 @@ CONF_DIR="$HOME/.config/agent-fabric-hermes"
 STATE_DIR="$HOME/.local/state/agent-fabric-hermes"
 UNIT_DIR="$HOME/.config/systemd/user"
 SOURCE_DIR=""; PROFILES=""; BIND=""; PORT="8767"; HERMES_HOME_DIR="$HOME/.hermes"
-AGENT_DIR=""; PY=""; TOKEN_SOURCE=""; TOKEN_SHA256=""; TIMEOUT_SECONDS="900"; SKIP_START=0; UNINSTALL=0
+AGENT_DIR=""; PY=""; TOKEN_SOURCE=""; TOKEN_SHA256=""; PROFILE_HASHES=(); TIMEOUT_SECONDS="900"; SKIP_START=0; UNINSTALL=0
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-usage() { sed -n '2,12p' "$0"; }
+usage() { sed -n '2,13p' "$0"; }
 
 while (($#)); do
   case "$1" in
-    --source-dir|--profiles|--bind|--port|--hermes-home|--hermes-agent-dir|--python|--token-file|--token-sha256|--timeout-seconds)
+    --source-dir|--profiles|--bind|--port|--hermes-home|--hermes-agent-dir|--python|--token-file|--token-sha256|--profile-token-sha256|--timeout-seconds)
       (($# >= 2)) || die "Missing value for $1"
       case "$1" in
         --source-dir) SOURCE_DIR="$2" ;; --profiles) PROFILES="$2" ;; --bind) BIND="$2" ;;
         --port) PORT="$2" ;; --hermes-home) HERMES_HOME_DIR="$2" ;; --hermes-agent-dir) AGENT_DIR="$2" ;;
-        --python) PY="$2" ;; --token-file) TOKEN_SOURCE="$2" ;; --token-sha256) TOKEN_SHA256="$2" ;; --timeout-seconds) TIMEOUT_SECONDS="$2" ;;
+        --python) PY="$2" ;; --token-file) TOKEN_SOURCE="$2" ;; --token-sha256) TOKEN_SHA256="$2" ;;
+        --profile-token-sha256) PROFILE_HASHES+=("$2") ;; --timeout-seconds) TIMEOUT_SECONDS="$2" ;;
       esac
       shift 2 ;;
     --no-start) SKIP_START=1; shift ;;
@@ -59,6 +61,9 @@ fi
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]{2,4}$ ]] && ((TIMEOUT_SECONDS >= 30 && TIMEOUT_SECONDS <= 3600)) || die "Invalid --timeout-seconds"
 [[ -z "$TOKEN_SHA256" || -z "$TOKEN_SOURCE" ]] || die "Use --token-sha256 or --token-file, not both"
 [[ -z "$TOKEN_SHA256" || "$TOKEN_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--token-sha256 must be 64 lowercase hex characters"
+if ((${#PROFILE_HASHES[@]})); then
+  [[ -z "$TOKEN_SHA256" && -z "$TOKEN_SOURCE" ]] || die "Use --profile-token-sha256 or a bridge-wide token, not both"
+fi
 [[ "$BIND" =~ ^[0-9.]+$ ]] || die "--bind must be an IPv4 address (127.0.0.1 or this host's Tailscale address)"
 if [[ "$BIND" != "127.0.0.1" ]]; then
   ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 | grep -qx "$BIND" || die "--bind $BIND is not an address of this host"
@@ -74,6 +79,22 @@ IFS=, read -r -a profile_list <<< "$PROFILES"
 for name in "${profile_list[@]}"; do
   [[ "$name" == default || -d "$HERMES_HOME_DIR/profiles/$name" ]] || die "Profile $name does not exist"
 done
+PROFILE_TOKENS=""
+if ((${#PROFILE_HASHES[@]})); then
+  declare -A seen_name=() seen_hash=()
+  for entry in "${PROFILE_HASHES[@]}"; do
+    [[ "$entry" =~ ^([a-z0-9][a-z0-9_-]{0,63})=([0-9a-f]{64})$ ]] || die "--profile-token-sha256 must be NAME=<64 lowercase hex>"
+    name="${BASH_REMATCH[1]}"; digest="${BASH_REMATCH[2]}"
+    [[ ",$PROFILES," == *",$name,"* ]] || die "--profile-token-sha256 names a profile that is not in --profiles"
+    [[ -z "${seen_name[$name]:-}" ]] || die "--profile-token-sha256 given twice for one profile"
+    [[ -z "${seen_hash[$digest]:-}" ]] || die "The same token hash is given for two profiles"
+    seen_name[$name]=1; seen_hash[$digest]=1
+    PROFILE_TOKENS+="$name $digest"$'\n'
+  done
+  for name in "${profile_list[@]}"; do
+    [[ -n "${seen_name[$name]:-}" ]] || die "Profile $name has no --profile-token-sha256 (every listed profile needs one)"
+  done
+fi
 
 # Preflight with Hermes' own read-only discovery (it never starts a gateway).
 HERMES_HOME="$HERMES_HOME_DIR" "$PY" -E -s - "$AGENT_DIR" "$HERMES_HOME_DIR" "$PROFILES" <<'PY' || die "Preflight failed"
@@ -97,7 +118,16 @@ install -d -m 0700 "$APP_DIR" "$CONF_DIR" "$STATE_DIR" "$UNIT_DIR"
 for file in hermes_bridge.py bridge.py request_ledger.py; do
   install -m 0600 "$SOURCE_DIR/$file" "$APP_DIR/$file"
 done
-if [[ -n "$TOKEN_SHA256" ]]; then
+if [[ -n "$PROFILE_TOKENS" ]]; then
+  # Per-profile scope replaces any bridge-wide credential, so no token reaches every profile.
+  printf '# <profile> <sha256 of that profile'"'"'s bearer token>; managed by install-hermes.sh\n%s' "$PROFILE_TOKENS" \
+    > "$CONF_DIR/profile-tokens.sha256"
+  chmod 0600 "$CONF_DIR/profile-tokens.sha256"
+  rm -f "$CONF_DIR/bridge.token.sha256"
+  if [[ -f "$CONF_DIR/bridge.token" ]]; then shred -u "$CONF_DIR/bridge.token"; fi
+  TOKEN_ENV="OPENBOT_BRIDGE_PROFILE_TOKENS_FILE=$CONF_DIR/profile-tokens.sha256"
+elif [[ -n "$TOKEN_SHA256" ]]; then
+  rm -f "$CONF_DIR/profile-tokens.sha256"
   printf '%s\n' "$TOKEN_SHA256" > "$CONF_DIR/bridge.token.sha256"
   chmod 0600 "$CONF_DIR/bridge.token.sha256"
   if [[ -f "$CONF_DIR/bridge.token" ]]; then shred -u "$CONF_DIR/bridge.token"; fi
@@ -110,7 +140,7 @@ else
     "$PY" -E -s -c 'import secrets; print(secrets.token_urlsafe(48))' > "$CONF_DIR/bridge.token"
   fi
   chmod 0600 "$CONF_DIR/bridge.token"
-  rm -f "$CONF_DIR/bridge.token.sha256"
+  rm -f "$CONF_DIR/bridge.token.sha256" "$CONF_DIR/profile-tokens.sha256"
   TOKEN_ENV="OPENBOT_BRIDGE_TOKEN_FILE=$CONF_DIR/bridge.token"
 fi
 
