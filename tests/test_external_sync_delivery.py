@@ -117,6 +117,13 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(self.received[0], self.received[1])
         self.assertEqual([e["content"] for e in self.stored.values()], ["a question", "an answer"])
         self.assertEqual({e["session_id"] for e in self.stored.values()}, {"first"})
+        historical = self.root / "first-start.db"
+        self.assertTrue(sync_hermes(file, historical, self.client, **binding,
+                                    backfill_on_first_start=True))
+        self.assertFalse(sync_hermes(file, historical, self.client, **binding,
+                                     backfill_on_first_start=True))
+        self.assertEqual([event["content"] for event in self.received[-1]["events"]],
+                         ["pre-opt-in", "a question", "an answer"])
 
     def test_historical_preview_then_apply_is_resumable_and_deduplicated(self):
         file = self.root / "history.jsonl"

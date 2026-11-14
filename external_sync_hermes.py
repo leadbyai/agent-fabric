@@ -65,7 +65,8 @@ def _event(row, install_id, profile_id, root_id):
     )
 
 
-def sync_hermes(source_path, ledger_path, client, *, bot_id, install_id, profile_id, root_id):
+def sync_hermes(source_path, ledger_path, client, *, bot_id, install_id, profile_id, root_id,
+                backfill_on_first_start=False):
     """Advance the native row position only after all corresponding IDs are acknowledged."""
     binding = (bot_id, install_id, profile_id, root_id)
     source_path = source_path.resolve(strict=True)
@@ -89,7 +90,7 @@ def sync_hermes(source_path, ledger_path, client, *, bot_id, install_id, profile
             )
             ledger.execute(
                 "INSERT OR IGNORE INTO hermes_cursor VALUES (?, ?, ?, ?, ?, ?)",
-                (*binding, source_identity, tip),
+                (*binding, source_identity, 0 if backfill_on_first_start else tip),
             )
             identity, offset = ledger.execute(
                 "SELECT identity, offset FROM hermes_cursor "
@@ -148,6 +149,7 @@ def main():
                 Path(config["hermesStateDb"]), args.ledger, client,
                 bot_id=config["botId"], install_id=config["installId"],
                 profile_id=config["profileId"], root_id=config["sessionId"],
+                backfill_on_first_start=config.get("backfillOnFirstStart") is True,
             )
             delay = 2
             if not progressed:
