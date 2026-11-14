@@ -87,15 +87,18 @@ owner's. With `HERMES_ISOLATED_PROFILE=1` the bridge:
 - refuses `HERMES_ALLOW_NATIVE_ATTACH`, `HERMES_BOUND_THREAD_ID`/`HERMES_BOUND_SESSION_ID` and
   `HERMES_BRIDGE_MEDIA_ROOT`, so every thread gets its own new `gui` session, a native binding is never resumed,
   and attachments are refused;
-- refuses to start unless the profile's **effective** Hermes config (defaults included) has:
+- refuses to start, and re-checks before **every run** (503 when it fails), unless the profile's **effective**
+  Hermes config (defaults included) reads cleanly (a fallback or last-known-good config is refused) and has:
   - no messaging platform enabled and no platform credential in `config.yaml`, the profile `.env` or the
     environment (checked by name only);
-  - `memory.memory_enabled: false` and `memory.user_profile_enabled: false`;
+  - `memory.memory_enabled: false`, `memory.user_profile_enabled: false` and no `memory.provider`;
   - `platform_toolsets` `cli`, `tui` and `gui` set to `[]` and every other platform empty;
-  - Hermes' client-surface toolsets (`project`, `desktop_ui`, `catalog`) in `agent.disabled_toolsets`. GUI
-    sessions get these even when every platform toolset is empty, and they include catalog installs, a
-    browser-driving preview and terminal reads behind `tool_search`/`tool_call`;
-  - no `mcp_servers`.
+  - Hermes' client-surface toolsets (`project`, `desktop_ui`, `catalog`) in `agent.disabled_toolsets`;
+  - no `mcp_servers`, no `plugins.enabled`, and `agent.coding_context` other than `focus`;
+- creates every session with an explicit `toolsets: []` and the per-thread `client` label, and never with
+  `follow_profile_config`. The **gateway** enforces the empty pick, and it also skips the GUI surface fold-in
+  that otherwise adds client-surface toolsets to GUI sessions. A gateway that does not advertise both
+  parameters is refused.
 
 Give the shared bridge its **own bearer**: the owner's pinned bridge only accepts the owner's.
 

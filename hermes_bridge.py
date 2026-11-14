@@ -51,7 +51,8 @@ DENY_CHOICES = ("deny", "reject", "no", "cancel", "abort")
 CLIENT_SURFACE_TOOLSETS = frozenset({"project", "desktop_ui", "catalog"})
 MESSAGING_ENV = re.compile(
     r"(DISCORD|TELEGRAM|SLACK|WHATSAPP|SIGNAL|MATRIX|MATTERMOST|EMAIL|IMAP|SMTP|SMS|TWILIO|IMESSAGE|"
-    r"BLUEBUBBLES|HOMEASSISTANT|HASS|WEBHOOK|DINGTALK|FEISHU|LARK|WECOM|WEIXIN|LINE|TEAMS|GOOGLE_CHAT|QQ)_[A-Z0-9_]+\Z")
+    r"BLUEBUBBLES|HOMEASSISTANT|HASS|WEBHOOK|DINGTALK|FEISHU|LARK|WECOM|WEIXIN|LINE|TEAMS|GOOGLE_CHAT|QQ|"
+    r"API_SERVER|MSGRAPH|YUANBAO|RELAY)_[A-Z0-9_]+\Z")
 CREDENTIAL_FIELD = re.compile(r"token|secret|password|api_key|webhook_url|signing", re.IGNORECASE)
 ISOLATED_TOOLSET_PLATFORMS = ("cli", "tui", "gui")
 
@@ -152,6 +153,13 @@ def isolated_profile_problems(config: dict, env_names: set[str], client_surfaces
         problems.append("agent.disabled_toolsets must include " + ", ".join(missing))
     if config.get("mcp_servers"):
         problems.append("mcp_servers must be empty")
+    plugins = config.get("plugins") if isinstance(config.get("plugins"), dict) else {}
+    if plugins.get("enabled"):
+        problems.append("plugins.enabled must be empty")
+    if memory.get("provider"):
+        problems.append("memory.provider must be empty")
+    if (config.get("agent") or {}).get("coding_context") == "focus":
+        problems.append("agent.coding_context must not be focus")
     return problems
 
 
@@ -284,15 +292,19 @@ class HermesConnector:
         """Check this process's own profile (HERMES_HOME) with Hermes' effective config, defaults included."""
         if Path(os.environ.get("HERMES_HOME", "")).resolve() != self.root.resolve():
             return ["HERMES_HOME must be the isolated profile's own home"]
-        if self.root.resolve() == (Path.home() / ".hermes").resolve():
-            return ["an isolated profile cannot be the default Hermes home"]
+        default_root = (Path.home() / ".hermes").resolve()
+        if self.root.resolve() == default_root or self.root.resolve().is_relative_to(default_root):
+            return ["an isolated profile cannot live in the default Hermes home"]
         from hermes_cli.config import load_config
         try:
             from toolsets import CLIENT_SURFACE_TOOLSETS as surfaces
         except ImportError:
             surfaces = frozenset()
         names = {key for key, value in os.environ.items() if value} | dotenv_names(self.root / ".env")
-        return isolated_profile_problems(load_config(), names, frozenset(surfaces) | CLIENT_SURFACE_TOOLSETS)
+        config = load_config()
+        if type(config).__name__ == "FailedConfigRead" or getattr(config, "error", None) is not None:
+            return ["config.yaml could not be read, and a fallback config is never trusted"]
+        return isolated_profile_problems(config, names, frozenset(surfaces) | CLIENT_SURFACE_TOOLSETS)
 
     def profile_home(self, name: str) -> Path:
         return self.root if name in ("default", self.dedicated_profile) else self.root / "profiles" / name
@@ -481,7 +493,7 @@ def session_title(profile_id: str, thread_id: str) -> str:
     return f"OpenBot {thread_id[:12]} {stable_id('title', profile_id, thread_id, length=10)}"
 
 
-async def create_params(client, profile_id: str, thread_id: str, *, follow_profile: bool) -> dict:
+async def create_params(client, profile_id: str, thread_id: str, *, follow_profile: bool, isolated: bool = False) -> dict:
     """Optional session.create parameters, each sent only when the gateway advertises it:
     ``follow_profile_config=True`` (the session re-reads the profile's current model/provider sections
     each turn, so a profile model change applies without restarting the gateway) and a ``client``
@@ -489,9 +501,18 @@ async def create_params(client, profile_id: str, thread_id: str, *, follow_profi
     try:
         described = await client.rpc("runtime.describe")
     except Exception:
+        if isolated:
+            raise RuntimeError("Hermes did not describe session.create, so an isolated session cannot be made safely")
         return {}
     parameters = (described.get("session_create") or {}).get("parameters") or []
     extra: dict = {}
+    if isolated:
+        # The gateway, not this bridge, enforces "no tools": an explicit empty pick also skips the GUI surface
+        # fold-in. A live profile re-read is never used, and the per-thread client label is required.
+        if "toolsets" not in parameters or "client" not in parameters:
+            raise RuntimeError("This Hermes gateway cannot enforce an isolated session (toolsets and client required)")
+        extra["toolsets"] = []
+        follow_profile = False
     if follow_profile and "follow_profile_config" in parameters:
         extra["follow_profile_config"] = True
     if "client" in parameters:
@@ -515,7 +536,7 @@ def foreign_session(snapshot: dict, sent: dict) -> str | None:
 
 async def open_session(client, ledger: HermesLedger, profile_id: str, thread_id: str,
                        *, allow_native: bool = False, follow_profile: bool = True,
-                       bound_session: str = "") -> tuple[str, bool]:
+                       bound_session: str = "", isolated: bool = False) -> tuple[str, bool]:
     """The Hermes session this OpenBot thread owns: resume ours, or create a new one.
 
     A thread an operator explicitly bound to an existing native session (origin 'bound',
@@ -541,7 +562,7 @@ async def open_session(client, ledger: HermesLedger, profile_id: str, thread_id:
         except Exception as exc:  # A pruned/deleted session: start a new one for this thread.
             if "not_found" not in str(exc) or mapping[1] == "bound":
                 raise
-    extra = await create_params(client, profile_id, thread_id, follow_profile=follow_profile)
+    extra = await create_params(client, profile_id, thread_id, follow_profile=follow_profile, isolated=isolated)
     snapshot = await client.rpc("session.create", request_id=stable_id("create", profile_id, thread_id),
                                 source=SESSION_SOURCE, title=session_title(profile_id, thread_id), **extra)
     session_id = snapshot.get("stored_session_id") or snapshot.get("session_id")
@@ -610,6 +631,12 @@ class HermesHandler(bridge.Handler):
             self.json_response(404, {"error": "Unknown or not allowed Hermes profile"})
             return
         name = match.group(1)
+        if self.config.get("isolated") and (problems := self.connector.isolated_profile_problems()):
+            # Re-checked on every run: a profile changed after startup is refused, not served.
+            print("isolated profile check failed: " + "; ".join(problems), file=sys.stderr, flush=True)
+            self.json_response(503, {"error": "This isolated profile failed its isolation check",
+                                     "code": "isolation_check_failed"})
+            return
         try:
             body = json.loads(self.read_request_body())
             text, attachments = bridge.parse_user_message(body)
@@ -672,7 +699,8 @@ class HermesHandler(bridge.Handler):
                 session_id, created = await open_session(client, self.ledger, endpoint.profile_id, thread_id,
                                                          allow_native=self.config.get("allow_native", False),
                                                          follow_profile=self.config.get("follow_profile", True),
-                                                         bound_session=self.config.get("bound_session", ""))
+                                                         bound_session=self.config.get("bound_session", ""),
+                                                         isolated=self.config.get("isolated", False))
                 emit({"type": "CUSTOM", "name": "agent-fabric.progress",
                       "value": {"state": "submitted", "session": "created" if created else "resumed"}})
                 with ExitStack() as cleanup:
