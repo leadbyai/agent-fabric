@@ -8,7 +8,7 @@ to Herdr or modifies a transcript.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import json
 import ipaddress
@@ -45,6 +45,7 @@ class Binding:
     claude_config_dir: Path
     cwd: Path
     native_session_id: str | None = None
+    terminal_sender: str = "Derek (terminal)"
 
 
 @dataclass(frozen=True)
@@ -195,7 +196,12 @@ def sync_source(ledger, client, binding, source, *, validate=None) -> bool:
     if validate is not None and validate() != source:
         raise SourceUnavailable("Claude session changed while reading")
     if batch.events:
-        client.deliver(binding.bot_id, batch.events)
+        events = tuple(
+            replace(event, sender=binding.terminal_sender)
+            if event.kind == "human" else event
+            for event in batch.events
+        )
+        client.deliver(binding.bot_id, events)
     ledger.acknowledge(batch)
     return True
 
@@ -214,6 +220,7 @@ def main():
         cfg["botId"], cfg["herdrSession"], cfg["paneId"],
         Path(cfg["claudeConfigDir"]).resolve(), Path(cfg["cwd"]).resolve(),
         cfg.get("nativeSessionId"),
+        cfg.get("terminalSender", "Derek (terminal)"),
     )
     if (not re.fullmatch(r"[\w.-]{1,128}", binding.bot_id, flags=re.ASCII)
             or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", binding.herdr_session)
@@ -222,6 +229,10 @@ def main():
                 (not isinstance(binding.native_session_id, str)
                  or not SESSION_ID.fullmatch(binding.native_session_id)))):
         parser.error("invalid Bot or Herdr binding")
+    if (not isinstance(binding.terminal_sender, str)
+            or not binding.terminal_sender.strip()
+            or len(binding.terminal_sender) > 80):
+        parser.error("terminal sender must be a name of 1 to 80 characters")
     client = ImportClient(cfg["openbotOrigin"], os.environ["AGENT_FABRIC_IMPORT_SECRET"])
     ledger = CursorLedger(args.ledger)
 
