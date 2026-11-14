@@ -7,7 +7,7 @@ and acknowledge successfully imported events before advancing its cursor.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import re
 from typing import Any, Iterable, Iterator
@@ -75,6 +75,7 @@ class TranscriptState:
     """
 
     suppress_openbot_turn: bool = False
+    parent_guard: dict[str, bool] = field(default_factory=dict)
 
 
 def redact_content(text: str, *, max_bytes: int = MAX_MESSAGE_BYTES) -> str:
@@ -123,6 +124,9 @@ def classify_claude_records(
     if not session_id:
         raise ValueError("session_id is required")
 
+    # Parent links identify interleaved replies within a read. The cursor also
+    # carries the sequential guard for Claude records with no local parent.
+    openbot_ancestors = state.parent_guard
     for record in records:
         if not isinstance(record, dict) or record.get("isSidechain"):
             continue
@@ -135,15 +139,32 @@ def classify_claude_records(
         if native_id is not None and native_id != session_id:
             continue
 
+        parent = record.get("parentUuid")
+        suppressed = state.suppress_openbot_turn
+        if isinstance(parent, str):
+            suppressed = openbot_ancestors.get(parent, suppressed)
+        openbot_ancestors[uuid] = suppressed
+        if len(openbot_ancestors) > 512:
+            del openbot_ancestors[next(iter(openbot_ancestors))]
+
         if kind == "user":
             content = _user_text(record)
             if content is None:
                 continue  # tool_result and attachments are never mirrored
 
-            # The provenance is important. Metadata, peer and scheduler inputs
-            # are deferred to the separate agent-activity workstream.
             origin = record.get("origin")
             source = record.get("promptSource")
+            if isinstance(origin, dict) and origin.get("kind") == "peer":
+                yield ImportEvent(
+                    id=_message_id(session_id, uuid, "peer"),
+                    source_uuid=uuid,
+                    session_id=session_id,
+                    kind="peer",
+                    sender="Peer agent",
+                    timestamp=timestamp,
+                    content=redact_content(content).strip() or "Received agent message",
+                )
+                continue
             if not isinstance(origin, dict) or origin.get("kind") != "human":
                 continue
             if record.get("isMeta") or source not in ("typed", "queued"):
@@ -151,9 +172,11 @@ def classify_claude_records(
 
             if _OPENBOT_MARKER.search(content) or "[OpenBot pilot request " in content:
                 state.suppress_openbot_turn = True
+                openbot_ancestors[uuid] = True
                 continue
 
             state.suppress_openbot_turn = False
+            openbot_ancestors[uuid] = False
             cleaned = redact_content(content).strip()
             if cleaned:
                 yield ImportEvent(
@@ -166,7 +189,7 @@ def classify_claude_records(
                     content=cleaned,
                 )
 
-        elif kind == "assistant" and not state.suppress_openbot_turn:
+        elif kind == "assistant" and not suppressed:
             message = record.get("message")
             if not isinstance(message, dict):
                 continue
@@ -183,7 +206,11 @@ def classify_claude_records(
                 elif block_kind == "tool_use" and include_tool_summaries:
                     tool_name = block.get("name")
                     content = _SAFE_TOOL_LABELS.get(tool_name, "Used tool")
-                    event_kind = "tool_summary"
+                    if tool_name == "SendMessage":
+                        content = "Sent a message to another agent"
+                        event_kind = "peer"
+                    else:
+                        event_kind = "tool_summary"
                 else:
                     continue  # thinking, raw tool input, other sensitive blocks
                 if content:

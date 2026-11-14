@@ -38,6 +38,7 @@ class Cursor:
     inode: int
     offset: int
     suppress_openbot_turn: bool
+    parent_guard: str = "{}"
 
 
 @dataclass(frozen=True)
@@ -46,15 +47,22 @@ class CandidateBatch:
     next_offset: int
     next_suppress_openbot_turn: bool
     events: tuple[ImportEvent, ...]
+    next_parent_guard: str = "{}"
 
 
 def _open_source(path: Path):
     flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow and path.is_symlink():
+        raise OSError("transcript source may not be a symlink")
+    flags |= no_follow
     descriptor = os.open(path, flags)
     try:
         info = os.fstat(descriptor)
+        if not no_follow:
+            current = path.lstat()
+            if stat.S_ISLNK(current.st_mode) or not os.path.samestat(info, current):
+                raise OSError("transcript source changed while opening")
         if not stat.S_ISREG(info.st_mode):
             raise ValueError("transcript source is not a regular file")
         return os.fdopen(descriptor, "rb"), info
@@ -63,19 +71,27 @@ def _open_source(path: Path):
         raise
 
 
+def _sqlite_file_id(value: int) -> int | str:
+    # Windows file IDs can exceed SQLite's signed 64-bit integer range.
+    # Keep existing integer rows readable and prevent numeric affinity from
+    # coercing larger IDs to floating point.
+    return value if -(1 << 63) <= value < (1 << 63) else f"id:{value}"
+
+
+def _read_file_id(value: int | str) -> int:
+    return int(value.removeprefix("id:")) if isinstance(value, str) else value
+
+
 def _last_complete_record_boundary(source, size: int) -> int:
     """Do not start in the middle of an unfinished JSONL record."""
-    if size == 0:
-        return 0
-    source.seek(size - 1)
-    if source.read(1) == b"\n":
-        return size
-    pos = size - 1
-    while pos > 0:
-        pos -= 1
-        source.seek(pos)
-        if source.read(1) == b"\n":
-            return pos + 1
+    end = size
+    while end:
+        start = max(0, end - 8192)
+        source.seek(start)
+        last = source.read(end - start).rfind(b"\n")
+        if last >= 0:
+            return start + last + 1
+        end = start
     return 0
 
 
@@ -85,8 +101,13 @@ class CursorLedger:
         self.db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if self.db_path.is_symlink():
             raise ValueError("cursor ledger may not be a symlink")
-        if not self.db_path.exists():
-            descriptor = os.open(self.db_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            descriptor = os.open(
+                self.db_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+            )
+        except FileExistsError:
+            pass
+        else:
             os.close(descriptor)
         with self._connect() as db:
             db.execute(
@@ -97,9 +118,16 @@ class CursorLedger:
                     inode INTEGER NOT NULL,
                     offset INTEGER NOT NULL,
                     suppress_openbot_turn INTEGER NOT NULL DEFAULT 0,
+                    parent_guard TEXT NOT NULL DEFAULT '{}',
                     PRIMARY KEY (bot_id, session_id)
                 )"""
             )
+            db.execute("BEGIN IMMEDIATE")
+            columns = {column[1] for column in db.execute("PRAGMA table_info(transcript_cursor)")}
+            if "parent_guard" not in columns:
+                db.execute(
+                    "ALTER TABLE transcript_cursor ADD COLUMN parent_guard TEXT NOT NULL DEFAULT '{}'"
+                )
 
     @contextmanager
     def _connect(self):
@@ -127,14 +155,18 @@ class CursorLedger:
             db.execute(
                 "INSERT OR IGNORE INTO transcript_cursor "
                 "(bot_id, session_id, device, inode, offset) VALUES (?, ?, ?, ?, ?)",
-                (bot_id, session_id, info.st_dev, info.st_ino, initial_offset),
+                (bot_id, session_id, _sqlite_file_id(info.st_dev),
+                 _sqlite_file_id(info.st_ino), initial_offset),
             )
             row = db.execute(
-                "SELECT device, inode, offset, suppress_openbot_turn "
+                "SELECT device, inode, offset, suppress_openbot_turn, parent_guard "
                 "FROM transcript_cursor WHERE bot_id=? AND session_id=?",
                 (bot_id, session_id),
             ).fetchone()
-        cursor = Cursor(bot_id, session_id, row[0], row[1], row[2], bool(row[3]))
+        cursor = Cursor(
+            bot_id, session_id, _read_file_id(row[0]), _read_file_id(row[1]),
+            row[2], bool(row[3]), row[4],
+        )
         if (cursor.device, cursor.inode) != (info.st_dev, info.st_ino):
             raise SourceChanged("transcript file identity changed")
         if info.st_size < cursor.offset:
@@ -171,11 +203,14 @@ class CursorLedger:
                 records.append(record)
                 next_offset = source.tell()
 
-        guard = TranscriptState(cursor.suppress_openbot_turn)
+        guard = TranscriptState(cursor.suppress_openbot_turn, json.loads(cursor.parent_guard))
         events = tuple(
             classify_claude_records(records, session_id=cursor.session_id, state=guard)
         )
-        return CandidateBatch(cursor, next_offset, guard.suppress_openbot_turn, events)
+        return CandidateBatch(
+            cursor, next_offset, guard.suppress_openbot_turn, events,
+            json.dumps(guard.parent_guard, separators=(",", ":")),
+        )
 
     def acknowledge(self, batch: CandidateBatch) -> Cursor:
         """Commit position only when the downstream import fully succeeded."""
@@ -184,23 +219,25 @@ class CursorLedger:
             raise ValueError("cursor cannot move backwards")
         with self._connect() as db:
             updated = db.execute(
-                "UPDATE transcript_cursor SET offset=?, suppress_openbot_turn=? "
+                "UPDATE transcript_cursor SET offset=?, suppress_openbot_turn=?, parent_guard=? "
                 "WHERE bot_id=? AND session_id=? AND device=? AND inode=? "
-                "AND offset=? AND suppress_openbot_turn=?",
+                "AND offset=? AND suppress_openbot_turn=? AND parent_guard=?",
                 (
                     batch.next_offset,
                     int(batch.next_suppress_openbot_turn),
+                    batch.next_parent_guard,
                     old.bot_id,
                     old.session_id,
-                    old.device,
-                    old.inode,
+                    _sqlite_file_id(old.device),
+                    _sqlite_file_id(old.inode),
                     old.offset,
                     int(old.suppress_openbot_turn),
+                    old.parent_guard,
                 ),
             ).rowcount
             if updated != 1:
                 raise CursorConflict("cursor was advanced by another worker")
         return Cursor(
             old.bot_id, old.session_id, old.device, old.inode,
-            batch.next_offset, batch.next_suppress_openbot_turn,
+            batch.next_offset, batch.next_suppress_openbot_turn, batch.next_parent_guard,
         )

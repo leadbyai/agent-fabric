@@ -102,6 +102,21 @@ class CursorTests(unittest.TestCase):
         batch = self.ledger.read_batch(cursor, path=self.source)
         self.assertEqual([e.content for e in batch.events], ["Wait until complete"])
 
+    def test_interleaved_openbot_reply_cannot_echo_after_restart(self):
+        cursor = self.start()
+        self.append(
+            prompt("openbot", "OPENBOT_BEGIN_AABBCCDDEEFF0011"),
+            prompt("native", "A separate prompt"),
+        )
+        self.ledger.acknowledge(self.ledger.read_batch(cursor, path=self.source))
+        self.ledger = CursorLedger(self.root / "ledger.sqlite3")
+        self.append(
+            {**answer("echo", "Already present"), "parentUuid": "openbot"},
+            {**answer("reply", "New reply"), "parentUuid": "native"},
+        )
+        batch = self.ledger.read_batch(self.start(), path=self.source)
+        self.assertEqual([event.content for event in batch.events], ["New reply"])
+
     def test_invalid_json_fails_without_advancing(self):
         cursor = self.start()
         with self.source.open("ab") as stream:

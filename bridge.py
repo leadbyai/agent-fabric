@@ -249,8 +249,13 @@ def parse_user_message(body: dict) -> tuple[str, list[tuple[str, str, bytes]]]:
     """
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
         raise ValueError("AG-UI messages must be an array")
-    user = next((msg for msg in reversed(body["messages"])
-                 if isinstance(msg, dict) and msg.get("role") == "user"), None)
+    user = next(
+        (msg for msg in reversed(body["messages"])
+         if isinstance(msg, dict)
+         and msg.get("role") == "user"
+         and not str(msg.get("id", "")).startswith("afx-")),
+        None,
+    )
     if user is None:
         raise ValueError("No user message was provided")
     content = user.get("content", "")

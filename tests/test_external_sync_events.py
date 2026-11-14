@@ -81,14 +81,18 @@ class ClassifierTests(unittest.TestCase):
         ])
         self.assertEqual([e.content for e in events], ["Ran shell command", "Completed"])
 
-    def test_peer_metadata_scheduler_and_sidechain_are_excluded(self):
+    def test_peer_messages_are_included_without_raw_tool_arguments(self):
         events = self.events([
             user("u1", "other peer", origin="peer", isMeta=True),
             user("u2", "scheduled task", origin="task-notification"),
             user("u3", "child task", isSidechain=True),
             user("u4", "not typed", source="system"),
+            assistant("a1", [{"type": "tool_use", "name": "SendMessage",
+                              "input": {"message": "private outbound body"}}]),
         ])
-        self.assertEqual(events, [])
+        self.assertEqual([e.content for e in events],
+                         ["other peer", "Sent a message to another agent"])
+        self.assertEqual([e.kind for e in events], ["peer", "peer"])
 
     def test_other_session_and_unidentified_records_fail_closed(self):
         events = self.events([
