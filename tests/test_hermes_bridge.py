@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -515,3 +516,109 @@ class HermesBridgeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IsolatedProfileTests(unittest.TestCase):
+    """HERMES_ISOLATED_PROFILE=1: a shared profile with no messaging, memory, tools or native attach."""
+
+    SAFE = {
+        "platforms": {}, "gateway": {"standalone": True, "platforms": {}},
+        "memory": {"memory_enabled": False, "user_profile_enabled": False},
+        "platform_toolsets": {"cli": [], "tui": [], "gui": []},
+        "agent": {"disabled_toolsets": ["project", "desktop_ui", "catalog"]},
+        "mcp_servers": {},
+    }
+
+    def problems(self, env=(), **override):
+        config = json.loads(json.dumps(self.SAFE))
+        config.update(override)
+        return hermes_bridge.isolated_profile_problems(config, set(env), hermes_bridge.CLIENT_SURFACE_TOOLSETS)
+
+    def test_safe_profile_passes(self):
+        self.assertEqual(self.problems(), [])
+
+    def test_enabled_messaging_platforms_are_refused(self):
+        self.assertEqual(self.problems(platforms={"discord": {"enabled": True}}), ["platforms.discord is enabled"])
+        self.assertEqual(self.problems(gateway={"platforms": {"telegram": {"enabled": True}}}),
+                         ["gateway.platforms.telegram is enabled"])
+
+    def test_platform_credential_on_disk_is_refused_even_when_disabled(self):
+        self.assertEqual(self.problems(platforms={"discord": {"enabled": False, "token": "x"}}),
+                         ["platforms.discord holds a credential"])
+        self.assertEqual(self.problems(platforms={"webhook": {"enabled": False, "extra": {"port": 1}}}), [])
+
+    def test_messaging_credentials_in_the_environment_are_refused_by_name(self):
+        self.assertEqual(self.problems(env={"DISCORD_BOT_TOKEN", "PATH", "HOME"}),
+                         ["messaging credential DISCORD_BOT_TOKEN is set"])
+
+    def test_memory_must_be_explicitly_off(self):
+        self.assertEqual(self.problems(memory={}),
+                         ["memory.memory_enabled must be false", "memory.user_profile_enabled must be false"])
+        self.assertEqual(self.problems(memory={"memory_enabled": False, "user_profile_enabled": True}),
+                         ["memory.user_profile_enabled must be false"])
+
+    def test_session_platform_toolsets_must_be_explicitly_empty(self):
+        self.assertEqual(self.problems(platform_toolsets={"cli": ["all"], "tui": []}),
+                         ["platform_toolsets.cli must be set to []", "platform_toolsets.gui must be set to []"])
+        self.assertEqual(self.problems(platform_toolsets={"cli": [], "tui": [], "gui": [], "cron": ["all"]}),
+                         ["platform_toolsets.cron must be empty"])
+
+    def test_client_surface_toolsets_must_be_disabled(self):
+        self.assertEqual(self.problems(agent={"disabled_toolsets": ["project"]}),
+                         ["agent.disabled_toolsets must include catalog, desktop_ui"])
+
+    def test_mcp_servers_are_refused(self):
+        self.assertEqual(self.problems(mcp_servers={"files": {"command": "x"}}), ["mcp_servers must be empty"])
+
+    def test_dotenv_names_ignores_comments_and_blank_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Path(tmp) / ".env"
+            env.write_text("A=1\n# B=2\nC=\nexport D='x'\nE=\"\"\n\nnoequals\n", encoding="utf-8")
+            self.assertEqual(hermes_bridge.dotenv_names(env), {"A", "D"})
+            self.assertEqual(hermes_bridge.dotenv_names(Path(tmp) / "missing"), set())
+
+    def test_connector_checks_only_its_own_home(self):
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.dict("os.environ", {"HERMES_HOME": "/elsewhere"}):
+            connector = hermes_bridge.HermesConnector(tmp, "", dedicated_profile="shared")
+            self.assertEqual(connector.isolated_profile_problems(), ["HERMES_HOME must be the isolated profile's own home"])
+            self.assertEqual(connector.profile_home("shared"), Path(tmp))
+
+    def start(self, **env):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            base = {"PATH": "/usr/bin:/bin", "OPENBOT_BRIDGE_TOKEN": TOKEN, "HERMES_PROFILES": "shared",
+                    "HERMES_ISOLATED_PROFILE": "1", "HERMES_HOME": tmp,
+                    "OPENBOT_BRIDGE_LEDGER_PATH": str(Path(tmp) / "ledger.sqlite3")}
+            base.update(env)
+            code = f"import sys; sys.path.insert(0, {str(PACKAGE_ROOT)!r}); import hermes_bridge; hermes_bridge.main()"
+            done = subprocess.run([sys.executable, "-I", "-c", code],
+                                  cwd=PACKAGE_ROOT, env={k: v for k, v in base.items() if v is not None},
+                                  capture_output=True, text=True, timeout=30)
+            return done.returncode, done.stderr
+
+    def test_isolated_profile_never_attaches_pins_or_carries_media(self):
+        for extra in ({"HERMES_ALLOW_NATIVE_ATTACH": "1"}, {"HERMES_BOUND_THREAD_ID": "t", "HERMES_BOUND_SESSION_ID": "s"},
+                      {"HERMES_BRIDGE_MEDIA_ROOT": "/tmp"}):
+            code, err = self.start(**extra)
+            self.assertNotEqual(code, 0)
+            self.assertIn("never attaches to native sessions", err)
+
+    def test_isolated_profile_serves_exactly_one_explicit_home(self):
+        for extra in ({"HERMES_PROFILES": "shared,other"}, {"HERMES_HOME": None}):
+            code, err = self.start(**extra)
+            self.assertNotEqual(code, 0)
+            self.assertIn("exactly one profile", err)
+
+
+class IsolatedHandlerTests(HermesBridgeTests):
+    """The isolated bridge never resumes a native binding, even one written into its ledger."""
+
+    def setUp(self):
+        super().setUp()
+        self.server.RequestHandlerClass.config = {**self.server.RequestHandlerClass.config, "isolated": True}
+
+    def test_bound_native_session_is_never_resumed(self):
+        self.ledger.map_thread(PROFILE_ID, "bound-thread", "NATIVE", origin="bound")
+        data = self.run_turn(thread="bound-thread")[1]
+        self.assertIn("RUN_ERROR", data)
+        self.assertNotIn("NATIVE", [p.get("session_id") for m, p in self.gateway.calls if m == "prompt.submit"])

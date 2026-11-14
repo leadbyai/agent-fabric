@@ -39,13 +39,21 @@ from urllib.parse import urlsplit
 import bridge
 from request_ledger import RequestLedger
 
-VERSION = "0.8.0-hermes.5"
+VERSION = "0.8.0-hermes.6"
 PROFILE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 ROUTE_RE = re.compile(r"/profiles/([a-z0-9][a-z0-9_-]{0,63})/ag-ui\Z")
 SESSION_SOURCE = "gui"
 CLIENT_NAME = "agent-fabric"
 HEARTBEAT_SECONDS = 15.0
 DENY_CHOICES = ("deny", "reject", "no", "cancel", "abort")
+# Toolsets a GUI-source session gets from its client surface even when every platform toolset is empty.
+# Read from Hermes when it names them; this is the fallback and is always required as well.
+CLIENT_SURFACE_TOOLSETS = frozenset({"project", "desktop_ui", "catalog"})
+MESSAGING_ENV = re.compile(
+    r"(DISCORD|TELEGRAM|SLACK|WHATSAPP|SIGNAL|MATRIX|MATTERMOST|EMAIL|IMAP|SMTP|SMS|TWILIO|IMESSAGE|"
+    r"BLUEBUBBLES|HOMEASSISTANT|HASS|WEBHOOK|DINGTALK|FEISHU|LARK|WECOM|WEIXIN|LINE|TEAMS|GOOGLE_CHAT|QQ)_[A-Z0-9_]+\Z")
+CREDENTIAL_FIELD = re.compile(r"token|secret|password|api_key|webhook_url|signing", re.IGNORECASE)
+ISOLATED_TOOLSET_PLATFORMS = ("cli", "tui", "gui")
 
 
 def env_config() -> dict:
@@ -78,6 +86,7 @@ def env_config() -> dict:
         "bound_session": os.environ.get("HERMES_BOUND_SESSION_ID", "").strip(),
         "media_root": os.environ.get("HERMES_BRIDGE_MEDIA_ROOT", "").strip(),
         "follow_profile": os.environ.get("HERMES_FOLLOW_PROFILE_CONFIG", "1").strip() != "0",
+        "isolated": os.environ.get("HERMES_ISOLATED_PROFILE", "0").strip() == "1",
     }
 
 
@@ -86,6 +95,64 @@ def check_bind_host(host: str) -> None:
     address = ipaddress.ip_address(host)
     if not (address.is_loopback or address in ipaddress.ip_network("100.64.0.0/10")):
         raise ValueError("Bind to 127.0.0.1 or this host's Tailscale 100.64.0.0/10 address only")
+
+
+def _leaves(value, prefix=""):
+    """(dotted key, value) for every scalar under a nested dict."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            yield from _leaves(child, f"{prefix}{key}.")
+    else:
+        yield prefix.rstrip("."), value
+
+
+def dotenv_names(path: Path) -> set[str]:
+    """Names set to a non-empty value in a KEY=VALUE file (comments and blank values ignored)."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return set()
+    names = set()
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.removeprefix("export ").split("=", 1)
+        if value.strip().strip("'\"").strip():
+            names.add(key.strip())
+    return names
+
+
+def isolated_profile_problems(config: dict, env_names: set[str], client_surfaces: frozenset[str]) -> list[str]:
+    """Why an EFFECTIVE Hermes profile config is not safe to serve as an isolated shared profile ([] when it
+    is): no messaging platform or platform credential, memory and the user profile off, no toolset on the
+    session platforms (client-surface toolsets disabled too), and no MCP servers. This is capability
+    isolation only; keeping the owner's files and credentials out of reach (a separate OS user or a
+    container with nothing of the owner's mounted) is the deployer's job and is not checked here."""
+    problems = []
+    for where, section in (("platforms", config.get("platforms")),
+                           ("gateway.platforms", (config.get("gateway") or {}).get("platforms"))):
+        for name, entry in (section if isinstance(section, dict) else {}).items():
+            entry = entry if isinstance(entry, dict) else {}
+            if entry.get("enabled"):
+                problems.append(f"{where}.{name} is enabled")
+            if any(value and CREDENTIAL_FIELD.search(key) for key, value in _leaves(entry)):
+                problems.append(f"{where}.{name} holds a credential")
+    problems += [f"messaging credential {name} is set" for name in sorted(env_names) if MESSAGING_ENV.fullmatch(name)]
+    memory = config.get("memory") if isinstance(config.get("memory"), dict) else {}
+    problems += [f"memory.{key} must be false" for key in ("memory_enabled", "user_profile_enabled")
+                 if memory.get(key) is not False]
+    toolsets = config.get("platform_toolsets") if isinstance(config.get("platform_toolsets"), dict) else {}
+    problems += [f"platform_toolsets.{name} must be set to []" for name in ISOLATED_TOOLSET_PLATFORMS
+                 if toolsets.get(name) != []]
+    problems += [f"platform_toolsets.{name} must be empty" for name, value in sorted(toolsets.items())
+                 if name not in ISOLATED_TOOLSET_PLATFORMS and value not in ([], None)]
+    disabled = set(((config.get("agent") or {}).get("disabled_toolsets")) or [])
+    if missing := sorted(set(client_surfaces) - disabled):
+        problems.append("agent.disabled_toolsets must include " + ", ".join(missing))
+    if config.get("mcp_servers"):
+        problems.append("mcp_servers must be empty")
+    return problems
 
 
 class HermesLedger(RequestLedger):
@@ -212,6 +279,20 @@ class HermesConnector:
         self.dedicated_profile = dedicated_profile
         if agent_dir and agent_dir not in sys.path:
             sys.path.insert(0, agent_dir)
+
+    def isolated_profile_problems(self) -> list[str]:
+        """Check this process's own profile (HERMES_HOME) with Hermes' effective config, defaults included."""
+        if Path(os.environ.get("HERMES_HOME", "")).resolve() != self.root.resolve():
+            return ["HERMES_HOME must be the isolated profile's own home"]
+        if self.root.resolve() == (Path.home() / ".hermes").resolve():
+            return ["an isolated profile cannot be the default Hermes home"]
+        from hermes_cli.config import load_config
+        try:
+            from toolsets import CLIENT_SURFACE_TOOLSETS as surfaces
+        except ImportError:
+            surfaces = frozenset()
+        names = {key for key, value in os.environ.items() if value} | dotenv_names(self.root / ".env")
+        return isolated_profile_problems(load_config(), names, frozenset(surfaces) | CLIENT_SURFACE_TOOLSETS)
 
     def profile_home(self, name: str) -> Path:
         return self.root if name in ("default", self.dedicated_profile) else self.root / "profiles" / name
@@ -643,6 +724,11 @@ def main() -> None:
         sys.exit(str(exc))
     if not config["profiles"] or any(not PROFILE_RE.fullmatch(p) for p in config["profiles"]):
         sys.exit("Set HERMES_PROFILES to the comma-separated profiles to expose")
+    if config["isolated"]:
+        if config["allow_native"] or config["bound_thread"] or config["bound_session"] or config["media_root"]:
+            sys.exit("An isolated profile never attaches to native sessions, pins a thread, or carries media")
+        if len(config["profiles"]) != 1 or not os.environ.get("HERMES_HOME", "").strip():
+            sys.exit("An isolated profile bridge serves exactly one profile: its own explicit HERMES_HOME")
     if config["bound_thread"] or config["bound_session"]:
         if (not config["bound_thread"] or not config["bound_session"] or not config["allow_native"]
                 or len(config["profiles"]) != 1):
@@ -664,12 +750,15 @@ def main() -> None:
     HermesHandler.ledger.trim_finished()
     HermesHandler.connector = HermesConnector(
         config["hermes_home"], config["agent_dir"],
-        dedicated_profile=config["profiles"][0] if config["bound_thread"] else None,
+        dedicated_profile=config["profiles"][0] if config["bound_thread"] or config["isolated"] else None,
     )
+    if config["isolated"] and (problems := HermesHandler.connector.isolated_profile_problems()):
+        sys.exit("Refusing an isolated profile that is not isolated: " + "; ".join(problems))
     server = ThreadingHTTPServer((config["host"], config["port"]), HermesHandler)
     print(f"Agent Fabric Hermes bridge {VERSION} ready on {config['host']}:{config['port']} "
           f"| profiles={len(config['profiles'])} "
-          f"| auth={'per-profile' if config['profile_hashes'] else 'bridge-wide'}", flush=True)
+          f"| auth={'per-profile' if config['profile_hashes'] else 'bridge-wide'}"
+          f"{' | isolated' if config['isolated'] else ''}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
