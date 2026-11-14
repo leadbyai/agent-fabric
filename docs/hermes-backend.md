@@ -50,6 +50,10 @@ Set `HERMES_FOLLOW_PROFILE_CONFIG=0` to opt out.
 - **Existing-session binding** (off by default): an operator can bind a thread to an existing native
   session id (`origin = bound`). It is resumed only with `HERMES_ALLOW_NATIVE_ATTACH=1`. The Hermes REST
   sessions API is never used to claim sessions.
+- **Only sessions it created:** Hermes resolves a session title as an identity, so titles carry a hash of
+  profile and thread. When the gateway supports it, `session.create` also sends a per-thread `client`
+  label, and the result must echo it in `info.launch_request`; a result whose `info.source` is not `gui`,
+  whose label differs, or whose session another thread already owns is refused before any prompt.
 - **Idempotency:** `prompt.submit` carries `input_id = H(profile, thread, run)`, and the ledger replays a
   finished run or refuses an in-doubt one. A run is never resent.
 - **Approvals:** surfaced as a CUSTOM `agent-fabric.approval` event plus a text notice, then answered

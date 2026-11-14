@@ -40,16 +40,19 @@ class FakeClient:
             return {"session_create": {"parameters": self.gateway.describe_params}}
         if method == "session.create":
             title = params.get("title")
+            launch = {"source": params.get("source"),
+                      "launch_request": {k: v for k, v in params.items() if k != "request_id"}}
             if title in self.gateway.titles:  # Hermes resolves a title as an identity
                 sid = self.gateway.titles[title]
-                return {"stored_session_id": sid, "session_id": "live-" + sid}
+                return {"stored_session_id": sid, "session_id": "live-" + sid, "info": self.gateway.info[sid]}
             if self.gateway.force_session:
-                return {"stored_session_id": self.gateway.force_session, "session_id": "live-x"}
+                return {"stored_session_id": self.gateway.force_session, "session_id": "live-x", "info": launch}
             self.gateway.created += 1
             sid = f"S{self.gateway.created}"
             self.gateway.sessions[sid] = []
             self.gateway.titles[title] = sid
-            return {"stored_session_id": sid, "session_id": "live-" + sid}
+            self.gateway.info[sid] = launch
+            return {"stored_session_id": sid, "session_id": "live-" + sid, "info": launch}
         if method == "session.resume":
             sid = params["session_id"]
             if sid not in self.gateway.sessions:
@@ -74,8 +77,8 @@ class FakeGateway:
     def __init__(self, state="ready"):
         self.state = state
         self.calls, self.sessions, self.inputs, self.created = [], {}, set(), 0
-        self.describe_params = ["model", "follow_profile_config", "request_id"]
-        self.titles, self.force_session = {}, None
+        self.describe_params = ["model", "follow_profile_config", "request_id", "client"]
+        self.titles, self.force_session, self.info = {}, None, {}
         self.script = lambda sid, adm: [("message.delta", {"text": "Hello "}),
                                         ("message.complete", {"text": "Hello there", "status": "complete"})]
 
@@ -211,11 +214,11 @@ class HermesBridgeTests(unittest.TestCase):
                     ("message.complete", {"text": "fine", "status": "complete"})]
         original = FakeClient.rpc
 
-        async def rpc(client, method, **params):
-            result = await original(client, method, **params)
+        async def rpc(fake, method, **params):  # not "client": that is also a session.create parameter
+            result = await original(fake, method, **params)
             if method == "prompt.submit":
                 # A foreign session's event arrives first on the same connection.
-                await client.events.put({"method": "event", "params": {
+                await fake.events.put({"method": "event", "params": {
                     "session_id": "FOREIGN", "type": "message.delta", "payload": {"text": "LEAK"}}})
             return result
         self.gateway.script = lambda sid, adm: [("message.complete", {"text": "fine", "status": "complete"})]
@@ -359,7 +362,7 @@ class HermesBridgeTests(unittest.TestCase):
                                                   "follow_profile": False}
         self.assertEqual(self.run_turn(thread="fp-off")[0], 200)
         self.assertNotIn("follow_profile_config", self.creates()[0])
-        self.assertNotIn("runtime.describe", [m for m, _ in self.gateway.calls])
+        self.assertIn("client", self.creates()[0])  # the launch label is independent of following
 
     def test_threads_with_a_shared_prefix_get_their_own_sessions(self):
         # Same first 12 characters: the titles must still differ, or Hermes would merge the threads.
@@ -383,6 +386,49 @@ class HermesBridgeTests(unittest.TestCase):
         self.assertIn("RUN_ERROR", [e["type"] for e in self.events(data)])
         self.assertIsNone(self.ledger.thread_session(PROFILE_ID, "intruder"))
         self.assertEqual(sum(1 for m, _ in self.gateway.calls if m == "prompt.submit"), prompts_before)
+
+    def seed_existing(self, thread, info):
+        """An existing session that owns the title this thread would get (title-as-identity)."""
+        self.gateway.sessions["OLD"] = ["earlier conversation"]
+        self.gateway.titles[hermes_bridge.session_title(PROFILE_ID, thread)] = "OLD"
+        self.gateway.info["OLD"] = info
+
+    def test_client_label_is_sent_and_echo_is_verified(self):
+        self.assertEqual(self.run_turn(thread="label-1")[0], 200)
+        client = self.creates()[0]["client"]
+        self.assertEqual(client["name"], "agent-fabric")
+        self.assertEqual(client["version"], hermes_bridge.stable_id("launch", PROFILE_ID, "label-1", length=24))
+
+    def test_title_resolved_tui_session_is_refused(self):
+        self.seed_existing("t-tui", {"source": "tui", "launch_request": {"source": "tui"}})
+        status, data = self.run_turn(thread="t-tui", run="r1")
+        self.assertIn("RUN_ERROR", [e["type"] for e in self.events(data)])
+        self.assertIsNone(self.ledger.thread_session(PROFILE_ID, "t-tui"))
+        self.assertEqual(self.gateway.sessions["OLD"], ["earlier conversation"])  # nothing submitted
+
+    def test_title_resolved_gui_session_from_another_launch_is_refused(self):
+        self.seed_existing("t-gui", {"source": "gui", "launch_request": {
+            "source": "gui", "client": {"name": "agent-fabric", "version": "somebody-else"}}})
+        status, data = self.run_turn(thread="t-gui", run="r1")
+        self.assertIn("RUN_ERROR", [e["type"] for e in self.events(data)])
+        self.assertIsNone(self.ledger.thread_session(PROFILE_ID, "t-gui"))
+        self.assertEqual(self.gateway.sessions["OLD"], ["earlier conversation"])
+
+    def test_without_client_support_only_the_source_is_checked(self):
+        self.gateway.describe_params = ["follow_profile_config"]
+        self.assertEqual(self.run_turn(thread="old-gw")[0], 200)
+        self.assertNotIn("client", self.creates()[0])
+        self.seed_existing("old-gw-tui", {"source": "tui"})
+        status, data = self.run_turn(thread="old-gw-tui", run="r1")
+        self.assertIn("RUN_ERROR", [e["type"] for e in self.events(data)])
+
+    def test_foreign_session_helper(self):
+        sent = {"client": {"name": "agent-fabric", "version": "v"}}
+        ok = {"info": {"source": "gui", "launch_request": {"client": {"name": "agent-fabric", "version": "v"}}}}
+        self.assertIsNone(hermes_bridge.foreign_session(ok, sent))
+        self.assertIsNone(hermes_bridge.foreign_session({}, {}))  # nothing to compare on an old gateway
+        self.assertIsNotNone(hermes_bridge.foreign_session({"info": {"source": "cli"}}, {}))
+        self.assertIsNotNone(hermes_bridge.foreign_session({"info": {"source": "gui"}}, sent))
 
     def test_bind_host_policy(self):
         hermes_bridge.check_bind_host("127.0.0.1")

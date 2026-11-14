@@ -37,10 +37,11 @@ from urllib.parse import urlsplit
 import bridge
 from request_ledger import RequestLedger
 
-VERSION = "0.8.0-hermes.4"
+VERSION = "0.8.0-hermes.5"
 PROFILE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 ROUTE_RE = re.compile(r"/profiles/([a-z0-9][a-z0-9_-]{0,63})/ag-ui\Z")
 SESSION_SOURCE = "gui"
+CLIENT_NAME = "agent-fabric"
 HEARTBEAT_SECONDS = 15.0
 DENY_CHOICES = ("deny", "reject", "no", "cancel", "abort")
 
@@ -359,16 +360,36 @@ def session_title(profile_id: str, thread_id: str) -> str:
     return f"OpenBot {thread_id[:12]} {stable_id('title', profile_id, thread_id, length=10)}"
 
 
-async def follow_profile_params(client) -> dict:
-    """``follow_profile_config=True`` when the gateway advertises it for session.create: the session
-    then re-reads the profile's current model/provider sections each turn (Hermes' own "Bot Chat"
-    behaviour), so a profile model change applies without restarting the gateway."""
+async def create_params(client, profile_id: str, thread_id: str, *, follow_profile: bool) -> dict:
+    """Optional session.create parameters, each sent only when the gateway advertises it:
+    ``follow_profile_config=True`` (the session re-reads the profile's current model/provider sections
+    each turn, so a profile model change applies without restarting the gateway) and a ``client``
+    label unique to this thread, which the created session echoes in ``info.launch_request``."""
     try:
         described = await client.rpc("runtime.describe")
     except Exception:
         return {}
     parameters = (described.get("session_create") or {}).get("parameters") or []
-    return {"follow_profile_config": True} if "follow_profile_config" in parameters else {}
+    extra: dict = {}
+    if follow_profile and "follow_profile_config" in parameters:
+        extra["follow_profile_config"] = True
+    if "client" in parameters:
+        extra["client"] = {"name": CLIENT_NAME, "version": stable_id("launch", profile_id, thread_id, length=24)}
+    return extra
+
+
+def foreign_session(snapshot: dict, sent: dict) -> str | None:
+    """Why a session.create result is not the session this request created (None when it is).
+    Title-as-identity could otherwise hand back an existing TUI, messaging or older session."""
+    info = snapshot.get("info") if isinstance(snapshot.get("info"), dict) else {}
+    source = info.get("source")
+    if source is not None and source != SESSION_SOURCE:
+        return f"source {source!r}"
+    if "client" in sent:
+        launch = info.get("launch_request")
+        if not isinstance(launch, dict) or launch.get("client") != sent["client"]:
+            return "launch request does not match"
+    return None
 
 
 async def open_session(client, ledger: HermesLedger, profile_id: str, thread_id: str,
@@ -392,12 +413,15 @@ async def open_session(client, ledger: HermesLedger, profile_id: str, thread_id:
         except Exception as exc:  # A pruned/deleted session: start a new one for this thread.
             if "not_found" not in str(exc) or mapping[1] == "bound":
                 raise
-    extra = await follow_profile_params(client) if follow_profile else {}
+    extra = await create_params(client, profile_id, thread_id, follow_profile=follow_profile)
     snapshot = await client.rpc("session.create", request_id=stable_id("create", profile_id, thread_id),
                                 source=SESSION_SOURCE, title=session_title(profile_id, thread_id), **extra)
     session_id = snapshot.get("stored_session_id") or snapshot.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         raise RuntimeError("Hermes did not return a session id")
+    if (why := foreign_session(snapshot, extra)) is not None:
+        # Never adopt a session this request did not create (e.g. one resolved by its title).
+        raise RuntimeError(f"Hermes returned a session this bridge did not create ({why})")
     owner = ledger.session_owner(profile_id, session_id)
     if owner is not None and owner != thread_id:
         # Never let two OpenBot threads share one Hermes session (their contexts would mix).

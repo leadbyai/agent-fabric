@@ -314,9 +314,21 @@ if ((SKIP_START == 0)); then
 else
   printf 'Prepared; run sudo systemctl enable --now openbot-herdr-gateway.service after review.\n'
 fi
-printf 'Gateway installed: %s, user=%s, sessions=%s, port=%s\n' "$RELEASE_VERSION" "$RUN_USER" "$HERDR_SESSIONS" "$GATEWAY_PORT"
+if [[ -n "$EXPECT_BRIDGE_SHA256" ]]; then
+  printf 'Gateway installed: reviewed source build (bridge.py %s), user=%s, sessions=%s, bind=%s, port=%s\n' \
+    "${EXPECT_BRIDGE_SHA256:0:16}" "$RUN_USER" "$HERDR_SESSIONS" "$BIND_HOST" "$GATEWAY_PORT"
+else
+  printf 'Gateway installed: %s, user=%s, sessions=%s, bind=%s, port=%s\n' "$RELEASE_VERSION" "$RUN_USER" "$HERDR_SESSIONS" "$BIND_HOST" "$GATEWAY_PORT"
+fi
 printf 'Busy wait=%ss, recovery=%ss; run ledger stays on this server when either is enabled.\n' "$BUSY_WAIT_SECONDS" "$RECOVERY_SECONDS"
-printf 'Bearer token stored locally at %s (not printed).\n' "$CONF_DIR/bridge.token"
+if [[ -n "$ROUTE_TOKENS" ]]; then
+  printf 'Per-agent token hashes stored at %s (%s routes); no bearer token is stored on this server.\n' \
+    "$CONF_DIR/route-tokens.sha256" "${#ROUTE_HASHES[@]}"
+elif [[ -n "$TOKEN_SHA256" ]]; then
+  printf 'Bridge-wide token hash stored at %s; no bearer token is stored on this server.\n' "$CONF_DIR/bridge.token.sha256"
+else
+  printf 'Bearer token stored locally at %s (not printed).\n' "$CONF_DIR/bridge.token"
+fi
 printf 'Existing pilot bridge and Herdr sessions were not modified.\n'
 
 if [[ "$BACKEND" == both ]]; then
