@@ -14,7 +14,7 @@ from unittest.mock import patch
 from external_sync_cursor import CursorLedger
 from external_sync_backfill import backfill, _timestamp
 from external_sync_hermes import sync_hermes
-from external_sync_supervisor import desired_sources
+from external_sync_supervisor import desired_sources, fetch_manifest
 from external_sync_watcher import (
     Binding, ImportClient, ImportFailed, Source, SourceUnavailable, resolve_claude, sync_source,
 )
@@ -32,6 +32,22 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(len(desired_sources({"bindings": [row, {"enabled": False}]})), 1)
         with self.assertRaisesRegex(ValueError, "source claimed"):
             desired_sources({"bindings": [row, dict(row, botId="other")]})
+
+    def test_pulled_manifest_cannot_redirect_import_credentials(self):
+        origin = "https://openbot.example"
+        with patch("external_sync_supervisor.build_opener") as build:
+            opener = build.return_value
+            response = opener.open.return_value.__enter__.return_value
+            response.read.return_value = json.dumps(
+                {"bindings": [{"openbotOrigin": "https://other.example", "botId": "bot"}]},
+            ).encode()
+            manifest = fetch_manifest(origin, SECRET)
+            request = opener.open.call_args.args[0]
+            self.assertEqual(request.full_url, origin + "/api/agent-fabric/enrollments")
+            self.assertEqual(request.get_header("Authorization"), "Bearer " + SECRET)
+            self.assertEqual(manifest["bindings"][0]["openbotOrigin"], origin)
+        with self.assertRaisesRegex(ValueError, "HTTPS origin"):
+            fetch_manifest("http://openbot.example", SECRET)
 
 
 class DeliveryTests(unittest.TestCase):
