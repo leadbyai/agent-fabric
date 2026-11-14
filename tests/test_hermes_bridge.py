@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -80,6 +81,7 @@ class FakeGateway:
         self.state = state
         self.calls, self.sessions, self.inputs, self.created = [], {}, set(), 0
         self.describe_params = ["model", "follow_profile_config", "request_id", "client"]
+        self.isolated_problems = []
         self.titles, self.force_session, self.info = {}, None, {}
         self.script = lambda sid, adm: [("message.delta", {"text": "Hello "}),
                                         ("message.complete", {"text": "Hello there", "status": "complete"})]
@@ -93,6 +95,9 @@ class FakeGateway:
 
     def profile_home(self, name):
         return Path("/home/example/.hermes/profiles") / name
+
+    def isolated_profile_problems(self):
+        return list(self.isolated_problems)
 
     @contextlib.asynccontextmanager
     async def _connect(self):
@@ -515,3 +520,216 @@ class HermesBridgeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IsolatedProfileTests(unittest.TestCase):
+    """HERMES_ISOLATED_PROFILE=1: a shared profile with no messaging, memory, tools or native attach."""
+
+    SAFE = {
+        "platforms": {}, "gateway": {"standalone": True, "platforms": {}},
+        "memory": {"memory_enabled": False, "user_profile_enabled": False},
+        "platform_toolsets": {"cli": [], "tui": [], "gui": []},
+        "agent": {"disabled_toolsets": ["project", "desktop_ui", "catalog"]},
+        "mcp_servers": {},
+    }
+
+    def problems(self, env=(), **override):
+        config = json.loads(json.dumps(self.SAFE))
+        config.update(override)
+        return hermes_bridge.isolated_profile_problems(config, set(env), hermes_bridge.CLIENT_SURFACE_TOOLSETS)
+
+    def test_safe_profile_passes(self):
+        self.assertEqual(self.problems(), [])
+
+    def test_enabled_messaging_platforms_are_refused(self):
+        self.assertEqual(self.problems(platforms={"discord": {"enabled": True}}), ["platforms.discord is enabled"])
+        self.assertEqual(self.problems(gateway={"platforms": {"telegram": {"enabled": True}}}),
+                         ["gateway.platforms.telegram is enabled"])
+
+    def test_platform_credential_on_disk_is_refused_even_when_disabled(self):
+        self.assertEqual(self.problems(platforms={"discord": {"enabled": False, "token": "x"}}),
+                         ["platforms.discord holds a credential"])
+        self.assertEqual(self.problems(platforms={"webhook": {"enabled": False, "extra": {"port": 1}}}), [])
+
+    def test_messaging_credentials_in_the_environment_are_refused_by_name(self):
+        self.assertEqual(self.problems(env={"DISCORD_BOT_TOKEN", "PATH", "HOME"}),
+                         ["messaging credential DISCORD_BOT_TOKEN is set"])
+
+    def test_memory_must_be_explicitly_off(self):
+        self.assertEqual(self.problems(memory={}),
+                         ["memory.memory_enabled must be false", "memory.user_profile_enabled must be false"])
+        self.assertEqual(self.problems(memory={"memory_enabled": False, "user_profile_enabled": True}),
+                         ["memory.user_profile_enabled must be false"])
+
+    def test_session_platform_toolsets_must_be_explicitly_empty(self):
+        self.assertEqual(self.problems(platform_toolsets={"cli": ["all"], "tui": []}),
+                         ["platform_toolsets.cli must be set to []", "platform_toolsets.gui must be set to []"])
+        self.assertEqual(self.problems(platform_toolsets={"cli": [], "tui": [], "gui": [], "cron": ["all"]}),
+                         ["platform_toolsets.cron must be empty"])
+
+    def test_client_surface_toolsets_must_be_disabled(self):
+        self.assertEqual(self.problems(agent={"disabled_toolsets": ["project"]}),
+                         ["agent.disabled_toolsets must include catalog, desktop_ui"])
+
+    def test_mcp_servers_are_refused(self):
+        self.assertEqual(self.problems(mcp_servers={"files": {"command": "x"}}), ["mcp_servers must be empty"])
+
+    def test_dotenv_names_ignores_comments_and_blank_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Path(tmp) / ".env"
+            env.write_text("A=1\n# B=2\nC=\nexport D='x'\nE=\"\"\n\nnoequals\n", encoding="utf-8")
+            self.assertEqual(hermes_bridge.dotenv_names(env), {"A", "D"})
+            self.assertEqual(hermes_bridge.dotenv_names(Path(tmp) / "missing"), set())
+
+    def test_connector_checks_only_its_own_home(self):
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.dict("os.environ", {"HERMES_HOME": "/elsewhere"}):
+            connector = hermes_bridge.HermesConnector(tmp, "", dedicated_profile="shared")
+            self.assertEqual(connector.isolated_profile_problems(), ["HERMES_HOME must be the isolated profile's own home"])
+            self.assertEqual(connector.profile_home("shared"), Path(tmp))
+
+    def start(self, **env):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            base = {"PATH": "/usr/bin:/bin", "OPENBOT_BRIDGE_TOKEN": TOKEN, "HERMES_PROFILES": "shared",
+                    "HERMES_ISOLATED_PROFILE": "1", "HERMES_HOME": tmp,
+                    "OPENBOT_BRIDGE_LEDGER_PATH": str(Path(tmp) / "ledger.sqlite3")}
+            base.update(env)
+            code = f"import sys; sys.path.insert(0, {str(PACKAGE_ROOT)!r}); import hermes_bridge; hermes_bridge.main()"
+            done = subprocess.run([sys.executable, "-I", "-c", code],
+                                  cwd=PACKAGE_ROOT, env={k: v for k, v in base.items() if v is not None},
+                                  capture_output=True, text=True, timeout=30)
+            return done.returncode, done.stderr
+
+    def test_isolated_profile_never_attaches_pins_or_carries_media(self):
+        for extra in ({"HERMES_ALLOW_NATIVE_ATTACH": "1"}, {"HERMES_BOUND_THREAD_ID": "t", "HERMES_BOUND_SESSION_ID": "s"},
+                      {"HERMES_BRIDGE_MEDIA_ROOT": "/tmp"}):
+            code, err = self.start(**extra)
+            self.assertNotEqual(code, 0)
+            self.assertIn("never attaches to native sessions", err)
+
+    def test_isolated_profile_serves_exactly_one_explicit_home(self):
+        for extra in ({"HERMES_PROFILES": "shared,other"}, {"HERMES_HOME": None}):
+            code, err = self.start(**extra)
+            self.assertNotEqual(code, 0)
+            self.assertIn("exactly one profile", err)
+
+
+class _Harness(unittest.TestCase):
+    """The HermesBridgeTests server and helpers without re-running its tests."""
+    setUp = HermesBridgeTests.setUp
+    request = HermesBridgeTests.request
+    run_turn = HermesBridgeTests.run_turn
+    events = staticmethod(HermesBridgeTests.events)
+
+
+class IsolatedHandlerTests(_Harness):
+    """An isolated bridge: gateway-enforced empty toolsets, no live profile re-read, and a per-run re-check."""
+
+    def setUp(self):
+        super().setUp()
+        self.gateway.describe_params = ["model", "follow_profile_config", "request_id", "client", "toolsets"]
+        self.server.RequestHandlerClass.config = {**self.server.RequestHandlerClass.config, "isolated": True,
+                                                  "follow_profile": True}
+
+    def test_sessions_are_created_with_no_toolsets_and_no_profile_follow(self):
+        self.assertIn("RUN_FINISHED", self.run_turn()[1])
+        creates = [p for m, p in self.gateway.calls if m == "session.create"]
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(creates[0]["toolsets"], [])
+        self.assertNotIn("follow_profile_config", creates[0])
+        self.assertIn("client", creates[0])
+
+    def test_gateway_that_cannot_enforce_isolation_is_refused(self):
+        for params in (["model", "client"], ["model", "toolsets"], None):
+            self.gateway.describe_params = params
+            data = self.run_turn(thread=f"t-{params}", run=f"r-{params}")[1]
+            self.assertIn("RUN_ERROR", data)
+        self.assertEqual([m for m, p in self.gateway.calls if m == "session.create"], [])
+
+    def test_failed_isolation_recheck_refuses_before_hermes(self):
+        self.gateway.isolated_problems = ["memory.memory_enabled must be false"]
+        status, data = self.run_turn()
+        self.assertEqual(status, 503)
+        self.assertIn("isolation_check_failed", data)
+        self.assertEqual(self.gateway.calls, [])
+
+    def test_bound_native_session_is_never_resumed(self):
+        self.ledger.map_thread(PROFILE_ID, "bound-thread", "NATIVE", origin="bound")
+        data = self.run_turn(thread="bound-thread")[1]
+        self.assertIn("RUN_ERROR", data)
+        self.assertNotIn("NATIVE", [p.get("session_id") for m, p in self.gateway.calls if m == "prompt.submit"])
+
+
+class DedicatedListingTests(_Harness):
+    """A dedicated (pinned or isolated) bridge lists its one home under its route name."""
+
+    def test_standalone_home_listed_under_its_route_name(self):
+        self.gateway.dedicated_profile = "solo"
+        self.server.RequestHandlerClass.config = {**self.server.RequestHandlerClass.config, "profiles": ("solo",)}
+        listing = json.loads(self.request("GET", "/agents")[1])
+        self.assertEqual([(p["name"], p["display_name"], p["ag_ui_path"]) for p in listing["profiles"]],
+                         [("solo", "solo", "/profiles/solo/ag-ui")])
+
+    def test_roster_that_names_the_route_is_unchanged(self):
+        self.gateway.dedicated_profile = "pilot"
+        listing = json.loads(self.request("GET", "/agents")[1])
+        self.assertEqual([(p["name"], p["display_name"]) for p in listing["profiles"]], [("pilot", "Pilot Bot")])
+
+
+class IsolatedGuardExtraTests(unittest.TestCase):
+    SAFE = IsolatedProfileTests.SAFE
+    problems = IsolatedProfileTests.problems
+
+    def test_plugins_memory_provider_and_focus_posture_are_refused(self):
+        self.assertEqual(self.problems(plugins={"enabled": ["files"]}), ["plugins.enabled must be empty"])
+        self.assertEqual(self.problems(plugins={"enabled": []}), [])
+        self.assertEqual(self.problems(memory={"memory_enabled": False, "user_profile_enabled": False, "provider": "honcho"}),
+                         ["memory.provider must be empty"])
+        self.assertEqual(self.problems(agent={"disabled_toolsets": ["project", "desktop_ui", "catalog"], "coding_context": "focus"}),
+                         ["agent.coding_context must not be focus"])
+
+    def test_more_messaging_credentials_are_refused_by_name(self):
+        self.assertEqual(self.problems(env={"API_SERVER_KEY", "MSGRAPH_CLIENT_SECRET", "YUANBAO_TOKEN", "RELAY_TOKEN"}),
+                         ["messaging credential API_SERVER_KEY is set", "messaging credential MSGRAPH_CLIENT_SECRET is set",
+                          "messaging credential RELAY_TOKEN is set", "messaging credential YUANBAO_TOKEN is set"])
+
+
+class IsolatedConnectorTests(unittest.TestCase):
+    """The connector reads Hermes' effective config itself and never trusts a fallback."""
+
+    def fake_hermes(self, config):
+        import types
+        cfg_mod = types.ModuleType("hermes_cli.config"); cfg_mod.load_config = lambda: config
+        pkg = types.ModuleType("hermes_cli"); pkg.config = cfg_mod
+        ts = types.ModuleType("toolsets"); ts.CLIENT_SURFACE_TOOLSETS = frozenset({"project", "desktop_ui", "catalog"})
+        return unittest.mock.patch.dict(sys.modules, {"hermes_cli": pkg, "hermes_cli.config": cfg_mod, "toolsets": ts})
+
+    def connector(self, tmp):
+        home = Path(tmp) / "isolated"; home.mkdir()
+        return hermes_bridge.HermesConnector(str(home), "", dedicated_profile="shared"), home
+
+    def test_effective_safe_config_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            connector, home = self.connector(tmp)
+            with self.fake_hermes(dict(IsolatedProfileTests.SAFE)), \
+                    unittest.mock.patch.dict("os.environ", {"HERMES_HOME": str(home), "HOME": tmp}, clear=True):
+                self.assertEqual(connector.isolated_profile_problems(), [])
+
+    def test_fallback_config_is_never_trusted(self):
+        class FailedConfigRead(dict):
+            def __init__(self, data, *, error):
+                super().__init__(data); self.error = error
+        with tempfile.TemporaryDirectory() as tmp:
+            connector, home = self.connector(tmp)
+            with self.fake_hermes(FailedConfigRead(IsolatedProfileTests.SAFE, error=ValueError("bad yaml"))), \
+                    unittest.mock.patch.dict("os.environ", {"HERMES_HOME": str(home), "HOME": tmp}, clear=True):
+                self.assertEqual(connector.isolated_profile_problems(),
+                                 ["config.yaml could not be read, and a fallback config is never trusted"])
+
+    def test_any_home_inside_the_default_hermes_home_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / ".hermes" / "profiles" / "shared"; home.mkdir(parents=True)
+            connector = hermes_bridge.HermesConnector(str(home), "", dedicated_profile="shared")
+            with unittest.mock.patch.dict("os.environ", {"HERMES_HOME": str(home), "HOME": tmp}, clear=True):
+                self.assertEqual(connector.isolated_profile_problems(),
+                                 ["an isolated profile cannot live in the default Hermes home"])

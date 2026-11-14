@@ -77,6 +77,35 @@ Images saved there are embedded in the authenticated reply with the existing scr
 size and file checks. Identical retries replay the stored reply and changed input under
 the same run ID is refused. Deployments without a media directory retain text-only behavior.
 
+### Isolated shared profile (`HERMES_ISOLATED_PROFILE=1`)
+
+For people an owner shares a Bot with, run a **second** bridge in front of a **separate** Hermes profile, never the
+owner's. With `HERMES_ISOLATED_PROFILE=1` the bridge:
+
+- serves exactly one route (`HERMES_PROFILES` has one name) backed by its own explicit `HERMES_HOME`, which must
+  not be the default Hermes home;
+- refuses `HERMES_ALLOW_NATIVE_ATTACH`, `HERMES_BOUND_THREAD_ID`/`HERMES_BOUND_SESSION_ID` and
+  `HERMES_BRIDGE_MEDIA_ROOT`, so every thread gets its own new `gui` session, a native binding is never resumed,
+  and attachments are refused;
+- refuses to start, and re-checks before **every run** (503 when it fails), unless the profile's **effective**
+  Hermes config (defaults included) reads cleanly (a fallback or last-known-good config is refused) and has:
+  - no messaging platform enabled and no platform credential in `config.yaml`, the profile `.env` or the
+    environment (checked by name only);
+  - `memory.memory_enabled: false`, `memory.user_profile_enabled: false` and no `memory.provider`;
+  - `platform_toolsets` `cli`, `tui` and `gui` set to `[]` and every other platform empty;
+  - Hermes' client-surface toolsets (`project`, `desktop_ui`, `catalog`) in `agent.disabled_toolsets`;
+  - no `mcp_servers`, no `plugins.enabled`, and `agent.coding_context` other than `focus`;
+- creates every session with an explicit `toolsets: []` and the per-thread `client` label, and never with
+  `follow_profile_config`. The **gateway** enforces the empty pick, and it also skips the GUI surface fold-in
+  that otherwise adds client-surface toolsets to GUI sessions. A gateway that does not advertise both
+  parameters is refused.
+
+Give the shared bridge its **own bearer**: the owner's pinned bridge only accepts the owner's.
+
+This is **capability** isolation. It does not stop a process from reading files its Unix user can read. Run
+the isolated profile as a different OS user, or in a disposable container with nothing of the owner's
+mounted and no inherited credentials, with only the egress its model provider needs.
+
 ## Install (as the profiles' Unix user; additive user service)
 ```bash
 bash install-hermes.sh --source-dir <reviewed checkout> --profiles <a>,<b> --bind <tailscale-ip> --port 8767 \
