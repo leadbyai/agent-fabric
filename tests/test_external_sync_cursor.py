@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 import unittest
@@ -53,6 +54,19 @@ class CursorTests(unittest.TestCase):
         self.append(prompt("new", "New text"), answer("a", "New answer"))
         batch = self.ledger.read_batch(cursor, path=self.source)
         self.assertEqual([e.content for e in batch.events], ["New text", "New answer"])
+
+    def test_resumed_session_catches_up_since_enable_without_backfill(self):
+        self.start()
+        target = self.root / "resumed.jsonl"
+        resumed = "resumed"
+        old = {**prompt("old", "Private historical text"),
+               "timestamp": "2000-01-01T00:00:00Z", "sessionId": resumed}
+        new = {**prompt("new", "New native prompt"), "sessionId": resumed,
+               "timestamp": datetime.now(timezone.utc).isoformat()}
+        target.write_bytes(b"".join(json.dumps(item).encode() + b"\n" for item in (old, new)))
+        cursor = self.ledger.open_or_initialize(bot_id="LBAI-Main", session_id=resumed, path=target)
+        batch = self.ledger.read_batch(cursor, path=target)
+        self.assertEqual([event.content for event in batch.events], ["New native prompt"])
 
     def test_no_ack_replays_identical_events(self):
         cursor = self.start()

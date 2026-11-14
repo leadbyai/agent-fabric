@@ -10,11 +10,13 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 import json
 import os
 from pathlib import Path
 import sqlite3
 import stat
+import time
 
 from external_sync_events import ImportEvent, TranscriptState, classify_claude_records
 
@@ -39,6 +41,7 @@ class Cursor:
     offset: int
     suppress_openbot_turn: bool
     parent_guard: str = "{}"
+    eligible_since: float | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +85,16 @@ def _read_file_id(value: int | str) -> int:
     return int(value.removeprefix("id:")) if isinstance(value, str) else value
 
 
+def _eligible(event: ImportEvent, since: float | None) -> bool:
+    if since is None:
+        return True
+    try:
+        timestamp = datetime.fromisoformat(event.timestamp.replace("Z", "+00:00"))
+        return timestamp.tzinfo is not None and timestamp.timestamp() >= since
+    except (ValueError, OverflowError, OSError):
+        return False
+
+
 def _last_complete_record_boundary(source, size: int) -> int:
     """Do not start in the middle of an unfinished JSONL record."""
     end = size
@@ -119,6 +132,7 @@ class CursorLedger:
                     offset INTEGER NOT NULL,
                     suppress_openbot_turn INTEGER NOT NULL DEFAULT 0,
                     parent_guard TEXT NOT NULL DEFAULT '{}',
+                    eligible_since REAL,
                     PRIMARY KEY (bot_id, session_id)
                 )"""
             )
@@ -128,6 +142,12 @@ class CursorLedger:
                 db.execute(
                     "ALTER TABLE transcript_cursor ADD COLUMN parent_guard TEXT NOT NULL DEFAULT '{}'"
                 )
+            if "eligible_since" not in columns:
+                db.execute("ALTER TABLE transcript_cursor ADD COLUMN eligible_since REAL")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS transcript_activation ("
+                "bot_id TEXT PRIMARY KEY, enabled_at REAL NOT NULL)"
+            )
 
     @contextmanager
     def _connect(self):
@@ -152,20 +172,32 @@ class CursorLedger:
             initial_offset = 0 if backfill else _last_complete_record_boundary(source, info.st_size)
 
         with self._connect() as db:
+            activated = db.execute(
+                "INSERT OR IGNORE INTO transcript_activation VALUES (?, ?)",
+                (bot_id, time.time()),
+            ).rowcount
+            eligible_since = None
+            if not activated and not backfill:
+                eligible_since = db.execute(
+                    "SELECT enabled_at FROM transcript_activation WHERE bot_id=?",
+                    (bot_id,),
+                ).fetchone()[0]
+                initial_offset = 0
             db.execute(
                 "INSERT OR IGNORE INTO transcript_cursor "
-                "(bot_id, session_id, device, inode, offset) VALUES (?, ?, ?, ?, ?)",
+                "(bot_id, session_id, device, inode, offset, eligible_since, suppress_openbot_turn) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (bot_id, session_id, _sqlite_file_id(info.st_dev),
-                 _sqlite_file_id(info.st_ino), initial_offset),
+                 _sqlite_file_id(info.st_ino), initial_offset, eligible_since, int(initial_offset > 0)),
             )
             row = db.execute(
-                "SELECT device, inode, offset, suppress_openbot_turn, parent_guard "
+                "SELECT device, inode, offset, suppress_openbot_turn, parent_guard, eligible_since "
                 "FROM transcript_cursor WHERE bot_id=? AND session_id=?",
                 (bot_id, session_id),
             ).fetchone()
         cursor = Cursor(
             bot_id, session_id, _read_file_id(row[0]), _read_file_id(row[1]),
-            row[2], bool(row[3]), row[4],
+            row[2], bool(row[3]), row[4], row[5],
         )
         if (cursor.device, cursor.inode) != (info.st_dev, info.st_ino):
             raise SourceChanged("transcript file identity changed")
@@ -205,7 +237,9 @@ class CursorLedger:
 
         guard = TranscriptState(cursor.suppress_openbot_turn, json.loads(cursor.parent_guard))
         events = tuple(
-            classify_claude_records(records, session_id=cursor.session_id, state=guard)
+            event for event in classify_claude_records(
+                records, session_id=cursor.session_id, state=guard
+            ) if _eligible(event, cursor.eligible_since)
         )
         return CandidateBatch(
             cursor, next_offset, guard.suppress_openbot_turn, events,
@@ -240,4 +274,5 @@ class CursorLedger:
         return Cursor(
             old.bot_id, old.session_id, old.device, old.inode,
             batch.next_offset, batch.next_suppress_openbot_turn, batch.next_parent_guard,
+            old.eligible_since,
         )
