@@ -98,10 +98,13 @@ def sync_hermes(source_path, ledger_path, client, *, bot_id, install_id, profile
         if identity != source_identity:
             raise SourceUnavailable("Hermes transcript database was replaced")
         rows = source.execute(
-            f"SELECT id, role, content, timestamp, message_uid FROM messages "
-            f"WHERE session_id IN ({placeholders}) AND id>? AND active=1 "
-            f"AND _compressed_summary=0 AND role IN ('user','assistant') "
-            f"AND display_kind IS NULL ORDER BY id LIMIT 20", (*chain, offset),
+            f"SELECT m.id, m.role, m.content, m.timestamp, m.message_uid FROM messages m "
+            f"WHERE m.session_id IN ({placeholders}) AND m.id>? AND (m.active=1 OR m.compacted=1) "
+            f"AND m._compressed_summary=0 AND m.role IN ('user','assistant') "
+            f"AND m.display_kind IS NULL AND NOT EXISTS ("
+            f"SELECT 1 FROM messages earlier WHERE earlier.session_id IN ({placeholders}) "
+            f"AND earlier.message_uid=m.message_uid AND earlier.id<m.id) "
+            f"ORDER BY m.id LIMIT 20", (*chain, offset, *chain),
         ).fetchall()
     if not rows:
         return False

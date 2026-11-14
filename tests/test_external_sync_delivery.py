@@ -90,20 +90,21 @@ class DeliveryTests(unittest.TestCase):
             db.executescript(
                 "CREATE TABLE sessions(id, source, created_source, end_reason, parent_session_id);"
                 "CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id, role, content, timestamp, "
-                "message_uid, active, _compressed_summary, display_kind);"
+                "message_uid, active, _compressed_summary, display_kind, compacted);"
                 "INSERT INTO sessions VALUES ('first','cli',NULL,NULL,NULL);"
                 "INSERT INTO sessions VALUES ('unrelated','gui','gui',NULL,NULL);"
-                "INSERT INTO messages VALUES (1,'first','user','pre-opt-in',100,'uid-1',1,0,NULL);"
+                "INSERT INTO messages VALUES (1,'first','user','pre-opt-in',100,'uid-1',1,0,NULL,0);"
             )
         self.assertFalse(sync_hermes(file, ledger, self.client, **binding))
         with contextlib.closing(sqlite3.connect(file)) as db, db:
             db.executescript(
                 "UPDATE sessions SET end_reason='compression' WHERE id='first';"
                 "INSERT INTO sessions VALUES ('next','cli','cli',NULL,'first');"
-                "INSERT INTO messages VALUES (2,'first','user','a question',102,'uid-2',1,0,NULL);"
-                "INSERT INTO messages VALUES (3,'next','user','a question',102,'uid-2',1,0,NULL);"
-                "INSERT INTO messages VALUES (4,'unrelated','user','other',104,'uid-4',1,0,NULL);"
-                "INSERT INTO messages VALUES (5,'next','assistant','an answer',105,'uid-5',1,0,NULL);"
+                "INSERT INTO messages VALUES (2,'first','user','a question',102,'uid-2',0,0,NULL,1);"
+                "INSERT INTO messages VALUES (3,'next','user','a question',102,'uid-2',1,0,NULL,0);"
+                "INSERT INTO messages VALUES (4,'unrelated','user','other',104,'uid-4',1,0,NULL,0);"
+                "INSERT INTO messages VALUES (5,'next','assistant','an answer',105,'uid-5',1,0,NULL,0);"
+                "INSERT INTO messages VALUES (6,'next','user','pre-opt-in',100,'uid-1',1,0,NULL,0);"
             )
         self.partial = True
         with self.assertRaises(ImportFailed):
