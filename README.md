@@ -22,6 +22,8 @@ processes. A stopped session is listed as offline until the owner starts it.
 | `GET /agents` | Discover recognized agents across configured sessions | Bearer token |
 | `GET /attention` | List blocked agents and offline sessions | Bearer token |
 | `POST /sessions/<session>/agents/<pane-id>/ag-ui` | Send AG-UI request to one existing agent | Bearer token |
+| `GET /sessions/<session>/agents/<pane-id>/model` | The agent's provider, offered models and efforts, and current model ([docs/model-control.md](docs/model-control.md)) | Bearer token (not discovery) |
+| `PUT /sessions/<session>/agents/<pane-id>/model` | Switch model and effort **for this session only** | Bearer token (not discovery) |
 | `POST /ag-ui` | Legacy single-agent entry point when configured | Bearer token |
 | `GET /agent` | Legacy target status when configured | Bearer token |
 
