@@ -46,6 +46,7 @@ class Binding:
     cwd: Path
     native_session_id: str | None = None
     terminal_sender: str = "Derek (terminal)"
+    backfill_on_first_start: bool = False
 
 
 @dataclass(frozen=True)
@@ -189,6 +190,7 @@ class ImportClient:
 def sync_source(ledger, client, binding, source, *, validate=None) -> bool:
     cursor = ledger.open_or_initialize(
         bot_id=binding.bot_id, session_id=source.session_id, path=source.path,
+        backfill=binding.backfill_on_first_start,
     )
     batch = ledger.read_batch(cursor, path=source.path, limit=20)
     if batch.next_offset == cursor.offset:
@@ -221,6 +223,7 @@ def main():
         Path(cfg["claudeConfigDir"]).resolve(), Path(cfg["cwd"]).resolve(),
         cfg.get("nativeSessionId"),
         cfg.get("terminalSender", "Derek (terminal)"),
+        cfg.get("backfillOnFirstStart") is True,
     )
     if (not re.fullmatch(r"[\w.-]{1,128}", binding.bot_id, flags=re.ASCII)
             or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", binding.herdr_session)
@@ -233,6 +236,8 @@ def main():
             or not binding.terminal_sender.strip()
             or len(binding.terminal_sender) > 80):
         parser.error("terminal sender must be a name of 1 to 80 characters")
+    if binding.backfill_on_first_start and binding.native_session_id is None:
+        parser.error("backfill on first start requires an explicit native session ID")
     client = ImportClient(cfg["openbotOrigin"], os.environ["AGENT_FABRIC_IMPORT_SECRET"])
     ledger = CursorLedger(args.ledger)
 

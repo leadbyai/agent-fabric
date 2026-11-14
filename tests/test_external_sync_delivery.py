@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from external_sync_cursor import CursorLedger
+from external_sync_backfill import backfill, _timestamp
 from external_sync_hermes import sync_hermes
 from external_sync_watcher import (
     Binding, ImportClient, ImportFailed, Source, SourceUnavailable, resolve_claude, sync_source,
@@ -116,6 +117,46 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(self.received[0], self.received[1])
         self.assertEqual([e["content"] for e in self.stored.values()], ["a question", "an answer"])
         self.assertEqual({e["session_id"] for e in self.stored.values()}, {"first"})
+
+    def test_historical_preview_then_apply_is_resumable_and_deduplicated(self):
+        file = self.root / "history.jsonl"
+        binding = Binding("bot-fixture", "staging", "w1:p1", self.root, self.root, SID, "Terminal")
+        source = Source(SID, file)
+        records = [
+            {**prompt("old", "Historical prompt"), "timestamp": "2026-11-13T23:59:00Z"},
+            {**answer("old-reply", "Historical reply"), "timestamp": "2026-11-13T23:59:01Z"},
+            {**prompt("remote", "OPENBOT_BEGIN_AABBCCDDEEFF0011"),
+             "timestamp": "2026-11-13T23:59:02Z"},
+            {**answer("echo", "Stored elsewhere"), "timestamp": "2026-11-13T23:59:03Z"},
+            prompt("live", "After cutoff"),
+        ]
+        file.write_bytes(b"".join(json.dumps(record).encode() + b"\n" for record in records))
+        start = _timestamp("2026-11-13T00:00:00Z")
+        stop = _timestamp("2026-11-14T00:00:00Z")
+        self.assertEqual(backfill(binding, source, self.root / "preview.db", start, stop), (2, True))
+        self.assertEqual(self.stored, {})
+        ledger = self.root / "apply.db"
+        self.partial = True
+        with self.assertRaises(ImportFailed):
+            backfill(binding, source, ledger, start, stop, client=self.client)
+        self.partial = False
+        self.assertEqual(backfill(binding, source, ledger, start, stop, client=self.client), (2, True))
+        self.assertEqual(backfill(binding, source, ledger, start, stop, client=self.client), (0, True))
+        self.assertEqual([e["content"] for e in self.stored.values()],
+                         ["Historical prompt", "Historical reply"])
+        self.assertEqual(next(iter(self.stored.values()))["sender"]["name"], "Terminal")
+
+    def test_new_binding_can_import_its_history_without_rewinding_live_cursor(self):
+        file = self.root / "new.jsonl"
+        records = [prompt("old", "Existing turn"), answer("reply", "Existing answer")]
+        file.write_bytes(b"".join(json.dumps(record).encode() + b"\n" for record in records))
+        source = Source(SID, file)
+        ledger = CursorLedger(self.root / "new.db")
+        binding = Binding("fixture", "staging", "w1:p1", self.root, self.root,
+                          SID, "Terminal", True)
+        self.assertTrue(sync_source(ledger, self.client, binding, source))
+        self.assertFalse(sync_source(CursorLedger(self.root / "new.db"), self.client, binding, source))
+        self.assertEqual(len(self.stored), 2)
 
     def test_resolver_follows_current_session_and_rejects_reused_pid(self):
         config = self.root / "claude"
