@@ -572,7 +572,7 @@ def image_file_type(data: bytes) -> tuple[str, str] | None:
     return None
 
 
-def persist_reply_images(reply: str, outbox: Path) -> str:
+def persist_reply_images(reply: str, outbox: Path, *, mode: str | None = None) -> str:
     """Automatically attach images placed in this request's private outbox.
 
     Default inline mode places image bytes within OpenBot's already-authenticated
@@ -581,6 +581,7 @@ def persist_reply_images(reply: str, outbox: Path) -> str:
     Legacy OPENBOT_IMAGE lines are removed when an actual image is available;
     arbitrary model-generated indentation cannot suppress delivery.
     """
+    mode = ARTIFACT_MODE if mode is None else mode
     published: list[Path] = []
     previews: list[str] = []
     total_inline = 0
@@ -605,7 +606,7 @@ def persist_reply_images(reply: str, outbox: Path) -> str:
             if ARTIFACT_MODE == "signed_url" and (not ARTIFACT_DIR or not PUBLIC_ORIGIN):
                 raise RuntimeError("Screenshot delivery is not configured on the Agent Fabric gateway")
             artifact_root: Path | None = None
-            if ARTIFACT_MODE == "signed_url":
+            if mode == "signed_url":
                 artifact_root = Path(ARTIFACT_DIR)
                 if not artifact_root.is_absolute() or artifact_root.is_symlink():
                     raise RuntimeError("Artifact directory is unsafe")
@@ -628,7 +629,7 @@ def persist_reply_images(reply: str, outbox: Path) -> str:
                 if kind is None or len(data) > MAX_FILE_SIZE:
                     raise RuntimeError("Screenshot is not a supported PNG, JPEG, or WebP image")
                 extension, mime = kind
-                if ARTIFACT_MODE == "inline":
+                if mode == "inline":
                     total_inline += len(data)
                     if (len(data) > MAX_INLINE_IMAGE_BYTES or
                             total_inline > MAX_INLINE_IMAGES_TOTAL):
