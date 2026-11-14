@@ -11,6 +11,7 @@ import argparse
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
+import ipaddress
 import logging
 import os
 from pathlib import Path
@@ -108,10 +109,13 @@ class NoRedirect(HTTPRedirectHandler):
 class ImportClient:
     def __init__(self, origin: str, secret: str):
         url = urlsplit(origin)
+        try:
+            loopback = ipaddress.ip_address(url.hostname or "").is_loopback
+        except ValueError:
+            loopback = False
         if (url.username or url.password or url.path not in ("", "/")
                 or url.query or url.fragment or not url.hostname
-                or (url.scheme != "https" and
-                    not (url.scheme == "http" and url.hostname in ("127.0.0.1", "::1")))):
+                or (url.scheme != "https" and not (url.scheme == "http" and loopback))):
             raise ValueError("OpenBot origin must be HTTPS or loopback HTTP")
         if len(secret) < 32 or not secret.isascii() or not secret.isprintable():
             raise ValueError("invalid import secret")
@@ -130,6 +134,8 @@ class ImportClient:
                 pending = []
             pending.append(event)
             if len(self._body(bot_id, pending)) > MAX_REQUEST_BYTES:
+                if len(pending) == 1:
+                    raise ImportFailed("event exceeds the import request limit")
                 accepted.update(self._post(bot_id, pending[:-1]))
                 pending = [event]
         if pending:
