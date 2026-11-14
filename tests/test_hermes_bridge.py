@@ -34,6 +34,10 @@ class FakeClient:
                 {"name": "default", "display_name": "Default"},
                 {"name": "pilot", "display_name": "Pilot Bot"},
                 {"name": "other", "display_name": "Other"}]}
+        if method == "runtime.describe":
+            if self.gateway.describe_params is None:
+                raise RuntimeError("unknown_method")
+            return {"session_create": {"parameters": self.gateway.describe_params}}
         if method == "session.create":
             self.gateway.created += 1
             sid = f"S{self.gateway.created}"
@@ -63,6 +67,7 @@ class FakeGateway:
     def __init__(self, state="ready"):
         self.state = state
         self.calls, self.sessions, self.inputs, self.created = [], {}, set(), 0
+        self.describe_params = ["model", "follow_profile_config", "request_id"]
         self.script = lambda sid, adm: [("message.delta", {"text": "Hello "}),
                                         ("message.complete", {"text": "Hello there", "status": "complete"})]
 
@@ -320,6 +325,33 @@ class HermesBridgeTests(unittest.TestCase):
         key = hermes_bridge.RequestLedger.key(PROFILE_ID, "hermes", "t-x", "r-x")
         self.assertEqual(self.request("GET", f"/requests/{key}", token=tok_pilot)[0], 200)
         self.assertEqual(self.request("GET", f"/requests/{key}", token=tok_other)[0], 404)
+
+    def creates(self):
+        return [params for method, params in self.gateway.calls if method == "session.create"]
+
+    def test_new_sessions_follow_profile_config_when_advertised(self):
+        self.assertEqual(self.run_turn(thread="fp-1")[0], 200)
+        self.assertEqual(len(self.creates()), 1)
+        self.assertIs(self.creates()[0].get("follow_profile_config"), True)
+        self.assertEqual(self.creates()[0]["source"], "gui")
+        # A resumed thread is not re-created and keeps its original session settings.
+        self.assertEqual(self.run_turn(thread="fp-1", run="run-2")[0], 200)
+        self.assertEqual(len(self.creates()), 1)
+
+    def test_follow_profile_config_omitted_when_not_advertised(self):
+        for params in ([], None):  # gateway lists other parameters only, or has no runtime.describe
+            self.gateway.describe_params = params
+            self.gateway.calls.clear()
+            thread = f"fp-none-{params is None}"
+            self.assertEqual(self.run_turn(thread=thread)[0], 200)
+            self.assertNotIn("follow_profile_config", self.creates()[0])
+
+    def test_follow_profile_config_can_be_disabled(self):
+        self.server.RequestHandlerClass.config = {**self.server.RequestHandlerClass.config,
+                                                  "follow_profile": False}
+        self.assertEqual(self.run_turn(thread="fp-off")[0], 200)
+        self.assertNotIn("follow_profile_config", self.creates()[0])
+        self.assertNotIn("runtime.describe", [m for m, _ in self.gateway.calls])
 
     def test_bind_host_policy(self):
         hermes_bridge.check_bind_host("127.0.0.1")

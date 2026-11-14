@@ -37,7 +37,7 @@ from urllib.parse import urlsplit
 import bridge
 from request_ledger import RequestLedger
 
-VERSION = "0.8.0-hermes.2"
+VERSION = "0.8.0-hermes.3"
 PROFILE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 ROUTE_RE = re.compile(r"/profiles/([a-z0-9][a-z0-9_-]{0,63})/ag-ui\Z")
 SESSION_SOURCE = "gui"
@@ -71,6 +71,7 @@ def env_config() -> dict:
         "timeout": int(os.environ.get("OPENBOT_BRIDGE_TIMEOUT_SECONDS", "900")),
         "approval_wait": int(os.environ.get("HERMES_APPROVAL_WAIT_SECONDS", "0")),
         "allow_native": os.environ.get("HERMES_ALLOW_NATIVE_ATTACH", "0").strip() == "1",
+        "follow_profile": os.environ.get("HERMES_FOLLOW_PROFILE_CONFIG", "1").strip() != "0",
     }
 
 
@@ -344,8 +345,20 @@ class Turn:
         return self.final
 
 
+async def follow_profile_params(client) -> dict:
+    """``follow_profile_config=True`` when the gateway advertises it for session.create: the session
+    then re-reads the profile's current model/provider sections each turn (Hermes' own "Bot Chat"
+    behaviour), so a profile model change applies without restarting the gateway."""
+    try:
+        described = await client.rpc("runtime.describe")
+    except Exception:
+        return {}
+    parameters = (described.get("session_create") or {}).get("parameters") or []
+    return {"follow_profile_config": True} if "follow_profile_config" in parameters else {}
+
+
 async def open_session(client, ledger: HermesLedger, profile_id: str, thread_id: str,
-                       *, allow_native: bool = False) -> tuple[str, bool]:
+                       *, allow_native: bool = False, follow_profile: bool = True) -> tuple[str, bool]:
     """The Hermes session this OpenBot thread owns: resume ours, or create a new one.
 
     A thread an operator explicitly bound to an existing native session (origin 'bound',
@@ -365,8 +378,9 @@ async def open_session(client, ledger: HermesLedger, profile_id: str, thread_id:
         except Exception as exc:  # A pruned/deleted session: start a new one for this thread.
             if "not_found" not in str(exc) or mapping[1] == "bound":
                 raise
+    extra = await follow_profile_params(client) if follow_profile else {}
     snapshot = await client.rpc("session.create", request_id=stable_id("create", profile_id, thread_id),
-                                source=SESSION_SOURCE, title=f"OpenBot {thread_id[:12]}")
+                                source=SESSION_SOURCE, title=f"OpenBot {thread_id[:12]}", **extra)
     session_id = snapshot.get("stored_session_id") or snapshot.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         raise RuntimeError("Hermes did not return a session id")
@@ -476,7 +490,8 @@ class HermesHandler(bridge.Handler):
         async def work() -> str:
             async with self.connector.connect(endpoint) as client:
                 session_id, created = await open_session(client, self.ledger, endpoint.profile_id, thread_id,
-                                                         allow_native=self.config.get("allow_native", False))
+                                                         allow_native=self.config.get("allow_native", False),
+                                                         follow_profile=self.config.get("follow_profile", True))
                 emit({"type": "CUSTOM", "name": "agent-fabric.progress",
                       "value": {"state": "submitted", "session": "created" if created else "resumed"}})
                 turn = Turn(client, emit, session_id=session_id,

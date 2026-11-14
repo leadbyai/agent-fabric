@@ -162,6 +162,7 @@ Environment=OPENBOT_BRIDGE_LEDGER_PATH=$STATE_DIR/ledger.sqlite3
 Environment=OPENBOT_BRIDGE_TIMEOUT_SECONDS=$TIMEOUT_SECONDS
 Environment=HERMES_APPROVAL_WAIT_SECONDS=0
 Environment=HERMES_ALLOW_NATIVE_ATTACH=0
+Environment=HERMES_FOLLOW_PROFILE_CONFIG=1
 ExecStart=$PY -E -s $APP_DIR/hermes_bridge.py
 Restart=on-failure
 RestartSec=5
