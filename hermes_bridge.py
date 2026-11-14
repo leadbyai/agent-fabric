@@ -37,7 +37,7 @@ from urllib.parse import urlsplit
 import bridge
 from request_ledger import RequestLedger
 
-VERSION = "0.8.0-hermes.3"
+VERSION = "0.8.0-hermes.4"
 PROFILE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 ROUTE_RE = re.compile(r"/profiles/([a-z0-9][a-z0-9_-]{0,63})/ag-ui\Z")
 SESSION_SOURCE = "gui"
@@ -107,6 +107,14 @@ class HermesLedger(RequestLedger):
                 "SELECT session_id, origin FROM thread_sessions WHERE profile_id=? AND thread_id=?",
                 (profile_id, thread_id)).fetchone()
             return (row["session_id"], row["origin"]) if row else None
+
+    def session_owner(self, profile_id: str, session_id: str) -> str | None:
+        """The thread already mapped to this session, if any."""
+        with self._open() as connection:
+            row = connection.execute(
+                "SELECT thread_id FROM thread_sessions WHERE profile_id=? AND session_id=? LIMIT 1",
+                (profile_id, session_id)).fetchone()
+            return row["thread_id"] if row else None
 
     def map_thread(self, profile_id: str, thread_id: str, session_id: str, origin: str = "created") -> None:
         with self._open() as connection:
@@ -345,6 +353,12 @@ class Turn:
         return self.final
 
 
+def session_title(profile_id: str, thread_id: str) -> str:
+    """A title no other thread shares. Hermes treats a session title as an identity, so two threads
+    with the same title prefix would otherwise be resolved to one session."""
+    return f"OpenBot {thread_id[:12]} {stable_id('title', profile_id, thread_id, length=10)}"
+
+
 async def follow_profile_params(client) -> dict:
     """``follow_profile_config=True`` when the gateway advertises it for session.create: the session
     then re-reads the profile's current model/provider sections each turn (Hermes' own "Bot Chat"
@@ -380,10 +394,14 @@ async def open_session(client, ledger: HermesLedger, profile_id: str, thread_id:
                 raise
     extra = await follow_profile_params(client) if follow_profile else {}
     snapshot = await client.rpc("session.create", request_id=stable_id("create", profile_id, thread_id),
-                                source=SESSION_SOURCE, title=f"OpenBot {thread_id[:12]}", **extra)
+                                source=SESSION_SOURCE, title=session_title(profile_id, thread_id), **extra)
     session_id = snapshot.get("stored_session_id") or snapshot.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         raise RuntimeError("Hermes did not return a session id")
+    owner = ledger.session_owner(profile_id, session_id)
+    if owner is not None and owner != thread_id:
+        # Never let two OpenBot threads share one Hermes session (their contexts would mix).
+        raise RuntimeError("Hermes returned a session that already belongs to another OpenBot thread")
     ledger.map_thread(profile_id, thread_id, session_id)
     return session_id, True
 

@@ -39,9 +39,16 @@ class FakeClient:
                 raise RuntimeError("unknown_method")
             return {"session_create": {"parameters": self.gateway.describe_params}}
         if method == "session.create":
+            title = params.get("title")
+            if title in self.gateway.titles:  # Hermes resolves a title as an identity
+                sid = self.gateway.titles[title]
+                return {"stored_session_id": sid, "session_id": "live-" + sid}
+            if self.gateway.force_session:
+                return {"stored_session_id": self.gateway.force_session, "session_id": "live-x"}
             self.gateway.created += 1
             sid = f"S{self.gateway.created}"
             self.gateway.sessions[sid] = []
+            self.gateway.titles[title] = sid
             return {"stored_session_id": sid, "session_id": "live-" + sid}
         if method == "session.resume":
             sid = params["session_id"]
@@ -68,6 +75,7 @@ class FakeGateway:
         self.state = state
         self.calls, self.sessions, self.inputs, self.created = [], {}, set(), 0
         self.describe_params = ["model", "follow_profile_config", "request_id"]
+        self.titles, self.force_session = {}, None
         self.script = lambda sid, adm: [("message.delta", {"text": "Hello "}),
                                         ("message.complete", {"text": "Hello there", "status": "complete"})]
 
@@ -352,6 +360,29 @@ class HermesBridgeTests(unittest.TestCase):
         self.assertEqual(self.run_turn(thread="fp-off")[0], 200)
         self.assertNotIn("follow_profile_config", self.creates()[0])
         self.assertNotIn("runtime.describe", [m for m, _ in self.gateway.calls])
+
+    def test_threads_with_a_shared_prefix_get_their_own_sessions(self):
+        # Same first 12 characters: the titles must still differ, or Hermes would merge the threads.
+        self.assertEqual(self.run_turn(thread="openbot-roll-a")[0], 200)
+        self.assertEqual(self.run_turn(thread="openbot-roll-b")[0], 200)
+        titles = [c["title"] for c in self.creates()]
+        self.assertEqual(len(set(titles)), 2)
+        self.assertTrue(all(t.startswith("OpenBot openbot-roll ") for t in titles))
+        self.assertEqual(self.gateway.created, 2)
+        self.assertNotEqual(self.ledger.thread_session(PROFILE_ID, "openbot-roll-a")[0],
+                            self.ledger.thread_session(PROFILE_ID, "openbot-roll-b")[0])
+
+    def test_session_owned_by_another_thread_is_refused(self):
+        self.assertEqual(self.run_turn(thread="owner")[0], 200)
+        taken = self.ledger.thread_session(PROFILE_ID, "owner")[0]
+        self.gateway.force_session = taken
+        self.gateway.titles.clear()
+        prompts_before = sum(1 for m, _ in self.gateway.calls if m == "prompt.submit")
+        status, data = self.run_turn(thread="intruder", run="r-i")
+        self.assertEqual(status, 200)
+        self.assertIn("RUN_ERROR", [e["type"] for e in self.events(data)])
+        self.assertIsNone(self.ledger.thread_session(PROFILE_ID, "intruder"))
+        self.assertEqual(sum(1 for m, _ in self.gateway.calls if m == "prompt.submit"), prompts_before)
 
     def test_bind_host_policy(self):
         hermes_bridge.check_bind_host("127.0.0.1")
