@@ -20,9 +20,13 @@ SOURCE_DIR=""
 PUBLIC_ORIGIN=""
 ARTIFACT_MODE="inline"
 SKIP_START=0
+BIND_HOST="127.0.0.1"
+TOKEN_SHA256=""
+ROUTE_HASHES=()
+EXPECT_BRIDGE_SHA256=""
 
 usage() {
-  printf 'Usage: sudo bash install.sh --user USER --sessions NAME[,NAME] --roots DIR[:DIR] [--artifact-mode inline|signed_url --public-origin https://AGENT-HOST] [--legacy-target NAME --legacy-workdir DIR] [--token-file PATH] [--port 8766] [--busy-wait-seconds 600] [--recovery-seconds 600] [--source-dir DIR] [--no-start]\n'
+  printf 'Usage: sudo bash install.sh --user USER --sessions NAME[,NAME] --roots DIR[:DIR] [--artifact-mode inline|signed_url --public-origin https://AGENT-HOST] [--legacy-target NAME --legacy-workdir DIR] [--token-file PATH] [--port 8766] [--busy-wait-seconds 600] [--recovery-seconds 600] [--source-dir DIR [--expect-bridge-sha256 HEX]] [--bind 127.0.0.1|TAILSCALE-IP] [--token-sha256 HEX | --route-token-sha256 SESSION/PANE=HEX ...] [--no-start]\n'
 }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -55,7 +59,7 @@ esac
 
 while (($#)); do
   case "$1" in
-    --user|--sessions|--roots|--legacy-target|--legacy-workdir|--token-file|--port|--busy-wait-seconds|--recovery-seconds|--source-dir|--public-origin|--artifact-mode)
+    --user|--sessions|--roots|--legacy-target|--legacy-workdir|--token-file|--port|--busy-wait-seconds|--recovery-seconds|--source-dir|--public-origin|--artifact-mode|--bind|--token-sha256|--route-token-sha256|--expect-bridge-sha256)
       (($# >= 2)) || die "Missing value for $1"
       case "$1" in
         --user) RUN_USER="$2" ;;
@@ -70,6 +74,10 @@ while (($#)); do
         --source-dir) SOURCE_DIR="$2" ;;
         --public-origin) PUBLIC_ORIGIN="$2" ;;
         --artifact-mode) ARTIFACT_MODE="$2" ;;
+        --bind) BIND_HOST="$2" ;;
+        --token-sha256) TOKEN_SHA256="$2" ;;
+        --route-token-sha256) ROUTE_HASHES+=("$2") ;;
+        --expect-bridge-sha256) EXPECT_BRIDGE_SHA256="$2" ;;
       esac
       shift 2 ;;
     --no-start) SKIP_START=1; shift ;;
@@ -98,6 +106,33 @@ id -u "$RUN_USER" >/dev/null 2>&1 || die "User $RUN_USER does not exist"
 [[ "$ARTIFACT_MODE" != "signed_url" || -n "$PUBLIC_ORIGIN" ]] || die "signed_url mode requires --public-origin"
 command -v curl >/dev/null || die "curl required"
 command -v systemctl >/dev/null || die "systemd required"
+# Bind: loopback (behind a private tunnel) or this host's own Tailscale (100.64.0.0/10) address.
+if [[ "$BIND_HOST" != "127.0.0.1" ]]; then
+  [[ "$BIND_HOST" =~ ^100\.([0-9]{1,3})\.[0-9]{1,3}\.[0-9]{1,3}$ ]] && (( BASH_REMATCH[1] >= 64 && BASH_REMATCH[1] <= 127 )) \
+    || die "--bind must be 127.0.0.1 or a Tailscale 100.64.0.0/10 address"
+  ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 | grep -qx "$BIND_HOST" || die "--bind $BIND_HOST is not an address of this host"
+fi
+# Credentials: the bridge-wide token file (default), a bridge-wide SHA-256, or per-agent SHA-256s.
+[[ -z "$TOKEN_SHA256" || "$TOKEN_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--token-sha256 must be 64 lowercase hex characters"
+(( (${#TOKEN_SOURCE} > 0) + (${#TOKEN_SHA256} > 0) + (${#ROUTE_HASHES[@]} > 0) <= 1 )) \
+  || die "Use one of --token-file, --token-sha256 or --route-token-sha256"
+ROUTE_TOKENS=""
+if ((${#ROUTE_HASHES[@]})); then
+  declare -A seen_route=() seen_hash=()
+  for entry in "${ROUTE_HASHES[@]}"; do
+    [[ "$entry" =~ ^([A-Za-z0-9][A-Za-z0-9_-]{0,63})/(w[0-9A-Za-z]+:p[0-9A-Za-z]+)=([0-9a-f]{64})$ ]] \
+      || die "--route-token-sha256 must be SESSION/PANE=<64 lowercase hex>"
+    route="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"; digest="${BASH_REMATCH[3]}"
+    [[ ",$HERDR_SESSIONS," == *",${BASH_REMATCH[1]},"* ]] || die "--route-token-sha256 names a session that is not in --sessions"
+    [[ -z "${seen_route[$route]:-}" ]] || die "--route-token-sha256 given twice for one route"
+    [[ -z "${seen_hash[$digest]:-}" ]] || die "The same token hash is given for two routes"
+    seen_route[$route]=1; seen_hash[$digest]=1
+    ROUTE_TOKENS+="$route $digest"$'\n'
+  done
+fi
+[[ -z "$EXPECT_BRIDGE_SHA256" || "$EXPECT_BRIDGE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--expect-bridge-sha256 must be 64 lowercase hex characters"
+[[ -z "$EXPECT_BRIDGE_SHA256" || -n "$SOURCE_DIR" ]] || die "--expect-bridge-sha256 needs --source-dir"
+[[ -n "$EXPECT_BRIDGE_SHA256" ]] && BRIDGE_SHA256="$EXPECT_BRIDGE_SHA256"
 
 IFS=: read -r -a root_list <<< "$UPLOAD_ROOTS"
 for path in "${root_list[@]}"; do
@@ -164,13 +199,34 @@ fi
 install -m 0755 "$TEMP_FILE" "$APP_DIR/bridge.py"
 install -m 0644 "$TEMP_LEDGER" "$APP_DIR/request_ledger.py"
 
-if [[ -n "$TOKEN_SOURCE" ]]; then
-  install -m 0600 "$TOKEN_SOURCE" "$CONF_DIR/bridge.token"
-elif [[ ! -f "$CONF_DIR/bridge.token" ]]; then
-  python3 -c 'import secrets,sys;sys.stdout.write(secrets.token_urlsafe(48)+"\n")' > "$CONF_DIR/bridge.token"
-  chmod 0600 "$CONF_DIR/bridge.token"
+CREDENTIAL_ENV='OPENBOT_BRIDGE_TOKEN_FILE=%d/bridge.token'
+CREDENTIAL_LOAD="bridge.token:$CONF_DIR/bridge.token"
+if [[ -n "$ROUTE_TOKENS" || -n "$TOKEN_SHA256" ]]; then
+  # Hash-only: the gateway never holds a bearer token; any old token file is removed.
+  if [[ -n "$ROUTE_TOKENS" ]]; then
+    printf '# <session>/<pane> <sha256 of that agent'"'"'s bearer token>; managed by install.sh\n%s' "$ROUTE_TOKENS" \
+      > "$CONF_DIR/route-tokens.sha256"
+    chmod 0600 "$CONF_DIR/route-tokens.sha256"
+    rm -f "$CONF_DIR/bridge.token.sha256"
+    CREDENTIAL_ENV='OPENBOT_BRIDGE_ROUTE_TOKENS_FILE=%d/route-tokens.sha256'
+    CREDENTIAL_LOAD="route-tokens.sha256:$CONF_DIR/route-tokens.sha256"
+  else
+    printf '%s\n' "$TOKEN_SHA256" > "$CONF_DIR/bridge.token.sha256"
+    chmod 0600 "$CONF_DIR/bridge.token.sha256"
+    rm -f "$CONF_DIR/route-tokens.sha256"
+    CREDENTIAL_ENV='OPENBOT_BRIDGE_TOKEN_SHA256_FILE=%d/bridge.token.sha256'
+    CREDENTIAL_LOAD="bridge.token.sha256:$CONF_DIR/bridge.token.sha256"
+  fi
+  if [[ -f "$CONF_DIR/bridge.token" ]]; then shred -u "$CONF_DIR/bridge.token"; fi
+else
+  if [[ -n "$TOKEN_SOURCE" ]]; then
+    install -m 0600 "$TOKEN_SOURCE" "$CONF_DIR/bridge.token"
+  elif [[ ! -f "$CONF_DIR/bridge.token" ]]; then
+    python3 -c 'import secrets,sys;sys.stdout.write(secrets.token_urlsafe(48)+"\n")' > "$CONF_DIR/bridge.token"
+    chmod 0600 "$CONF_DIR/bridge.token"
+  fi
+  [[ $(wc -c < "$CONF_DIR/bridge.token") -ge 24 ]] || die "Existing bearer token too short"
 fi
-[[ $(wc -c < "$CONF_DIR/bridge.token") -ge 24 ]] || die "Existing bearer token too short"
 
 CONFIG_TEMP="$(mktemp "$CONF_DIR/.config.env.XXXXXX")"
 trap 'test ! -e "$CONFIG_TEMP" || rm -f -- "$CONFIG_TEMP"; test ! -e "$TEMP_FILE" || rm -f -- "$TEMP_FILE"; test ! -e "$TEMP_LEDGER" || rm -f -- "$TEMP_LEDGER"' EXIT
@@ -188,7 +244,7 @@ fi
   printf 'OPENBOT_BRIDGE_PORT=%s\n' "$GATEWAY_PORT"
   printf 'OPENBOT_BRIDGE_ALLOWED_ROOTS=%s\n' "$UPLOAD_ROOTS"
   printf 'OPENBOT_BRIDGE_WORKDIR=%s\n' "$LEGACY_WORKDIR"
-  printf 'OPENBOT_BRIDGE_HOST=127.0.0.1\n'
+  printf 'OPENBOT_BRIDGE_HOST=%s\n' "$BIND_HOST"
   printf 'OPENBOT_BRIDGE_BUSY_WAIT_SECONDS=%s\n' "$BUSY_WAIT_SECONDS"
   printf 'OPENBOT_BRIDGE_RECOVERY_SECONDS=%s\n' "$RECOVERY_SECONDS"
   printf 'OPENBOT_BRIDGE_ARTIFACT_DIR=%s\n' "$ARTIFACT_DIR"
@@ -212,8 +268,8 @@ Type=simple
 User=$RUN_USER
 WorkingDirectory=$RUN_HOME
 EnvironmentFile=$CONF_DIR/config.env
-Environment=OPENBOT_BRIDGE_TOKEN_FILE=%d/bridge.token
-LoadCredential=bridge.token:$CONF_DIR/bridge.token
+Environment=$CREDENTIAL_ENV
+LoadCredential=$CREDENTIAL_LOAD
 ExecStart=/usr/bin/python3 $APP_DIR/bridge.py
 Restart=on-failure
 RestartSec=3
@@ -232,7 +288,7 @@ if ((SKIP_START == 0)); then
   systemctl restart openbot-herdr-gateway.service
   HEALTHY=0
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if curl -fsS --max-time 2 "http://127.0.0.1:$GATEWAY_PORT/health"; then
+    if curl -fsS --max-time 2 "http://$BIND_HOST:$GATEWAY_PORT/health"; then
       printf '\n'
       HEALTHY=1
       break

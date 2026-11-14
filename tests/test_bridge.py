@@ -104,11 +104,11 @@ class BridgeTests(unittest.TestCase):
             return self.replies[(session, args[2])]
         raise AssertionError(f"Unexpected Herdr command {args}")
 
-    def request(self, method, path, data=None, auth=True, raw=False):
+    def request(self, method, path, data=None, auth=True, raw=False, token=None):
         con = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=10)
         headers = {"Content-Type": "application/json"}
         if auth:
-            headers["Authorization"] = "Bearer " + "Z" * 48
+            headers["Authorization"] = "Bearer " + (token or "Z" * 48)
         con.request(method, path, body=json.dumps(data) if data is not None else None,
                     headers=headers)
         response = con.getresponse()
@@ -170,6 +170,79 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.request("GET", "/agents", auth=False)[0], 401)
         self.assertEqual(self.request("POST", "/ag-ui", self.message("Hello"), auth=False)[0], 401)
         self.assertEqual(self.prompts, [])
+
+    def use_route_tokens(self):
+        import hashlib
+        self.tok_pricing, self.tok_other = "P" * 43, "O" * 43
+        self.bridge.TOKEN = ""
+        self.bridge.ROUTE_HASHES = {
+            ("Main", "w3:p1"): hashlib.sha256(self.tok_pricing.encode()).hexdigest(),
+            ("Other", "w1:p2"): hashlib.sha256(self.tok_other.encode()).hexdigest()}
+
+    def test_route_token_file_parsing(self):
+        import hashlib
+        a, b = (hashlib.sha256(x.encode()).hexdigest() for x in ("a", "b"))
+        parsed = self.bridge.parse_route_hashes(f"# c\nMain/w3:p1 {a}\nOther/w1:p2 {b.upper()} # x\n")
+        self.assertEqual(parsed, {("Main", "w3:p1"): a, ("Other", "w1:p2"): b})
+        for bad in (f"Main/w3:p1 {a}\nMain/w3:p1 {b}\n", f"Main/w3:p1 {a}\nOther/w1:p2 {a}\n",
+                    f"Main {a}\n", f"Main/notapane {a}\n", f"Main/w3:p1 {a[:-1]}\n"):
+            with self.assertRaises(ValueError):
+                self.bridge.parse_route_hashes(bad)
+
+    def test_credential_scope_function(self):
+        import hashlib
+        scope = self.bridge.credential_scope
+        routes = {("Main", "w3:p1"): hashlib.sha256(b"P" * 43).hexdigest()}
+        self.assertEqual(scope("Bearer " + "P" * 43, route_hashes=routes), frozenset({("Main", "w3:p1")}))
+        self.assertIsNone(scope("Bearer " + "Q" * 43, route_hashes=routes))
+        self.assertIsNone(scope("Bearer " + routes[("Main", "w3:p1")], route_hashes=routes))  # hash is not the token
+        self.assertIsNone(scope("P" * 43, route_hashes=routes))
+        wide = hashlib.sha256(b"W" * 43).hexdigest()
+        self.assertEqual(scope("Bearer " + "W" * 43, token_sha256=wide), self.bridge.ALL_ROUTES)
+        self.assertIsNone(scope("Bearer " + "W" * 44, token_sha256=wide))
+        self.assertEqual(scope("Bearer " + "Z" * 48, token="Z" * 48), self.bridge.ALL_ROUTES)
+        self.assertIsNone(scope("Bearer " + "Z" * 47, token="Z" * 48))
+        self.assertIsNone(scope("", token=""))
+
+    def test_route_token_reaches_only_its_agent(self):
+        self.use_route_tokens()
+        self.assertEqual(self.request("GET", "/agents")[0], 401)  # bridge-wide token no longer accepted
+        status, body = self.request("GET", "/agents", token=self.tok_pricing)
+        self.assertEqual(status, 200)
+        sessions = json.loads(body)["sessions"]
+        self.assertEqual([(s["name"], [a["pane_id"] for a in s["agents"]]) for s in sessions],
+                         [("Main", ["w3:p1"])])
+        # Another agent's route, and the legacy route, are refused without prompting.
+        self.assertEqual(self.request("POST", "/sessions/Main/agents/wA:p1/ag-ui", self.message("x"),
+                                      token=self.tok_pricing)[0], 404)
+        self.assertEqual(self.request("POST", "/sessions/Other/agents/w1:p2/ag-ui", self.message("x"),
+                                      token=self.tok_pricing)[0], 404)
+        self.assertEqual(self.request("POST", "/ag-ui", self.message("x"), token=self.tok_pricing)[0], 404)
+        self.assertEqual(self.request("GET", "/agent", token=self.tok_pricing)[0], 404)
+        self.assertEqual(self.prompts, [])
+        status, body = self.request("POST", "/sessions/Main/agents/w3:p1/ag-ui", self.message("Hello"),
+                                    token=self.tok_pricing)
+        self.assertEqual(status, 200)
+        self.assertIn("Reply from Main/w3:p1", body)
+        self.assertEqual([(s, p) for s, p, _ in self.prompts], [("Main", "w3:p1")])
+
+    def test_route_token_scopes_request_status_and_attention(self):
+        self.use_route_tokens()
+        self.bridge.LEDGER = self.bridge.RequestLedger(str(Path(self.tmp.name) / "scoped.sqlite3"))
+        key = self.bridge.RequestLedger.key("Main", "w3:p1", "t1", "r1")
+        self.request("POST", "/sessions/Main/agents/w3:p1/ag-ui", self.message("Hello"), token=self.tok_pricing)
+        self.assertEqual(self.request("GET", f"/requests/{key}", token=self.tok_pricing)[0], 200)
+        self.assertEqual(self.request("GET", f"/requests/{key}", token=self.tok_other)[0], 404)
+        status, body = self.request("GET", "/attention", token=self.tok_other)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["offline_sessions"], [])  # Review is outside this token's scope
+
+    def test_bind_host_policy(self):
+        self.bridge.check_bind_host("127.0.0.1")
+        self.bridge.check_bind_host("100.100.1.2")
+        for bad in ("0.0.0.0", "192.168.1.5", "8.8.8.8"):
+            with self.assertRaises(ValueError):
+                self.bridge.check_bind_host(bad)
 
     def test_multi_page_instruction_reaches_herdr_without_truncation(self):
         prompt = "Please complete the following checklist.\n" + ("A" * 12000)
