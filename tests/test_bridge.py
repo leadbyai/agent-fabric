@@ -157,6 +157,22 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(list(inbox.glob("*/1-test.csv"))), 1)
         self.assertFalse((Path(self.tmp.name) / "demo" / ".openbot-inbox").exists())
 
+    def test_text_reaches_agent_outside_upload_roots_but_uploads_stay_blocked(self):
+        path = "/sessions/Main/agents/w3:p1/ag-ui"
+        root = Path(self.tmp.name)
+        self.bridge.ALLOWED_ROOTS = (str(root / "demo"),)
+        status, body = self.request("POST", path, self.message("Hello from the group"))
+        self.assertEqual(status, 200)
+        self.assertIn("RUN_FINISHED", body)
+        self.assertIn("Hello from the group", self.prompts[0][2])
+        self.assertNotIn("OPENBOT_IMAGE", self.prompts[0][2])
+        self.assertFalse((root / "pricing" / ".openbot-outbox").exists())
+
+        _, body = self.request("POST", path, self.message("With a file", "upload\n"))
+        self.assertIn("outside allowed upload roots", body)
+        self.assertEqual(len(self.prompts), 1)
+        self.assertFalse((root / "pricing" / ".openbot-inbox").exists())
+
     def test_stopped_or_unknown_agent_never_gets_prompt(self):
         status, body = self.request("POST", "/sessions/Review/agents/w1:p1/ag-ui",
                                     self.message("Hello"))
