@@ -27,10 +27,12 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from http.server import ThreadingHTTPServer
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -72,6 +74,9 @@ def env_config() -> dict:
         "timeout": int(os.environ.get("OPENBOT_BRIDGE_TIMEOUT_SECONDS", "900")),
         "approval_wait": int(os.environ.get("HERMES_APPROVAL_WAIT_SECONDS", "0")),
         "allow_native": os.environ.get("HERMES_ALLOW_NATIVE_ATTACH", "0").strip() == "1",
+        "bound_thread": os.environ.get("HERMES_BOUND_THREAD_ID", "").strip(),
+        "bound_session": os.environ.get("HERMES_BOUND_SESSION_ID", "").strip(),
+        "media_root": os.environ.get("HERMES_BRIDGE_MEDIA_ROOT", "").strip(),
         "follow_profile": os.environ.get("HERMES_FOLLOW_PROFILE_CONFIG", "1").strip() != "0",
     }
 
@@ -185,16 +190,31 @@ def stable_id(*parts: str, length: int = 32) -> str:
     return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()[:length]
 
 
+@contextmanager
+def staged_images(cache: Path, attachments):
+    """Hermes copies these disposable files into durable, content-addressed ingress on admission."""
+    with ExitStack() as cleanup:
+        images = []
+        for _, mime, data in attachments:
+            suffix = "." + bridge.image_file_type(data)[0]
+            with tempfile.NamedTemporaryFile(dir=cache, prefix="afx-", suffix=suffix, delete=False) as file:
+                cleanup.callback(Path(file.name).unlink, missing_ok=True)
+                file.write(data)
+            images.append({"path": file.name, "mime": mime})
+        yield images
+
+
 class HermesConnector:
     """The only code that imports Hermes. Tests replace it with a fake."""
 
-    def __init__(self, hermes_home: str, agent_dir: str):
+    def __init__(self, hermes_home: str, agent_dir: str, *, dedicated_profile: str | None = None):
         self.root = Path(hermes_home)
+        self.dedicated_profile = dedicated_profile
         if agent_dir and agent_dir not in sys.path:
             sys.path.insert(0, agent_dir)
 
     def profile_home(self, name: str) -> Path:
-        return self.root if name == "default" else self.root / "profiles" / name
+        return self.root if name in ("default", self.dedicated_profile) else self.root / "profiles" / name
 
     def discover(self, name: str):
         from hermes_cli.gateway_runtime import discover_gateway_endpoint  # never spawns
@@ -203,6 +223,10 @@ class HermesConnector:
     def connect(self, endpoint):
         from hermes_cli.gateway_client import connect_gateway
         return connect_gateway(endpoint)
+
+    def image_cache(self):
+        from gateway.platforms.base import get_image_cache_dir
+        return get_image_cache_dir()
 
 
 async def list_profiles(connector, allowed: tuple[str, ...]) -> dict:
@@ -282,14 +306,15 @@ class Turn:
                               prompt_id=payload.get("prompt_id"), answer="")
 
     async def handle(self, kind: str, admission: str | None, payload: dict) -> None:
-        # Session-blocking controls are answered whichever admission raised them.
+        # The TUI and bridge can share a session. Only the client that submitted a
+        # turn should observe or answer its controls. Unstamped frames cannot prove ownership.
+        if admission != self.admission:
+            return
         if kind == "approval.request" and payload.get("kind", "approval") == "approval":
             await self._deny(payload)
             return
         if kind == "clarify.request" or (kind == "approval.request" and payload.get("kind") == "clarify"):
             await self._clarify(payload)
-            return
-        if admission and admission != self.admission:
             return
         if kind == "message.delta":
             text = payload.get("text") or payload.get("delta") or ""
@@ -316,9 +341,10 @@ class Turn:
                 self.failure = str(payload.get("failure_reason") or payload.get("error") or status)[:300]
             self.final = text or self.streamed
 
-    async def run(self) -> str:
+    async def run(self, attachments=(), *, outbox: Path | None = None) -> str:
         receipt = await self.client.rpc("prompt.submit", session_id=self.session_id,
-                                        input_id=self.input_id, text=self.text)
+                                        input_id=self.input_id, text=self.text,
+                                        **({"attachments": attachments} if attachments else {}))
         self.admission = (receipt or {}).get("admission_id")
         if not self.admission:
             raise RuntimeError("Hermes did not admit the prompt")
@@ -347,11 +373,19 @@ class Turn:
             if time.monotonic() - last_beat >= HEARTBEAT_SECONDS:
                 self.emit({"type": "CUSTOM", "name": "agent-fabric.progress", "value": {"state": "working"}})
                 last_beat = time.monotonic()
-        if self.started_text:
-            self.emit({"type": "TEXT_MESSAGE_END", "messageId": self.message_id})
-        if self.failure:
-            raise RuntimeError(f"Hermes turn failed: {self.failure}")
-        return self.final
+        try:
+            if self.failure:
+                raise RuntimeError(f"Hermes turn failed: {self.failure}")
+            if outbox is not None:
+                screenshots = bridge.persist_reply_images("", outbox, mode="inline")
+                if screenshots:
+                    preview = ("\n\n" if self.final else "") + screenshots
+                    self._text(preview)
+                    self.final += preview
+            return self.final
+        finally:
+            if self.started_text:
+                self.emit({"type": "TEXT_MESSAGE_END", "messageId": self.message_id})
 
 
 def session_title(profile_id: str, thread_id: str) -> str:
@@ -393,12 +427,19 @@ def foreign_session(snapshot: dict, sent: dict) -> str | None:
 
 
 async def open_session(client, ledger: HermesLedger, profile_id: str, thread_id: str,
-                       *, allow_native: bool = False, follow_profile: bool = True) -> tuple[str, bool]:
+                       *, allow_native: bool = False, follow_profile: bool = True,
+                       bound_session: str = "") -> tuple[str, bool]:
     """The Hermes session this OpenBot thread owns: resume ours, or create a new one.
 
     A thread an operator explicitly bound to an existing native session (origin 'bound',
     e.g. one a TUI also opens by id) is resumed only when native attachment is enabled
     (HERMES_ALLOW_NATIVE_ATTACH=1, off by default). Nothing here discovers or adopts other sessions."""
+    if bound_session:
+        snapshot = await client.rpc("session.resume", session_id=bound_session, omit_messages=True,
+                                    defer_history=True)
+        if (snapshot.get("stored_session_id") or snapshot.get("session_id")) != bound_session:
+            raise PermissionError("Hermes returned a different session than the configured binding")
+        return bound_session, False
     mapping = ledger.thread_session(profile_id, thread_id)
     known = None
     if mapping:
@@ -491,9 +532,20 @@ class HermesHandler(bridge.Handler):
         except (ValueError, json.JSONDecodeError, TypeError, TimeoutError) as exc:
             self.json_response(400, {"error": str(exc)})
             return
-        if attachments:
+        media_root = self.config.get("media_root")
+        if attachments and not media_root:
             self.json_response(400, {"error": "Attachments are not supported by the Hermes backend yet",
                                      "code": "attachments_unsupported"})
+            return
+        if len(attachments) > 10 or any(
+            (kind := bridge.image_file_type(data)) is None or kind[1] != mime
+            for _, mime, data in attachments
+        ):
+            self.json_response(400, {"error": "Hermes accepts up to 10 PNG, JPEG, or WebP images"})
+            return
+        thread_id = str(body.get("threadId") or uuid.uuid4())
+        if self.config.get("bound_thread") and thread_id != self.config["bound_thread"]:
+            self.json_response(404, {"error": "not_found"})
             return
         found = self.connector.discover(name)
         if found.endpoint is None or found.state != "ready":
@@ -501,15 +553,15 @@ class HermesHandler(bridge.Handler):
                                      "code": found.reason_code or "not_ready"})
             return
         endpoint = found.endpoint
-        thread_id = str(body.get("threadId") or uuid.uuid4())
         run_id = str(body.get("runId") or uuid.uuid4())
         key = RequestLedger.key(endpoint.profile_id, "hermes", thread_id, run_id)
-        fingerprint = RequestLedger.fingerprint(text, [])
-        previous = self.ledger.get(key)
-        if previous:
-            if previous["fingerprint"] != fingerprint:
-                self.json_response(409, {"error": "Run identifier reused with different content"})
-                return
+        fingerprint = RequestLedger.fingerprint(text, attachments)
+        try:
+            previous = self.ledger.reserve(key, endpoint.profile_id, "hermes", fingerprint, run_id)
+        except ValueError:
+            self.json_response(409, {"error": "Run identifier reused with different content"})
+            return
+        if not previous["created"]:
             self.start_stream(thread_id, run_id)
             if previous["state"] == "finished":
                 self.send_reply(str(uuid.uuid4()), thread_id, run_id, previous["reply"] or "")
@@ -517,7 +569,6 @@ class HermesHandler(bridge.Handler):
                 self.send_event({"type": "RUN_ERROR", "message":
                                  f"Request {key} is already {previous['state']}. No duplicate prompt sent."})
             return
-        self.ledger.reserve(key, endpoint.profile_id, "hermes", fingerprint, run_id)
         self.start_stream(thread_id, run_id)
         detached = {"value": False}
 
@@ -533,14 +584,26 @@ class HermesHandler(bridge.Handler):
             async with self.connector.connect(endpoint) as client:
                 session_id, created = await open_session(client, self.ledger, endpoint.profile_id, thread_id,
                                                          allow_native=self.config.get("allow_native", False),
-                                                         follow_profile=self.config.get("follow_profile", True))
+                                                         follow_profile=self.config.get("follow_profile", True),
+                                                         bound_session=self.config.get("bound_session", ""))
                 emit({"type": "CUSTOM", "name": "agent-fabric.progress",
                       "value": {"state": "submitted", "session": "created" if created else "resumed"}})
-                turn = Turn(client, emit, session_id=session_id,
-                            input_id=stable_id("input", endpoint.profile_id, thread_id, run_id),
-                            text=text, timeout=self.config["timeout"],
-                            approval_wait=self.config["approval_wait"])
-                return await turn.run()
+                with ExitStack() as cleanup:
+                    images = cleanup.enter_context(staged_images(self.connector.image_cache(), attachments)) if attachments else ()
+                    outbox = None
+                    prompt = text
+                    if media_root:
+                        outbox = Path(cleanup.enter_context(tempfile.TemporaryDirectory(dir=media_root)))
+                        prompt += (
+                            "\n\nOpenBot screenshot delivery: To include a screenshot with the reply, "
+                            f"save a PNG, JPEG, or WebP file directly in {outbox.as_posix()}/. "
+                            "OpenBot attaches files from this folder automatically."
+                        )
+                    turn = Turn(client, emit, session_id=session_id,
+                                input_id=stable_id("input", endpoint.profile_id, thread_id, run_id),
+                                text=prompt, timeout=self.config["timeout"],
+                                approval_wait=self.config["approval_wait"])
+                    return await turn.run(images, outbox=outbox)
 
         try:
             reply = asyncio.run(work())
@@ -580,6 +643,15 @@ def main() -> None:
         sys.exit(str(exc))
     if not config["profiles"] or any(not PROFILE_RE.fullmatch(p) for p in config["profiles"]):
         sys.exit("Set HERMES_PROFILES to the comma-separated profiles to expose")
+    if config["bound_thread"] or config["bound_session"]:
+        if (not config["bound_thread"] or not config["bound_session"] or not config["allow_native"]
+                or len(config["profiles"]) != 1):
+            sys.exit("A pinned bridge requires native attach, a thread, a session and one dedicated HERMES_HOME")
+    if config["media_root"]:
+        root = Path(config["media_root"])
+        if (not config["bound_session"] or not root.is_absolute() or not root.is_dir()
+                or root.is_symlink() or root.stat().st_uid != os.geteuid() or root.stat().st_mode & 0o077):
+            sys.exit("Hermes screenshots require a pinned session and a private media directory owned by the bridge user")
     if not config["ledger"]:
         sys.exit("Set OPENBOT_BRIDGE_LEDGER_PATH to a private absolute path")
     if not 30 <= config["timeout"] <= 3600:
@@ -590,7 +662,10 @@ def main() -> None:
     HermesHandler.config = config
     HermesHandler.ledger = HermesLedger(config["ledger"])
     HermesHandler.ledger.trim_finished()
-    HermesHandler.connector = HermesConnector(config["hermes_home"], config["agent_dir"])
+    HermesHandler.connector = HermesConnector(
+        config["hermes_home"], config["agent_dir"],
+        dedicated_profile=config["profiles"][0] if config["bound_thread"] else None,
+    )
     server = ThreadingHTTPServer((config["host"], config["port"]), HermesHandler)
     print(f"Agent Fabric Hermes bridge {VERSION} ready on {config['host']}:{config['port']} "
           f"| profiles={len(config['profiles'])} "

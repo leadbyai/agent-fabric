@@ -61,8 +61,21 @@ Set `HERMES_FOLLOW_PROFILE_CONFIG=0` to opt out.
   Clarify prompts are answered as skipped.
 - **Tool activity:** reported as CUSTOM `agent-fabric.tool` events, not AG-UI `TOOL_CALL_*`. OpenBot
   would treat those as tools for it to run.
-- **Binding:** loopback or the host's Tailscale (100.64.0.0/10) address only. Text only for now;
-  attachments are refused with a clear error.
+- **Binding:** loopback or the host's Tailscale (100.64.0.0/10) address only.
+
+### Screenshots on a dedicated existing-session bridge
+
+Run the bridge with `HERMES_HOME` pointing to the target profile's home, a single
+`HERMES_PROFILES` route, `HERMES_ALLOW_NATIVE_ATTACH=1`, and exact
+`HERMES_BOUND_THREAD_ID` and `HERMES_BOUND_SESSION_ID` values. Setting
+`HERMES_BRIDGE_MEDIA_ROOT` to an existing private directory owned by the bridge user
+enables PNG, JPEG and WebP uploads and replies on that route. Other threads are refused.
+
+OpenBot sends inline image data and the bridge submits it through Hermes' native
+attachment admission. The bridge creates a private reply directory for each turn.
+Images saved there are embedded in the authenticated reply with the existing screenshot
+size and file checks. Identical retries replay the stored reply and changed input under
+the same run ID is refused. Deployments without a media directory retain text-only behavior.
 
 ## Install (as the profiles' Unix user; additive user service)
 ```bash

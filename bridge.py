@@ -72,6 +72,9 @@ STATE_POLL_SECONDS = 2.0
 WORKDIR = os.environ.get("OPENBOT_BRIDGE_WORKDIR", "").strip()
 ALLOWED_ROOTS = tuple(s.strip() for s in
     os.environ.get("OPENBOT_BRIDGE_ALLOWED_ROOTS", "").split(":") if s.strip())
+MEDIA_ROOT = os.environ.get("OPENBOT_BRIDGE_MEDIA_ROOT", "").strip()
+MEDIA_ROUTES = frozenset(s.strip() for s in
+    os.environ.get("OPENBOT_BRIDGE_MEDIA_ROUTES", "").split(",") if s.strip())
 AGENT_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 LOCKS_GUARD = threading.Lock()
 WAIT_QUEUES: dict[tuple[str, str], deque[object]] = {}
@@ -529,8 +532,9 @@ def private_marker_directory(root: Path, name: str, marker_id: str) -> Path:
 
 
 def stage_attachments(attachments: list[tuple[str, str, bytes]],
-                      marker_id: str, workdir: str, *, dynamic: bool = False) -> list[str]:
-    """Write into the selected agent's workdir, never a supplied HTTP path."""
+                      marker_id: str, workdir: str, *, dynamic: bool = False,
+                      absolute: bool = False) -> list[str]:
+    """Write to trusted per-agent storage, never to a supplied HTTP path."""
     if not attachments:
         return []
     root = agent_workdir(workdir, dynamic=dynamic)
@@ -548,8 +552,8 @@ def stage_attachments(attachments: list[tuple[str, str, bytes]],
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
             # Only paths and metadata go to the agent prompt, never file contents.
-        return [f".openbot-inbox/{marker_id}/{i}-{safe_filename(name)} ({mime}; {len(data)} bytes)"
-                for i, (name, mime, data) in enumerate(attachments, 1)]
+        return [f"{path if absolute else path.relative_to(root).as_posix()} ({mime}; {len(data)} bytes)"
+                for path, (_, mime, data) in zip(written, attachments)]
     except Exception:
         for path in written:
             path.unlink(missing_ok=True)
@@ -562,6 +566,16 @@ def prepare_outbox(marker_id: str, workdir: str, *, dynamic: bool = False) -> Pa
     return private_marker_directory(root, ".openbot-outbox", marker_id)
 
 
+def route_media_directory(route: str) -> Path:
+    root = agent_workdir(MEDIA_ROOT, dynamic=True).resolve(strict=True)
+    route_id = hashlib.sha256(route.encode("utf-8")).hexdigest()
+    directory = root / route_id
+    directory.mkdir(mode=0o700, exist_ok=True)
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("Unsafe route media directory")
+    return directory
+
+
 def image_file_type(data: bytes) -> tuple[str, str] | None:
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return "png", "image/png"
@@ -572,7 +586,7 @@ def image_file_type(data: bytes) -> tuple[str, str] | None:
     return None
 
 
-def persist_reply_images(reply: str, outbox: Path) -> str:
+def persist_reply_images(reply: str, outbox: Path, *, mode: str | None = None) -> str:
     """Automatically attach images placed in this request's private outbox.
 
     Default inline mode places image bytes within OpenBot's already-authenticated
@@ -581,6 +595,7 @@ def persist_reply_images(reply: str, outbox: Path) -> str:
     Legacy OPENBOT_IMAGE lines are removed when an actual image is available;
     arbitrary model-generated indentation cannot suppress delivery.
     """
+    mode = ARTIFACT_MODE if mode is None else mode
     published: list[Path] = []
     previews: list[str] = []
     total_inline = 0
@@ -605,7 +620,7 @@ def persist_reply_images(reply: str, outbox: Path) -> str:
             if ARTIFACT_MODE == "signed_url" and (not ARTIFACT_DIR or not PUBLIC_ORIGIN):
                 raise RuntimeError("Screenshot delivery is not configured on the Agent Fabric gateway")
             artifact_root: Path | None = None
-            if ARTIFACT_MODE == "signed_url":
+            if mode == "signed_url":
                 artifact_root = Path(ARTIFACT_DIR)
                 if not artifact_root.is_absolute() or artifact_root.is_symlink():
                     raise RuntimeError("Artifact directory is unsafe")
@@ -628,7 +643,7 @@ def persist_reply_images(reply: str, outbox: Path) -> str:
                 if kind is None or len(data) > MAX_FILE_SIZE:
                     raise RuntimeError("Screenshot is not a supported PNG, JPEG, or WebP image")
                 extension, mime = kind
-                if ARTIFACT_MODE == "inline":
+                if mode == "inline":
                     total_inline += len(data)
                     if (len(data) > MAX_INLINE_IMAGE_BYTES or
                             total_inline > MAX_INLINE_IMAGES_TOTAL):
@@ -1081,6 +1096,8 @@ class Handler(BaseHTTPRequestHandler):
         if not PANE_RE.fullmatch(pane_id):
             self.json_response(503, {"error": "Herdr did not identify the target pane"})
             return
+        media_route = f"{session}/{pane_id}"
+        dedicated_media = dynamic and media_route in MEDIA_ROUTES
         try:
             body = json.loads(self.read_request_body())
             # Key names, field types and lengths only; no user content or tokens.
@@ -1228,14 +1245,21 @@ class Handler(BaseHTTPRequestHandler):
                 if long_text:
                     staged_items.append(("full-user-instructions.txt", "text/plain",
                                          user_text.encode("utf-8")))
+                if dedicated_media:
+                    workdir = str(route_media_directory(media_route))
                 staged = stage_attachments(staged_items, marker_id, workdir,
-                                           dynamic=dynamic)
-                outbox = prepare_outbox(marker_id, workdir, dynamic=dynamic)
+                                           dynamic=dynamic, absolute=dedicated_media)
             except (ValueError, OSError) as exc:
                 if stream_started:
                     raise RuntimeError(f"Could not prepare attachment: {exc}") from exc
                 self.json_response(422, {"error": str(exc)})
                 return
+            try:
+                outbox = prepare_outbox(marker_id, workdir, dynamic=dynamic)
+            except (ValueError, OSError) as exc:
+                # Reply images are optional, even when this agent cannot host files.
+                outbox = None
+                self.log_message("Reply image directory unavailable (%s)", type(exc).__name__)
             if not stream_started:
                 self.start_stream(thread_id, run_id)
                 stream_started = True
@@ -1248,12 +1272,22 @@ class Handler(BaseHTTPRequestHandler):
             attachment_instructions = ""
             if staged:
                 attachment_instructions = (
-                    "\n\nThe user provided these files in your working directory. "
+                    "\n\nThe user provided these files at the paths below. "
                     "Read them with your normal file tools as needed; the files are not "
                     "included verbatim in this prompt. A file marked "
                     "source=openbot-derived-text is a reconstructed UTF-8 text copy, "
                     "not guaranteed to be byte-for-byte identical to the upload:\n" +
                     "\n".join(f"- {path}" for path in staged)
+                )
+            screenshot_instructions = ""
+            if outbox is not None:
+                screenshot_path = outbox.as_posix() if dedicated_media else f".openbot-outbox/{marker_id}"
+                screenshot_instructions = (
+                    "To return up to four screenshots, save actual PNG, JPEG, or WebP files "
+                    f"into {screenshot_path}/. The gateway automatically attaches "
+                    "the image files in that directory. No OPENBOT_IMAGE declaration or "
+                    "special reply formatting is needed. This is optional; never claim a "
+                    "screenshot was attached unless you saved the image. "
                 )
             prompt = (
                 f"[OpenBot pilot request {marker_id}]\n{user_text}"
@@ -1261,11 +1295,7 @@ class Handler(BaseHTTPRequestHandler):
                 "For this integration test, enclose your final response between "
                 "these exact lines, with no formatting around them:\n"
                 f"{begin}\n<your response>\n{end}\n"
-                "To return up to four screenshots, save actual PNG, JPEG, or WebP files "
-                f"into .openbot-outbox/{marker_id}/. The gateway automatically attaches "
-                "the image files in that directory. No OPENBOT_IMAGE declaration or "
-                "special reply formatting is needed. This is optional; never claim a "
-                "screenshot was attached unless you saved the image. Keep the response concise."
+                f"{screenshot_instructions}Keep the response concise."
             )
             if LEDGER:
                 try:
@@ -1285,7 +1315,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_submitted_event({"type": "CUSTOM", "name": "agent-fabric.request",
                                            "value": {"id": request_key, "state": "submitted"}})
             response = self.prompt_with_liveness(session, pane_id, prompt, marker_id)
-            response = persist_reply_images(response, outbox)
+            if outbox is not None:
+                response = persist_reply_images(response, outbox)
             if LEDGER:
                 LEDGER.finish(request_key, response)
                 ledger_reserved = False
@@ -1357,6 +1388,16 @@ def main() -> None:
     for root in ALLOWED_ROOTS:
         if not Path(root).is_absolute() or not Path(root).is_dir():
             sys.exit("Every OPENBOT_BRIDGE_ALLOWED_ROOTS entry must be an existing absolute directory")
+    if bool(MEDIA_ROOT) != bool(MEDIA_ROUTES):
+        sys.exit("Configure both the dedicated media root and its routes")
+    for route in MEDIA_ROUTES:
+        session, _, pane = route.partition("/")
+        if not SESSION_RE.fullmatch(session) or not PANE_RE.fullmatch(pane):
+            sys.exit("Dedicated media routes must be exact Herdr session/pane pairs")
+        try:
+            route_media_directory(route)
+        except (ValueError, OSError) as exc:
+            sys.exit(f"Dedicated media directory unavailable: {exc}")
     if TIMEOUT_MS < 1000 or TIMEOUT_MS > 600000:
         sys.exit("OPENBOT_BRIDGE_TIMEOUT_MS must be between 1000 and 600000")
     if BUSY_WAIT_SECONDS < 0 or BUSY_WAIT_SECONDS > 3600:

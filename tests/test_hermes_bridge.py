@@ -1,9 +1,11 @@
 """Offline tests for the Hermes backend. No real Hermes gateway is touched."""
 
 import asyncio
+import base64
 import contextlib
 import http.client
 import json
+import re
 import sys
 import tempfile
 import threading
@@ -208,6 +210,25 @@ class HermesBridgeTests(unittest.TestCase):
         self.assertNotIn("TOOL_CALL", data)
         self.assertEqual(data.count("agent-fabric.tool"), 2)
 
+    def test_shared_session_only_handles_controls_from_its_own_admission(self):
+        async def check():
+            events = []
+            client = FakeClient(self.gateway)
+            turn = hermes_bridge.Turn(client, events.append, session_id="native", input_id="input",
+                                      text="hello", timeout=30, approval_wait=0)
+            turn.admission = "ours"
+            foreign = {"prompt_id": "foreign", "execution_generation": 1, "choices": ["deny"]}
+            await turn.handle("approval.request", "tui", foreign)
+            await turn.handle("clarify.request", None, foreign)
+            await turn.handle("message.complete", "tui", {"text": "TUI message"})
+            self.assertEqual(self.gateway.calls, [])
+            self.assertEqual(events, [])
+            self.assertIsNone(turn.final)
+            await turn.handle("approval.request", "ours", foreign)
+            self.assertEqual([method for method, _ in self.gateway.calls], ["approval.respond"])
+
+        asyncio.run(check())
+
     def test_other_sessions_events_are_ignored(self):
         def script(sid, adm):
             return [("message.delta", {"text": "LEAK"}),
@@ -259,6 +280,60 @@ class HermesBridgeTests(unittest.TestCase):
         data = self.run_turn(thread="bound-thread", run="r2")[1]
         self.assertIn("RUN_FINISHED", data)
         self.assertEqual(self.gateway.sessions["NATIVE"], ["hi"])
+        self.assertEqual(self.gateway.created, 0)
+
+    def test_pinned_screenshot_roundtrip_and_replay(self):
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/"
+            "5XcAAAAASUVORK5CYII="
+        )
+        media = Path(self.ledger.path).parent / "media"
+        cache = media / "cache"
+        cache.mkdir(parents=True)
+        self.gateway.image_cache = lambda: cache
+        self.gateway.sessions["NATIVE"] = []
+        self.server.RequestHandlerClass.config.update(
+            bound_thread="pinned", bound_session="NATIVE", allow_native=True, media_root=str(media),
+        )
+
+        def reply(sid, admission):
+            params = self.gateway.calls[-1][1]
+            assert params["attachments"][0]["mime"] == "image/png"
+            assert Path(params["attachments"][0]["path"]).read_bytes() == png
+            path = Path(re.search(r"directly in (.*?)/\. OpenBot", params["text"])[1])
+            (path / "reply.png").write_bytes(png)
+            return [("message.delta", {"text": "I read it"}),
+                    ("message.complete", {"text": "I read it", "status": "complete"})]
+
+        self.gateway.script = reply
+        body = {"threadId": "pinned", "runId": "media", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Read the image"},
+            {"type": "image", "source": {"type": "data", "mimeType": "image/png",
+                                         "value": base64.b64encode(png).decode()}},
+        ]}]}
+        route = "/profiles/pilot/ag-ui"
+        for _ in range(2):
+            status, data = self.request("POST", route, body)
+            self.assertEqual(status, 200)
+            self.assertIn("RUN_FINISHED", data)
+            self.assertIn("data:image/png;base64,", data)
+        body["messages"][0]["content"][1]["source"]["value"] = base64.b64encode(png + b"changed").decode()
+        self.assertEqual(self.request("POST", route, body)[0], 409)
+        self.assertEqual(len(self.gateway.sessions["NATIVE"]), 1)
+        self.assertEqual(list(media.iterdir()), [cache])
+        self.assertEqual(list(cache.iterdir()), [])
+
+    def test_pinned_bridge_accepts_only_its_exact_thread_and_existing_session(self):
+        self.gateway.sessions["NATIVE"] = []
+        self.server.RequestHandlerClass.config.update(
+            bound_thread="bound-thread", bound_session="NATIVE", allow_native=True,
+        )
+        self.assertEqual(self.run_turn(thread="other-thread")[0], 404)
+        self.assertEqual(self.gateway.calls, [])
+        self.assertIn("RUN_FINISHED", self.run_turn(thread="bound-thread")[1])
+        self.assertEqual(self.gateway.sessions["NATIVE"], ["hi"])
+        del self.gateway.sessions["NATIVE"]
+        self.assertIn("RUN_ERROR", self.run_turn(thread="bound-thread", run="r2")[1])
         self.assertEqual(self.gateway.created, 0)
 
     def test_hash_only_bearer(self):
