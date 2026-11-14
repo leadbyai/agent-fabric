@@ -210,6 +210,25 @@ class HermesBridgeTests(unittest.TestCase):
         self.assertNotIn("TOOL_CALL", data)
         self.assertEqual(data.count("agent-fabric.tool"), 2)
 
+    def test_shared_session_only_handles_controls_from_its_own_admission(self):
+        async def check():
+            events = []
+            client = FakeClient(self.gateway)
+            turn = hermes_bridge.Turn(client, events.append, session_id="native", input_id="input",
+                                      text="hello", timeout=30, approval_wait=0)
+            turn.admission = "ours"
+            foreign = {"prompt_id": "foreign", "execution_generation": 1, "choices": ["deny"]}
+            await turn.handle("approval.request", "tui", foreign)
+            await turn.handle("clarify.request", None, foreign)
+            await turn.handle("message.complete", "tui", {"text": "TUI message"})
+            self.assertEqual(self.gateway.calls, [])
+            self.assertEqual(events, [])
+            self.assertIsNone(turn.final)
+            await turn.handle("approval.request", "ours", foreign)
+            self.assertEqual([method for method, _ in self.gateway.calls], ["approval.respond"])
+
+        asyncio.run(check())
+
     def test_other_sessions_events_are_ignored(self):
         def script(sid, adm):
             return [("message.delta", {"text": "LEAK"}),

@@ -306,14 +306,15 @@ class Turn:
                               prompt_id=payload.get("prompt_id"), answer="")
 
     async def handle(self, kind: str, admission: str | None, payload: dict) -> None:
-        # Session-blocking controls are answered whichever admission raised them.
+        # The TUI and bridge can share a session. Only the client that submitted a
+        # turn should observe or answer its controls. Unstamped frames cannot prove ownership.
+        if admission != self.admission:
+            return
         if kind == "approval.request" and payload.get("kind", "approval") == "approval":
             await self._deny(payload)
             return
         if kind == "clarify.request" or (kind == "approval.request" and payload.get("kind") == "clarify"):
             await self._clarify(payload)
-            return
-        if admission and admission != self.admission:
             return
         if kind == "message.delta":
             text = payload.get("text") or payload.get("delta") or ""
