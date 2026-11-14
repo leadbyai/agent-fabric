@@ -152,6 +152,31 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual([event["content"] for event in self.received[-1]["events"]],
                          ["pre-opt-in", "a question", "an answer"])
 
+    def test_discord_sync_requires_an_explicit_pinned_origin(self):
+        file = self.root / "discord.db"
+        ledger = self.root / "cursor.db"
+        binding = {"bot_id": "beck", "install_id": "host", "profile_id": "beck", "root_id": "dm"}
+        with contextlib.closing(sqlite3.connect(file)) as db, db:
+            db.executescript(
+                "CREATE TABLE sessions(id, source, created_source, end_reason, parent_session_id);"
+                "CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id, role, content, timestamp, "
+                "message_uid, active, _compressed_summary, display_kind, compacted);"
+                "INSERT INTO sessions VALUES ('dm','discord','discord',NULL,NULL);"
+                "INSERT INTO sessions VALUES ('other','discord','discord',NULL,NULL);"
+                "INSERT INTO messages VALUES (1,'dm','user','old DM',100,'uid-1',1,0,NULL,0);"
+            )
+        with self.assertRaises(SourceUnavailable):
+            sync_hermes(file, ledger, self.client, **binding)
+        self.assertFalse(sync_hermes(file, ledger, self.client, root_origin="discord", **binding))
+        with contextlib.closing(sqlite3.connect(file)) as db, db:
+            db.executescript(
+                "INSERT INTO messages VALUES (2,'other','user','other DM',200,'uid-2',1,0,NULL,0);"
+                "INSERT INTO messages VALUES (3,'dm','user','pilot DM',200,'uid-3',1,0,NULL,0);"
+            )
+        self.assertTrue(sync_hermes(file, ledger, self.client, root_origin="discord", **binding))
+        self.assertFalse(sync_hermes(file, ledger, self.client, root_origin="discord", **binding))
+        self.assertEqual([e["content"] for e in self.stored.values()], ["pilot DM"])
+
     def test_historical_preview_then_apply_is_resumable_and_deduplicated(self):
         file = self.root / "history.jsonl"
         binding = Binding("bot-fixture", "staging", "w1:p1", self.root, self.root, SID, "Terminal")

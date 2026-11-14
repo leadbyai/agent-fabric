@@ -1,4 +1,4 @@
-"""Mirror an explicitly bound native Hermes CLI/TUI conversation to OpenBot.
+"""Mirror an explicitly bound native Hermes conversation to OpenBot.
 
 Use durable transcript rows as the read cursor. The gateways' in-memory replay
 sequence resets on restart and cannot recover a truncated replay on its own.
@@ -22,12 +22,13 @@ from external_sync_events import ImportEvent, redact_content
 from external_sync_watcher import ImportClient, ImportFailed, SourceUnavailable
 
 
-def _lineage(db, root_id):
+def _lineage(db, root_id, root_origin=None):
     root = db.execute(
         "SELECT id, source, COALESCE(created_source, source) AS origin, end_reason "
         "FROM sessions WHERE id=?", (root_id,),
     ).fetchone()
-    if root is None or root["origin"] not in ("cli", "tui"):
+    allowed = ("cli", "tui") if root_origin is None else (root_origin,)
+    if root is None or root["origin"] not in allowed or root_origin not in (None, "discord"):
         raise SourceUnavailable("binding does not identify a native Hermes session")
     origin = root["origin"]
     chain = [root["id"]]
@@ -66,7 +67,7 @@ def _event(row, install_id, profile_id, root_id):
 
 
 def sync_hermes(source_path, ledger_path, client, *, bot_id, install_id, profile_id, root_id,
-                backfill_on_first_start=False):
+                backfill_on_first_start=False, root_origin=None):
     """Advance the native row position only after all corresponding IDs are acknowledged."""
     binding = (bot_id, install_id, profile_id, root_id)
     source_path = source_path.resolve(strict=True)
@@ -76,7 +77,7 @@ def sync_hermes(source_path, ledger_path, client, *, bot_id, install_id, profile
         source.row_factory = sqlite3.Row
         source.execute("PRAGMA query_only=ON")
         source.execute("BEGIN")
-        chain = _lineage(source, root_id)
+        chain = _lineage(source, root_id, root_origin)
         placeholders = ",".join("?" for _ in chain)
         tip = source.execute(
             f"SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id IN ({placeholders})",
@@ -150,6 +151,7 @@ def main():
                 bot_id=config["botId"], install_id=config["installId"],
                 profile_id=config["profileId"], root_id=config["sessionId"],
                 backfill_on_first_start=config.get("backfillOnFirstStart") is True,
+                root_origin=config.get("rootOrigin"),
             )
             delay = 2
             if not progressed:

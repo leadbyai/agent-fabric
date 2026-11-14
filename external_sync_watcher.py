@@ -27,6 +27,7 @@ from external_sync_cursor import CursorConflict, CursorLedger, SourceChanged
 LOG = logging.getLogger(__name__)
 SESSION_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 MAX_REQUEST_BYTES = 128_000
+SYNC_USER_AGENT = "AgentFabricSync/1.0"
 
 
 class SourceUnavailable(RuntimeError):
@@ -175,6 +176,7 @@ class ImportClient:
         request = Request(
             self.url, method="POST", data=self._body(bot_id, events),
             headers={"Content-Type": "application/json",
+                     "User-Agent": SYNC_USER_AGENT,
                      "Authorization": "Bearer " + self.secret},
         )
         try:

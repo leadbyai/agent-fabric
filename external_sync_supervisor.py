@@ -14,7 +14,7 @@ import time
 from urllib.parse import urlsplit
 from urllib.request import Request, build_opener
 
-from external_sync_watcher import NoRedirect
+from external_sync_watcher import NoRedirect, SYNC_USER_AGENT
 
 
 def fetch_manifest(origin, secret):
@@ -24,7 +24,8 @@ def fetch_manifest(origin, secret):
         raise ValueError("enrollment origin must be a bare HTTPS origin")
     request = Request(
         origin.rstrip("/") + "/api/agent-fabric/enrollments",
-        headers={"Authorization": "Bearer " + secret, "Accept": "application/json"},
+        headers={"Authorization": "Bearer " + secret, "Accept": "application/json",
+                 "User-Agent": SYNC_USER_AGENT},
     )
     with build_opener(NoRedirect()).open(request, timeout=10) as response:
         raw = response.read(1_000_001)
@@ -58,6 +59,8 @@ def desired_sources(manifest):
         }
         if not all(entry.get(field) for field in (*fingerprints[kind], "openbotOrigin")):
             raise ValueError("incomplete native binding")
+        if entry.get("rootOrigin") is not None and (kind != "hermes" or entry["rootOrigin"] != "discord"):
+            raise ValueError("unsupported native root origin")
         physical_source = (kind, sid, *(entry[field] for field in fingerprints[kind]))
         if physical_source in claimed_sources:
             raise ValueError("source claimed by multiple bots")
