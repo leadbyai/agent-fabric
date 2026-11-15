@@ -5,8 +5,9 @@ set -euo pipefail
 
 RELEASE_VERSION="v0.7.0-rc4"
 RELEASE_URL="https://raw.githubusercontent.com/leadbyai/agent-fabric/${RELEASE_VERSION}"
-BRIDGE_SHA256="cd842baca6927da3d07094ff2dda31cefe040424eba76ef4a4c46b8333c06240"
+BRIDGE_SHA256="daf0cfa9c7a7d6cce37db7ca98d01144b5e63e947ab6deb4ed8ff09f1dc31e05"
 LEDGER_SHA256="c675b60a26a462690361951e6569848831f3efecf15577bb34dcb71babf2f49d"
+MODEL_SHA256="2a9d74a3f3eb96190f68157d543fab365c0c3b0eafa0d775e7b2505f7924b1c2"
 RUN_USER=""
 HERDR_SESSIONS=""
 UPLOAD_ROOTS=""
@@ -149,6 +150,7 @@ HERDR_EXEC="$RUN_HOME/.local/bin/herdr"
 if [[ -n "$SOURCE_DIR" ]]; then
   [[ -f "$SOURCE_DIR/bridge.py" ]] || die "Missing bridge.py in source directory"
   [[ -f "$SOURCE_DIR/request_ledger.py" ]] || die "Missing request_ledger.py in source directory"
+  [[ -f "$SOURCE_DIR/model_control.py" ]] || die "Missing model_control.py in source directory"
 fi
 
 APP_DIR="/opt/openbot-herdr-bridge"
@@ -170,25 +172,31 @@ install -d -o "$RUN_USER" -g "$(id -gn "$RUN_USER")" -m 0700 "$STATE_DIR"
 install -d -o "$RUN_USER" -g "$(id -gn "$RUN_USER")" -m 0700 "$ARTIFACT_DIR"
 TEMP_FILE="$(mktemp "$APP_DIR/.bridge.py.XXXXXX")"
 TEMP_LEDGER="$(mktemp "$APP_DIR/.request_ledger.py.XXXXXX")"
-trap 'test ! -e "$TEMP_FILE" || rm -f -- "$TEMP_FILE"; test ! -e "$TEMP_LEDGER" || rm -f -- "$TEMP_LEDGER"' EXIT
+TEMP_MODEL="$(mktemp "$APP_DIR/.model_control.py.XXXXXX")"
+trap 'test ! -e "$TEMP_FILE" || rm -f -- "$TEMP_FILE"; test ! -e "$TEMP_LEDGER" || rm -f -- "$TEMP_LEDGER"; test ! -e "$TEMP_MODEL" || rm -f -- "$TEMP_MODEL"' EXIT
 if [[ -n "$SOURCE_DIR" ]]; then
   cp -- "$SOURCE_DIR/bridge.py" "$TEMP_FILE"
   cp -- "$SOURCE_DIR/request_ledger.py" "$TEMP_LEDGER"
+  cp -- "$SOURCE_DIR/model_control.py" "$TEMP_MODEL"
 else
   command -v curl >/dev/null || die "curl required"
   curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --max-time 30 \
     "$RELEASE_URL/bridge.py" -o "$TEMP_FILE"
   curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --max-time 30 \
     "$RELEASE_URL/request_ledger.py" -o "$TEMP_LEDGER"
+  curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --max-time 30 \
+    "$RELEASE_URL/model_control.py" -o "$TEMP_MODEL"
 fi
 
-if [[ "$BRIDGE_SHA256" != __BRIDGE_SHA256__ && "$LEDGER_SHA256" != __LEDGER_SHA256__ ]]; then
+if [[ "$BRIDGE_SHA256" != __BRIDGE_SHA256__ && "$LEDGER_SHA256" != __LEDGER_SHA256__ &&
+      "$MODEL_SHA256" != __MODEL_SHA256__ ]]; then
   printf '%s  %s\n' "$BRIDGE_SHA256" "$TEMP_FILE" | sha256sum -c - >/dev/null || die "Bridge SHA256 mismatch"
   printf '%s  %s\n' "$LEDGER_SHA256" "$TEMP_LEDGER" | sha256sum -c - >/dev/null || die "Ledger SHA256 mismatch"
+  printf '%s  %s\n' "$MODEL_SHA256" "$TEMP_MODEL" | sha256sum -c - >/dev/null || die "Model control SHA256 mismatch"
 elif [[ -z "$SOURCE_DIR" ]]; then
   die "Release checksum not finalized; use a signed release or --source-dir"
 fi
-python3 -m py_compile "$TEMP_FILE" "$TEMP_LEDGER" || die "Gateway code did not compile"
+python3 -m py_compile "$TEMP_FILE" "$TEMP_LEDGER" "$TEMP_MODEL" || die "Gateway code did not compile"
 BACKUP_STAMP="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 if [[ -f "$APP_DIR/bridge.py" ]]; then
   cp -p -- "$APP_DIR/bridge.py" "$APP_DIR/bridge.py.bak.$BACKUP_STAMP"
@@ -196,8 +204,12 @@ fi
 if [[ -f "$APP_DIR/request_ledger.py" ]]; then
   cp -p -- "$APP_DIR/request_ledger.py" "$APP_DIR/request_ledger.py.bak.$BACKUP_STAMP"
 fi
+if [[ -f "$APP_DIR/model_control.py" ]]; then
+  cp -p -- "$APP_DIR/model_control.py" "$APP_DIR/model_control.py.bak.$BACKUP_STAMP"
+fi
 install -m 0755 "$TEMP_FILE" "$APP_DIR/bridge.py"
 install -m 0644 "$TEMP_LEDGER" "$APP_DIR/request_ledger.py"
+install -m 0644 "$TEMP_MODEL" "$APP_DIR/model_control.py"
 
 CREDENTIAL_ENV='OPENBOT_BRIDGE_TOKEN_FILE=%d/bridge.token'
 CREDENTIAL_LOAD="bridge.token:$CONF_DIR/bridge.token"
@@ -229,7 +241,7 @@ else
 fi
 
 CONFIG_TEMP="$(mktemp "$CONF_DIR/.config.env.XXXXXX")"
-trap 'test ! -e "$CONFIG_TEMP" || rm -f -- "$CONFIG_TEMP"; test ! -e "$TEMP_FILE" || rm -f -- "$TEMP_FILE"; test ! -e "$TEMP_LEDGER" || rm -f -- "$TEMP_LEDGER"' EXIT
+trap 'test ! -e "$CONFIG_TEMP" || rm -f -- "$CONFIG_TEMP"; test ! -e "$TEMP_FILE" || rm -f -- "$TEMP_FILE"; test ! -e "$TEMP_LEDGER" || rm -f -- "$TEMP_LEDGER"; test ! -e "$TEMP_MODEL" || rm -f -- "$TEMP_MODEL"' EXIT
 if [[ -f "$CONF_DIR/config.env" ]]; then
   cp -p -- "$CONF_DIR/config.env" "$CONF_DIR/config.env.bak.$BACKUP_STAMP"
 fi
@@ -304,6 +316,11 @@ if ((SKIP_START == 0)); then
       cp -p -- "$UNIT_FILE.bak.$BACKUP_STAMP" "$UNIT_FILE"
       if [[ -f "$APP_DIR/request_ledger.py.bak.$BACKUP_STAMP" ]]; then
         cp -p -- "$APP_DIR/request_ledger.py.bak.$BACKUP_STAMP" "$APP_DIR/request_ledger.py"
+      fi
+      if [[ -f "$APP_DIR/model_control.py.bak.$BACKUP_STAMP" ]]; then
+        cp -p -- "$APP_DIR/model_control.py.bak.$BACKUP_STAMP" "$APP_DIR/model_control.py"
+      else
+        rm -f -- "$APP_DIR/model_control.py"  # the restored bridge predates it
       fi
       systemctl daemon-reload
       systemctl restart openbot-herdr-gateway.service || true
