@@ -69,6 +69,29 @@ def write_catalogues(home: Path) -> None:
     (codex / "models_cache.json").write_text(json.dumps({"client_version": "0.169.0", "models": rows}))
 
 
+def write_proc(proc: Path, pid: int, ppid: int, *, uid: int | None = None, environ=None, start: int = 100,
+               name: str = "claude") -> None:
+    """A minimal /proc/<pid> (stat, status, environ) as model_control.agent_profile reads it."""
+    uid = os.getuid() if uid is None else uid
+    entry = proc / str(pid)
+    entry.mkdir(parents=True, exist_ok=True)
+    (entry / "stat").write_text(f"{pid} ({name}) S {ppid} " + " ".join(["0"] * 17) + f" {start} 0 0\n")
+    uids = uid if isinstance(uid, tuple) else (uid,) * 4
+    (entry / "status").write_text(f"Name:\t{name}\nUid:\t" + "\t".join(map(str, uids)) + "\n")
+    if environ is not None:
+        raw = environ if isinstance(environ, bytes) else b"\0".join(
+            f"{k}={v}".encode() for k, v in environ.items()) + b"\0"
+        (entry / "environ").write_bytes(raw)
+
+
+def process_info(pane: str, shell: int, *pids, name: str = "claude") -> dict:
+    """Herdr 0.9.5 `pane process-info --pane <pane>` output."""
+    return {"id": "cli:pane:process_info", "result": {"type": "pane_process_info", "process_info": {
+        "pane_id": pane, "shell_pid": shell, "foreground_process_group_id": pids[0] if pids else shell,
+        "foreground_processes": [{"pid": pid, "name": name, "argv": [name], "cmdline": name, "cwd": "/"}
+                                 for pid in pids]}}}
+
+
 class FakeClaude:
     """Claude Code's prompt and `/model` menu, as far as the switch uses them."""
 
@@ -445,6 +468,111 @@ class ModelControlTests(unittest.TestCase):
             driver("codex").switch(pane, option, effort)
 
 
+class AgentProfileTests(unittest.TestCase):
+    """Which profile an agent's CLI runs under: read from the pane's own foreground process, exactly."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.proc = Path(self.tmp.name) / "proc"
+        self.uid = os.getuid()
+        write_proc(self.proc, 500, 1, name="bash")
+        write_proc(self.proc, 600, 500, environ={"HOME": "/home/u", "CLAUDE_CONFIG_DIR": "/home/u/.claude-x",
+                                                 "API_TOKEN": "never-read", "PATH": "/usr/bin"})
+
+    def profile(self, info=None, kind="claude", **kwargs):
+        kwargs.setdefault("home_of", lambda uid: "/home/fallback")
+        return mc.agent_profile(kind, info or process_info("w1:p1", 500, 600, name=kind), pane_id="w1:p1",
+                                uid=self.uid, proc=self.proc, **kwargs)
+
+    def test_reads_only_the_profile_keys(self):
+        self.assertEqual(self.profile(), {"HOME": "/home/u", "CLAUDE_CONFIG_DIR": "/home/u/.claude-x"})
+
+    def test_default_profile_when_config_dir_is_absent(self):
+        write_proc(self.proc, 600, 500, environ={"HOME": "/home/u", "PATH": "/usr/bin"})
+        self.assertEqual(self.profile(), {"HOME": "/home/u"})
+
+    def test_passwd_home_when_home_is_absent(self):
+        write_proc(self.proc, 600, 500, environ={"PATH": "/usr/bin"})
+        self.assertEqual(self.profile(), {"HOME": "/home/fallback"})
+
+    def test_deeper_descendant_of_the_pane_shell(self):
+        write_proc(self.proc, 550, 500, name="sh")
+        write_proc(self.proc, 600, 550, environ={"HOME": "/home/u"})
+        self.assertEqual(self.profile(), {"HOME": "/home/u"})
+
+    def test_codex_reads_codex_home_not_claude_config(self):
+        write_proc(self.proc, 600, 500, name="codex",
+                   environ={"HOME": "/home/u", "CODEX_HOME": "/srv/codex", "CLAUDE_CONFIG_DIR": "/x"})
+        self.assertEqual(self.profile(kind="codex"), {"HOME": "/home/u", "CODEX_HOME": "/srv/codex"})
+
+    def test_other_kinds_are_unsupported_not_unknown(self):
+        with self.assertRaises(mc.Unsupported) as caught:
+            self.profile(kind="gemini")
+        self.assertNotIsInstance(caught.exception, mc.ProfileUnknown)
+
+    def test_accepts_herdr_envelope_or_bare_result(self):
+        self.assertEqual(self.profile(process_info("w1:p1", 500, 600)["result"])["HOME"], "/home/u")
+
+    def test_fails_closed(self):
+        cases = {
+            "another pane": process_info("w1:p9", 500, 600),
+            "no CLI process": process_info("w1:p1", 500),
+            "two CLI processes": process_info("w1:p1", 500, 600, 601),
+            "CLI under another name": process_info("w1:p1", 500, 600, name="node"),
+            "pid not an int": process_info("w1:p1", 500, True),
+            "garbage": {"result": {"process_info": "x"}},
+        }
+        for label, info in cases.items():
+            with self.subTest(label), self.assertRaises(mc.ProfileUnknown):
+                mc.agent_profile("claude", info, pane_id="w1:p1", uid=self.uid, proc=self.proc,
+                                 home_of=lambda uid: "/home/fallback")
+
+    def test_fails_closed_on_process_doubt(self):
+        edits = {
+            "another user": dict(uid=self.uid + 1, environ={"HOME": "/home/u"}),
+            "setuid (mixed uids)": dict(uid=(self.uid, self.uid + 1, self.uid, self.uid), environ={"HOME": "/home/u"}),
+            "not under the pane shell": dict(ppid=1, environ={"HOME": "/home/u"}),
+            "environ unreadable": dict(environ=None),
+            "relative config dir": dict(environ={"HOME": "/home/u", "CLAUDE_CONFIG_DIR": "rel/dir"}),
+            "empty config dir": dict(environ={"HOME": "/home/u", "CLAUDE_CONFIG_DIR": ""}),
+            "empty home": dict(environ={"HOME": ""}),
+            "duplicated key": dict(environ=b"HOME=/a\0HOME=/b\0"),
+            "undecodable value": dict(environ=b"HOME=/home/\xff\0"),
+            "oversized environ": dict(environ=b"X=" + b"y" * (mc.MAX_ENVIRON_BYTES + 1)),
+        }
+        for label, edit in edits.items():
+            with self.subTest(label):
+                if (self.proc / "600").exists():
+                    for child in (self.proc / "600").iterdir():
+                        child.unlink()
+                write_proc(self.proc, 600, edit.pop("ppid", 500), **edit)
+                with self.assertRaises(mc.ProfileUnknown):
+                    self.profile()
+
+    def test_ancestry_loop_is_bounded(self):
+        write_proc(self.proc, 700, 701, name="x")
+        write_proc(self.proc, 701, 700, name="y")
+        write_proc(self.proc, 600, 700, environ={"HOME": "/home/u"})
+        with self.assertRaises(mc.ProfileUnknown):
+            self.profile()
+
+    def test_vanished_process(self):
+        with self.assertRaises(mc.ProfileUnknown):
+            self.profile(process_info("w1:p1", 500, 4242))
+
+    def test_pid_reused_while_read(self):
+        real, calls = mc._proc_stat, []
+
+        def changing(proc, pid):
+            parent, start = real(proc, pid)
+            calls.append(pid)
+            return parent, start + (calls.count(600) > 1)
+
+        with patch.object(mc, "_proc_stat", changing), self.assertRaises(mc.ProfileUnknown):
+            self.profile()
+
+
 class ModelRouteTests(unittest.TestCase):
     """GET/PUT /sessions/<s>/agents/<pane>/model through the gateway's real handler."""
 
@@ -453,15 +581,39 @@ class ModelRouteTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
         write_catalogues(root)
-        self.panes = {"w1:p1": FakeClaude(), "w1:p2": FakeCodex()}
+        # A second Claude profile on the same host (CLAUDE_CONFIG_DIR), offering a different list.
+        self.other_profile = root / "other-profile"
+        other = self.other_profile / "cache" / "model-catalog"
+        other.mkdir(parents=True)
+        other_models = [{"id": "claude-haiku-5-5", "name": "Haiku 5.5", "section": "main",
+                         "runtime": {"effort_levels": LEVELS, "default_effort": "low"}}]
+        (other / "b-cc.json").write_text(json.dumps({"catalog": {"config": {"models": other_models}}}))
+        self.panes = {"w1:p1": FakeClaude(), "w1:p2": FakeCodex(), "w1:p4": FakeClaude(model="Haiku 5.5")}
         self.roster = [
             {"pane_id": "w1:p1", "agent": "claude", "agent_status": "idle", "cwd": str(root),
              "agent_session": {"value": "c-1"}},
             {"pane_id": "w1:p2", "agent": "codex", "agent_status": "idle", "cwd": str(root),
              "agent_session": {"value": "x-1"}},
             {"pane_id": "w1:p3", "agent": "gemini", "agent_status": "idle", "cwd": str(root)},
+            {"pane_id": "w1:p4", "agent": "claude", "agent_status": "idle", "cwd": str(root),
+             "agent_session": {"value": "c-4"}},
         ]
-        env = {"HOME": str(root), "HERDR_SESSIONS": "Main", "OPENBOT_BRIDGE_TOKEN": "Z" * 48,
+        # Each pane's foreground CLI: its own HOME / CLAUDE_CONFIG_DIR, under the pane's shell.
+        self.proc = root / "proc"
+        for shell, pid, kind, environ in ((101, 201, "claude", {"HOME": str(root)}),
+                                          (102, 202, "codex", {"HOME": str(root)}),
+                                          (104, 204, "claude", {"HOME": str(root),
+                                                                "CLAUDE_CONFIG_DIR": str(self.other_profile)})):
+            write_proc(self.proc, shell, 1, name="bash")
+            write_proc(self.proc, pid, shell, name=kind, environ=environ)
+        self.procinfo = {"w1:p1": process_info("w1:p1", 101, 201),
+                         "w1:p2": process_info("w1:p2", 102, 202, name="codex"),
+                         "w1:p3": process_info("w1:p3", 103),
+                         "w1:p4": process_info("w1:p4", 104, 204)}
+        # The gateway's own HOME has no model cache: it must never be the fallback.
+        gateway_home = root / "gateway-home"
+        gateway_home.mkdir()
+        env = {"HOME": str(gateway_home), "HERDR_SESSIONS": "Main", "OPENBOT_BRIDGE_TOKEN": "Z" * 48,
                "OPENBOT_BRIDGE_ALLOWED_ROOTS": str(root)}
         self.env_patch = patch.dict(os.environ, env)
         self.env_patch.start()
@@ -470,6 +622,7 @@ class ModelRouteTests(unittest.TestCase):
         self.bridge = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.bridge)
         self.bridge.command = self.fake_command
+        self.bridge.PROC_ROOT = self.proc
         mc.POLL_SECONDS = 0.0
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self.bridge.Handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -482,6 +635,11 @@ class ModelRouteTests(unittest.TestCase):
             return json.dumps({"result": {"agents": self.roster}})
         if args[:2] == ("agent", "get"):
             return json.dumps({"result": {"agent": next(a for a in self.roster if a["pane_id"] == args[2])}})
+        if args[:3] == ("pane", "process-info", "--pane"):
+            info = self.procinfo[args[3]]
+            if isinstance(info, Exception):
+                raise info
+            return json.dumps(info)
         pane = self.panes[args[2]]
         if args[:2] == ("agent", "read"):
             if args[3:] == ("--source", "visible", "--format", "ansi"):
@@ -577,6 +735,43 @@ class ModelRouteTests(unittest.TestCase):
         self.bridge.ROUTE_HASHES = {("Main", "w1:p2"): __import__("hashlib").sha256(token.encode()).hexdigest()}
         self.assertEqual(self.call("GET", "/sessions/Main/agents/w1:p1/model", token=token)[0], 404)
         self.assertEqual(self.call("GET", "/sessions/Main/agents/w1:p2/model", token=token)[0], 200)
+
+    def test_each_claude_pane_gets_its_own_profiles_models(self):
+        _, first = self.call("GET", "/sessions/Main/agents/w1:p1/model")
+        _, second = self.call("GET", "/sessions/Main/agents/w1:p4/model")
+        self.assertIn("claude-fable-5-2", [m["id"] for m in first["models"]])
+        self.assertEqual([m["id"] for m in second["models"]], ["claude-haiku-5-5"])
+        self.assertTrue(first["switchable"] and second["switchable"])
+
+    def test_switch_is_validated_against_the_panes_own_profile(self):
+        status, _ = self.call("PUT", "/sessions/Main/agents/w1:p4/model", {"model": "claude-fable-5-2"})
+        self.assertEqual(status, 422)  # offered by the other profile, not by this agent's
+        self.assertEqual(self.panes["w1:p4"].model, "Haiku 5.5")
+
+    def test_unknown_profile_refuses_untouched_and_never_uses_gateway_env(self):
+        doubts = {
+            "Herdr cannot report the process": RuntimeError("Herdr command failed"),
+            "two CLI processes": process_info("w1:p1", 101, 201, 205),
+            "Herdr answers for another pane": process_info("w1:p4", 104, 204),
+            "CLI not under this pane's shell": process_info("w1:p1", 101, 204),
+            "not a Claude process": process_info("w1:p1", 101, 201, name="node"),
+        }
+        for label, info in doubts.items():
+            with self.subTest(label):
+                self.procinfo["w1:p1"] = info
+                status, body = self.call("GET", "/sessions/Main/agents/w1:p1/model?refresh=1")
+                self.assertEqual((status, body["switchable"], body["models"]), (200, False, []))
+                self.assertTrue(body["reason"])
+                status, _ = self.call("PUT", "/sessions/Main/agents/w1:p1/model", {"model": "claude-haiku-5-5"})
+                self.assertEqual(status, 501)
+                self.assertEqual((self.panes["w1:p1"].model, self.panes["w1:p1"].menu), ("Opus 5.5", None))
+                self.assertIsNone(self.panes["w1:p1"].saved_default)
+
+    def test_process_of_another_user_is_refused(self):
+        write_proc(self.proc, 201, 101, uid=os.getuid() + 1, environ={"HOME": str(self.other_profile)})
+        status, _ = self.call("PUT", "/sessions/Main/agents/w1:p1/model", {"model": "claude-haiku-5-5"})
+        self.assertEqual(status, 501)
+        self.assertEqual(self.panes["w1:p1"].model, "Opus 5.5")
 
     def test_switch_can_be_turned_off(self):
         self.bridge.MODEL_SWITCH = False

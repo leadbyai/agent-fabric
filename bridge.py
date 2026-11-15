@@ -116,6 +116,7 @@ MODEL_ROUTE = re.compile(r"/sessions/([A-Za-z0-9][A-Za-z0-9_-]{0,63})/agents/(w[
 MODEL_SWITCH = os.environ.get("OPENBOT_BRIDGE_MODEL_SWITCH", "on").strip().lower() != "off"
 MODEL_CACHE_SECONDS = 600.0
 MAX_MODEL_BODY = 4096
+PROC_ROOT = Path("/proc")  # where each agent's own CLI profile is read from (model_control.agent_profile)
 ALL_ROUTES = "*"  # scope of a bridge-wide credential
 
 
@@ -287,6 +288,19 @@ class HerdrPane:
         command("agent", "prompt", self.pane_id, text, session=self.session)
 
 
+def agent_catalogue(session: str, pane_id: str, kind: str) -> list:
+    """The models THIS agent's CLI offers, from its own profile: agents on one host may run under
+    different CLAUDE_CONFIG_DIR/CODEX_HOME. The gateway's own environment is never used for this."""
+    if kind not in model_control.PROFILE_KEYS:
+        raise model_control.Unsupported(f"Model switching is not available for {kind or 'this'} agent")
+    try:
+        info = json.loads(command("pane", "process-info", "--pane", pane_id, session=session))
+    except (RuntimeError, OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        raise model_control.ProfileUnknown("Couldn't read this agent's process; nothing was changed") from exc
+    profile = model_control.agent_profile(kind, info, pane_id=pane_id, uid=os.getuid(), proc=PROC_ROOT)
+    return model_control.catalogue_for(kind, profile)
+
+
 MODEL_STATE_GUARD = threading.Lock()
 MODEL_STATES: dict[tuple[str, str], tuple[float, str, object]] = {}  # route -> (at, agent session id, state)
 
@@ -326,7 +340,7 @@ def model_view(session: str, pane_id: str, agent: dict, *, refresh: bool) -> dic
     Otherwise the model is the last one read or set here, with the effort shown beside the prompt."""
     kind = str(agent.get("agent") or "")
     try:
-        models = model_control.catalogue_for(kind)
+        models = agent_catalogue(session, pane_id, kind)
     except model_control.Unsupported as exc:
         return model_control.describe(kind, None, None, switchable=False, reason=str(exc), observed_at=None)
     except (OSError, ValueError) as exc:
@@ -992,7 +1006,7 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response(403, {"error": "model_switch_disabled"})
             return
         try:
-            models = model_control.catalogue_for(kind)
+            models = agent_catalogue(session, pane_id, kind)
             option, effort = model_control.validate(models, body.get("model"), body.get("effort"))
         except model_control.Unsupported as exc:
             self.json_response(501, {"error": "unsupported", "message": str(exc)})

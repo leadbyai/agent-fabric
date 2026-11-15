@@ -21,10 +21,18 @@ stays the source of truth.
 
 ## Where the lists come from
 
-Each CLI's own model cache, in the home of the user the gateway runs as. There is no model table in this repo.
+Each CLI's own model cache, in **that agent's own profile**. There is no model table in this repo.
 
-- Claude Code: newest `~/.claude/cache/model-catalog/*.json` (`CLAUDE_CONFIG_DIR` honoured). The main list and "More models" are both offered.
-- Codex: `~/.codex/models_cache.json` (`CODEX_HOME` honoured); models with `visibility: "list"`, in the CLI's order.
+- Claude Code: newest `$CLAUDE_CONFIG_DIR/cache/model-catalog/*.json`, or `~/.claude/...` when the agent has no `CLAUDE_CONFIG_DIR`. The main list and "More models" are both offered.
+- Codex: `$CODEX_HOME/models_cache.json`, or `~/.codex/...`; models with `visibility: "list"`, in the CLI's order.
+
+Agents on one host can run under different profiles, so the gateway never uses its own environment for this. Per request it asks Herdr for the pane's foreground processes (`herdr pane process-info --pane <id>`) and accepts the profile only when all of these hold; otherwise the model is shown as unavailable and a switch is refused with 501, untouched:
+
+- exactly one foreground process of that kind's CLI (`claude` or `codex`), and Herdr's answer is for this pane;
+- it runs as the gateway's own user (every uid), and descends from the pane's shell;
+- its start time does not change while it is read (no pid reuse).
+
+From that process's environment only `CLAUDE_CONFIG_DIR` and `HOME` (Claude) or `CODEX_HOME` and `HOME` (Codex) are read; nothing else is decoded, kept or logged. Without `HOME` the user's passwd home is used, as the CLIs do. An empty, relative or duplicated value is refused. So no gateway-wide `CLAUDE_CONFIG_DIR` is needed or honoured.
 
 If a cache is missing, the model is shown as unavailable (`switchable: false` with a reason). Nothing is guessed.
 
@@ -56,7 +64,7 @@ If a cache is missing, the model is shown as unavailable (`switchable: false` wi
 | 404 | Unknown route, or the credential cannot reach this agent (discovery credentials never can) |
 | 409 | The agent is working or blocked, or a request holds its pane |
 | 422 | The agent does not offer that model, or that model does not take that effort |
-| 501 | This agent kind cannot be switched, or its model cache is missing |
+| 501 | This agent kind cannot be switched, its model cache is missing, or its profile could not be established exactly |
 | 502 | The CLI did not confirm the switch. Menus were closed with Esc and nothing was retried |
 
 The same credentials as `/ag-ui` apply: a bridge-wide token, or a per-agent token for its own route only.

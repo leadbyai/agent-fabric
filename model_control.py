@@ -11,8 +11,11 @@ switches them, always FOR THIS SESSION ONLY:
 
 A restart therefore returns the agent to whatever its host is configured for.
 
-Where the lists come from: each CLI's own model cache in the agent user's home, never a table here.
-Claude Code: `~/.claude/cache/model-catalog/*.json` (newest). Codex: `~/.codex/models_cache.json`.
+Where the lists come from: each CLI's own model cache, never a table here, in THAT agent's own profile.
+Claude Code: `$CLAUDE_CONFIG_DIR` or `~/.claude`, then `cache/model-catalog/*.json` (newest). Codex:
+`$CODEX_HOME` or `~/.codex`, then `models_cache.json`. Agents on one host may run under different
+profiles, so the gateway reads the profile from the pane's own foreground CLI process
+(`agent_profile`), never from its own environment, and refuses when it cannot tell exactly.
 
 Fail closed: nothing is typed or pressed unless the pane sits at an idle, EMPTY prompt (no unsent
 draft, no menu open; told apart from a dim placeholder hint by the screen's styling), otherwise the
@@ -164,6 +167,98 @@ def catalogue_for(kind: str, environ: dict | None = None) -> list[ModelOption]:
     if kind == "codex":
         return codex_catalogue(environ)
     raise Unsupported(f"Model switching is not available for {kind or 'this'} agent")
+
+
+# ---------------------------------------------------------------- per-agent profile
+
+# The only environment variables ever read from an agent's process, and only to find its model cache.
+PROFILE_KEYS = {"claude": ("CLAUDE_CONFIG_DIR", "HOME"), "codex": ("CODEX_HOME", "HOME")}
+CLI_PROCESS = {"claude": "claude", "codex": "codex"}  # Herdr's foreground process name per kind
+MAX_ANCESTRY = 32
+MAX_ENVIRON_BYTES = 1 << 20
+
+
+class ProfileUnknown(Unsupported):
+    """Which profile the pane's CLI runs under could not be established exactly (HTTP 501; nothing is
+    typed). Never answered from the gateway's own environment instead."""
+
+
+def _proc_stat(proc: Path, pid: int) -> tuple[int, int]:
+    """(parent pid, start time in clock ticks) from /proc/<pid>/stat."""
+    text = (proc / str(pid) / "stat").read_text(encoding="utf-8", errors="replace")
+    fields = text[text.rindex(")") + 2:].split()
+    return int(fields[1]), int(fields[19])
+
+
+def _proc_uids(proc: Path, pid: int) -> set[int]:
+    for line in (proc / str(pid) / "status").read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("Uid:"):
+            return {int(value) for value in line.split()[1:]}
+    raise ValueError("no Uid line")
+
+
+def _passwd_home(uid: int) -> str:
+    import pwd  # Unix only; imported here so the module still loads elsewhere
+    return pwd.getpwuid(uid).pw_dir
+
+
+def agent_profile(kind: str, process_info: dict, *, pane_id: str, uid: int, proc: Path = Path("/proc"),
+                  home_of: Callable[[int], str] = _passwd_home) -> dict[str, str]:
+    """The environment the agent's CLI resolves its model cache from, limited to PROFILE_KEYS[kind].
+
+    `process_info` is Herdr's `pane process-info --pane <pane_id>` output. It must name exactly one
+    foreground process of this kind's CLI, running as `uid` (the gateway's own user) and descended from
+    the pane's shell; its start time must not change while it is read. From its environment only the
+    PROFILE_KEYS are kept; nothing else is decoded, stored or logged. HOME, if the process has none,
+    is the user's passwd home (as the CLIs themselves fall back to). An empty or relative value, or
+    any other doubt, raises ProfileUnknown."""
+    keys = PROFILE_KEYS.get(kind)
+    if keys is None:
+        raise Unsupported(f"Model switching is not available for {kind or 'this'} agent")
+    unknown = ProfileUnknown("Couldn't tell which profile this agent runs under; nothing was changed")
+    info = process_info.get("result", process_info) if isinstance(process_info, dict) else None
+    info = info.get("process_info") if isinstance(info, dict) else None
+    if not isinstance(info, dict) or info.get("pane_id") != pane_id:
+        raise unknown
+    shell = info.get("shell_pid")
+    found = [row.get("pid") for row in info.get("foreground_processes") or []
+             if isinstance(row, dict) and row.get("name") == CLI_PROCESS[kind]]
+    if (len(found) != 1 or not all(type(pid) is int and pid > 1 for pid in (found[0], shell))):
+        raise unknown  # none, several, or not a usable pid: ambiguous
+    pid = found[0]
+    try:
+        _, started = _proc_stat(proc, pid)
+        if _proc_uids(proc, pid) != {uid}:
+            raise unknown
+        ancestor, hops = pid, 0
+        while ancestor != shell:
+            ancestor, _ = _proc_stat(proc, ancestor)
+            hops += 1
+            if ancestor <= 1 or hops > MAX_ANCESTRY:
+                raise unknown  # not this pane's process
+        with open(proc / str(pid) / "environ", "rb") as handle:
+            raw = handle.read(MAX_ENVIRON_BYTES + 1)
+        if len(raw) > MAX_ENVIRON_BYTES:
+            raise unknown
+        wanted = {key.encode("ascii") for key in keys}
+        values: dict[str, str] = {}
+        for entry in raw.split(b"\0"):
+            name, sep, value = entry.partition(b"=")
+            if sep and name in wanted:
+                if name.decode("ascii") in values:
+                    raise unknown  # duplicated: which one the CLI used is unclear
+                values[name.decode("ascii")] = value.decode("utf-8")
+        if _proc_stat(proc, pid)[1] != started:
+            raise unknown  # the pid was reused while it was read
+        if "HOME" not in values:
+            values["HOME"] = home_of(uid)
+    except ProfileUnknown:
+        raise
+    except (OSError, ValueError, IndexError, KeyError) as exc:  # gone, unreadable, malformed, undecodable
+        raise unknown from exc
+    if any(not value or not os.path.isabs(value) for value in values.values()):
+        raise unknown
+    return values
 
 
 def validate(models: list[ModelOption], model_id: object, effort: object) -> tuple[ModelOption, str | None]:
