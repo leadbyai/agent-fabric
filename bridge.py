@@ -327,6 +327,10 @@ class HerdrPane:
         # The visible screen, read at once ("recent" waits ~0.4 s to settle; the drivers poll anyway).
         return command("agent", "read", self.pane_id, "--source", "visible", session=self.session)
 
+    def styled(self) -> str:
+        # The same screen with ANSI styling, so a dim placeholder hint is not mistaken for a typed draft.
+        return command("agent", "read", self.pane_id, "--source", "visible", "--format", "ansi", session=self.session)
+
     def keys(self, *names: str) -> None:
         command("agent", "send-keys", self.pane_id, *names, session=self.session)
 
@@ -402,7 +406,7 @@ def model_view(session: str, pane_id: str, agent: dict, *, refresh: bool) -> dic
             try:
                 state, at = model_control.ClaudeDriver().read(HerdrPane(session, pane_id), models), time.monotonic()
                 remember_model_state(session, pane_id, agent, state)
-            except (model_control.Unverified, RuntimeError, subprocess.TimeoutExpired):
+            except (model_control.NotIdle, model_control.Unverified, RuntimeError, subprocess.TimeoutExpired):
                 pass
             finally:
                 lock.release()
@@ -1086,6 +1090,9 @@ class Handler(BaseHTTPRequestHandler):
                                              "message": "Models switch only while the agent is idle"})
                     return
                 state = model_control.driver_for(kind).switch(HerdrPane(session, pane_id), option, effort)
+            except model_control.NotIdle as exc:
+                self.json_response(409, {"error": "agent_not_ready", "message": str(exc)})
+                return
             except model_control.Unverified as exc:
                 self.log_message("Model switch unverified on %s/%s (%s)", session, pane_id, kind)
                 self.json_response(502, {"error": "switch_unverified", "message": str(exc)})

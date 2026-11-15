@@ -14,8 +14,12 @@ A restart therefore returns the agent to whatever its host is configured for.
 Where the lists come from: each CLI's own model cache in the agent user's home, never a table here.
 Claude Code: `~/.claude/cache/model-catalog/*.json` (newest). Codex: `~/.codex/models_cache.json`.
 
-Fail closed: any screen this module does not recognise ends the attempt (menus closed with Esc)
-and raises; nothing is retried, and a switch is reported only once the CLI has confirmed it.
+Fail closed: nothing is typed or pressed unless the pane sits at an idle, EMPTY prompt (no unsent
+draft, no menu open; told apart from a dim placeholder hint by the screen's styling), otherwise the
+request is refused untouched (NotIdle, HTTP 409). Once this module has opened a menu, any screen it
+does not recognise ends the attempt (only ITS menu is closed with Esc) and raises; a menu the user
+already had open is never touched. Nothing is retried, and a switch is reported only once the CLI
+has confirmed it.
 Terminal I/O is passed in (`Pane`), so this module never runs Herdr itself and is testable offline.
 """
 
@@ -61,11 +65,18 @@ class InvalidChoice(ValueError):
 
 
 class Unverified(RuntimeError):
-    """The CLI did not confirm the switch; its menus were closed (HTTP 502)."""
+    """The CLI did not confirm the switch; the menu this module opened was closed (HTTP 502)."""
+
+
+class NotIdle(Exception):
+    """The pane is not at an idle, empty prompt (a draft is typed, a menu is open, or the screen is not
+    recognised); nothing was typed or pressed (HTTP 409). Not a RuntimeError on purpose: callers map
+    RuntimeError to "Herdr unavailable"."""
 
 
 class Pane(Protocol):
     def screen(self) -> str: ...  # the visible terminal text
+    def styled(self) -> str: ...  # the same screen with ANSI styling (dim placeholder vs typed draft)
     def keys(self, *names: str) -> None: ...  # Herdr key names: Up, Down, Left, Right, Enter, Escape, s
     def submit(self, text: str) -> None: ...  # type a line and press Enter
 
@@ -243,6 +254,94 @@ def codex_footer(screen: str) -> tuple[str, str] | None:
     return found
 
 
+# ---------------------------------------------------------------- the prompt (composer)
+
+# The glyph each CLI draws at the start of its input line. Claude Code 2.1.325: "❯" + NBSP between two
+# horizontal rules. Codex: "›" (newer) or "▌" (older). An empty prompt shows either nothing or a hint
+# drawn DIM (SGR 2) or in the bright-black/grey palette; anything else after the glyph is a draft.
+COMPOSER_GLYPHS = {"claude": ("❯",), "codex": ("›", "▌")}
+_SGR = re.compile(r"\x1b\[([0-9;:]*)m")
+_OTHER_ESC = re.compile(r"\x1b(?:\[[0-9;:?]*[A-Za-ln-z]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()][0-9A-Za-z])")
+_RULE = re.compile(r"^\s*[─━]{8,}\s*$")
+
+
+def _faint(params: list[str], faint: bool) -> bool:
+    """Track whether text is drawn as a hint: SGR 2 (dim), 90 (bright black) or 38;5;8/244-247."""
+    i = 0
+    while i < len(params):
+        code = params[i]
+        if code in ("", "0", "22", "39"):
+            faint = False if code in ("", "0", "22") else faint
+        elif code in ("2", "90"):
+            faint = True
+        elif code == "38" and i + 2 < len(params) and params[i + 1] == "5":
+            faint = params[i + 2] in ("8", "240", "241", "242", "243", "244", "245", "246", "247")
+            i += 2
+        elif code == "38" and i + 4 < len(params) and params[i + 1] == "2":
+            i += 4
+        i += 1
+    return faint
+
+
+def _typed_text(styled_line: str) -> str:
+    """The visible characters of *styled_line* that are NOT drawn as a hint."""
+    line = _OTHER_ESC.sub("", styled_line)
+    out, faint, pos = [], False, 0
+    for match in _SGR.finditer(line):
+        if not faint:
+            out.append(line[pos:match.start()])
+        faint = _faint(match.group(1).replace(":", ";").split(";"), faint)
+        pos = match.end()
+    if not faint:
+        out.append(line[pos:])
+    return "".join(out)
+
+
+def composer_state(kind: str, styled: str) -> str | None:
+    """"empty", "draft", or None when this module cannot locate the live prompt unambiguously.
+
+    Claude Code: the live prompt is the ONE glyph line framed by a rule directly above and below it
+    (earlier `❯ /model` echoes in the scrollback are not framed, so repeated switches still work; a
+    multi-line draft breaks the frame and is refused). Codex: the live prompt is the nearest glyph line
+    above the status footer, and every row between them must be blank (a multi-line draft, even one
+    whose first line is blank, leaves continuation rows there and is refused)."""
+    glyphs = COMPOSER_GLYPHS.get(kind)
+    if not glyphs:
+        return None
+    lines = styled.replace("\r", "").split("\n")
+    plain = [_OTHER_ESC.sub("", _SGR.sub("", line)) for line in lines]
+    is_prompt = [line.lstrip().startswith(glyphs) for line in plain]
+    if kind == "claude":
+        framed = [i for i in range(1, len(plain) - 1)
+                  if is_prompt[i] and _RULE.match(plain[i - 1]) and _RULE.match(plain[i + 1])]
+        if len(framed) != 1:
+            return None
+        i = framed[0]
+    else:
+        footers = [i for i, line in enumerate(plain) if _CODEX_FOOTER.match(line)]
+        if not footers:
+            return None
+        i = footers[-1] - 1
+        while i >= 0 and not plain[i].replace("\u00a0", " ").strip():
+            i -= 1  # blank rows between the prompt and the footer are fine
+        if i < 0 or not is_prompt[i]:
+            return None  # a continuation row (or anything else) sits above the footer: refuse
+    raw = lines[i]
+    glyph_at = min(raw.find(g) for g in glyphs if raw.find(g) >= 0)
+    after = next(g for g in glyphs if raw.startswith(g, glyph_at))
+    rest = _typed_text(raw[glyph_at + len(after):])
+    return "empty" if not rest.replace("\u00a0", " ").strip() else "draft"
+
+
+def require_empty_prompt(pane: Pane, kind: str) -> None:
+    """Refuse (NotIdle) unless the pane is at an empty prompt. Reads only; never types or presses."""
+    state = composer_state(kind, pane.styled())
+    if state == "draft":
+        raise NotIdle("The agent has unsent text at its prompt; nothing was changed")
+    if state != "empty":
+        raise NotIdle("The agent's prompt is not recognisably idle and empty; nothing was changed")
+
+
 # ---------------------------------------------------------------- drivers
 
 
@@ -269,9 +368,15 @@ class ClaudeDriver:
             pane.keys("Escape")
             self.sleep(POLL_SECONDS)
 
-    def _open(self, pane: Pane) -> dict:
+    def _ready(self, pane: Pane) -> None:
+        """Checks only, before anything is typed: no menu open (the user's own is left alone) and an
+        empty prompt. Raises NotIdle; the caller must not close anything when this raises."""
         if claude_menu(pane.screen()) is not None:
-            raise Unverified("A Claude Code menu is already open in this pane")
+            raise NotIdle("A Claude Code menu is already open in this pane; it was left as it is")
+        require_empty_prompt(pane, "claude")
+
+    def _open(self, pane: Pane) -> dict:
+        """Type `/model` and wait for the menu. Call only after _ready(); the menu is then ours."""
         pane.submit("/model")
         menu = _wait(pane, claude_menu, self.sleep, self.clock)
         if menu is None:
@@ -280,10 +385,11 @@ class ClaudeDriver:
 
     def read(self, pane: Pane, models: list[ModelOption]) -> ModelState:
         """Open the menu, read the checked model and the effort, close it (prints "Kept model")."""
+        self._ready(pane)  # raises before anything is typed; nothing of ours to close then
         try:
             menu = self._open(pane)
         finally:
-            self._close(pane)
+            self._close(pane)  # only ever our own menu: _ready() proved none was open before
         label = menu["current"] or "Default (recommended)"
         option = next((m for m in models if m.label == label), None)
         return ModelState(option.id if option else None, label, menu["effort"])
@@ -316,6 +422,7 @@ class ClaudeDriver:
         raise Unverified("Could not set the effort in Claude Code's menu")
 
     def switch(self, pane: Pane, option: ModelOption, effort: str | None) -> ModelState:
+        self._ready(pane)  # raises before anything is typed; nothing of ours to close then
         try:
             menu = self._open(pane)
             if option.label not in menu["rows"]:
@@ -376,6 +483,7 @@ class CodexDriver:
         return state
 
     def switch(self, pane: Pane, option: ModelOption, effort: str | None) -> ModelState:
+        require_empty_prompt(pane, "codex")  # never append to an unsent draft
         command = f"/model {option.id}" + (f" --reasoning={effort}" if effort else "")
         pane.submit(command)
 

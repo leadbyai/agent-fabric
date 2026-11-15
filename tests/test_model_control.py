@@ -108,9 +108,18 @@ class FakeClaude:
             lines += [f"{' ' * 60}● {self.effort} · /effort", "─" * 40, f"❯ {self.typed}", "─" * 40]
         return "\n".join(lines)
 
+    def styled(self):
+        if self.menu:
+            return self.screen()  # no prompt line while a menu is open
+        typed = self.typed if self.typed else '\x1b[0m\x1b[2mTry "create a util logging.py that..."\x1b[0m'
+        lines = list(self.history) + [f"{' ' * 60}● {self.effort} · /effort", "─" * 40, f"❯\u00a0{typed}\r", "─" * 40]
+        return "\n".join(lines)
+
     def submit(self, text):
         if self.menu:
             raise AssertionError("typed into an open menu")
+        if self.typed:
+            raise AssertionError("submitted on top of an unsent draft")
         self.history.append(f"❯ {text}")
         if text == "/model":
             self.menu = {"cursor": self.rows().index(self.model) if self.model in self.rows() else 0,
@@ -158,6 +167,13 @@ class FakeCodex:
         self.label, self.effort = "GPT-6.1-Sol", "default"
         self.commands = []
         self.config_written = False
+        self.draft = ""
+
+    def styled(self):
+        # Real codex-cli 0.169 shape (Codex staging, 2026-11-15): ESC[0m ESC[1m›ESC[0m then a DIM hint,
+        # the prompt directly above the "<model> <effort> · <dir>" footer.
+        prompt = self.draft if self.draft else "\x1b[0m\x1b[2mAsk Codex to do anything\x1b[0m"
+        return self.screen().replace("› Ask Codex to do anything", f"\x1b[0m\x1b[1m›\x1b[0m {prompt}")
 
     def screen(self):
         return CODEX_SCREEN.replace("GPT-6.1-Sol default", f"{self.label} {self.effort}")
@@ -166,6 +182,8 @@ class FakeCodex:
         raise AssertionError("Codex is switched with a typed command only")
 
     def submit(self, text):
+        if self.draft:
+            raise AssertionError("submitted on top of an unsent draft")
         self.commands.append(text)
         parts = text.split()
         slug = parts[1]
@@ -267,12 +285,87 @@ class ModelControlTests(unittest.TestCase):
             driver("claude").switch(pane, option, effort)
         self.assertEqual((pane.model, pane.typed), ("Opus 5.5", ""))
 
-    def test_claude_menu_already_open_is_not_touched(self):
+    def _user_menu(self):
         pane = FakeClaude()
-        pane.submit("/model")  # a person has the menu open
+        pane.submit("/model")  # a person has the menu open...
+        pane.keys("Down", "Right")  # ...and has moved in it
+        return pane, dict(pane.menu), list(pane.history)
+
+    def test_regression_switch_leaves_a_users_open_menu_untouched(self):
+        pane, menu, history = self._user_menu()
         option, _ = mc.validate(mc.catalogue_for("claude", self.env), "claude-haiku-5-5", None)
-        with self.assertRaises(mc.Unverified):
+        with self.assertRaises(mc.NotIdle):
             driver("claude").switch(pane, option, None)
+        self.assertEqual((pane.menu, pane.history, pane.saved_default), (menu, history, None))  # no Escape, nothing typed
+
+    def test_regression_read_leaves_a_users_open_menu_untouched(self):
+        pane, menu, history = self._user_menu()
+        with self.assertRaises(mc.NotIdle):
+            driver("claude").read(pane, mc.catalogue_for("claude", self.env))
+        self.assertEqual((pane.menu, pane.history, pane.saved_default), (menu, history, None))
+
+    def test_regression_unsent_draft_is_never_appended_submitted_or_cleared(self):
+        models = mc.catalogue_for("claude", self.env)
+        option, effort = mc.validate(models, "claude-haiku-5-5", "high")
+        for act in (lambda p: driver("claude").read(p, models), lambda p: driver("claude").switch(p, option, effort)):
+            pane = FakeClaude()
+            pane.typed = "STAGE-DRAFT keep me"
+            history = list(pane.history)
+            with self.assertRaises(mc.NotIdle):
+                act(pane)
+            self.assertEqual((pane.typed, pane.history, pane.menu, pane.model), ("STAGE-DRAFT keep me", history, None, "Opus 5.5"))
+
+    def test_unrecognised_prompt_is_refused_untouched(self):
+        pane = FakeClaude()
+        pane.styled = lambda: "no prompt line on this screen"
+        history = list(pane.history)
+        option, _ = mc.validate(mc.catalogue_for("claude", self.env), "claude-haiku-5-5", None)
+        with self.assertRaises(mc.NotIdle):
+            driver("claude").switch(pane, option, None)
+        self.assertEqual((pane.history, pane.menu), (history, None))
+
+    def test_codex_unsent_draft_is_refused_untouched(self):
+        pane = FakeCodex()
+        pane.draft = "half-typed request"
+        option, effort = mc.validate(mc.catalogue_for("codex", self.env), "gpt-6-luna", "high")
+        with self.assertRaises(mc.NotIdle):
+            driver("codex").switch(pane, option, effort)
+        self.assertEqual((pane.commands, pane.draft), ([], "half-typed request"))
+
+    def test_composer_state_on_captured_claude_screens(self):
+        rule = "─" * 119
+        empty = f'{rule}\n❯\u00a0\x1b[0m\x1b[2mTry "create a util logging.py that..."\x1b[0m\r\n{rule}'
+        draft = f"{rule}\n❯\u00a0STAGE-DRAFT keep me\r\n{rule}"
+        multi = f"{rule}\n❯\u00a0first line\n  second line\n{rule}"
+        self.assertEqual(mc.composer_state("claude", empty), "empty")
+        self.assertEqual(mc.composer_state("claude", draft), "draft")
+        self.assertIsNone(mc.composer_state("claude", multi))  # frame broken: not recognised, so refused
+        self.assertEqual(mc.composer_state("claude", empty.replace("\x1b[2m", "")), "draft")  # unstyled: refused
+        self.assertIsNone(mc.composer_state("gemini", empty))
+        # Scrollback full of earlier prompt echoes does not hide the one framed, live prompt.
+        history = "❯ /model\n  ⎿  Set model to Haiku 5.5 for this session only\n❯ /model\n  ⎿  Kept model as Haiku 5.5\n"
+        self.assertEqual(mc.composer_state("claude", history + empty), "empty")
+
+    def test_composer_state_on_codex_screens_anchors_to_the_footer(self):
+        footer = "  GPT-6.1-Sol low · ~/work"
+        hint = "\x1b[0m\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m"
+        self.assertEqual(mc.composer_state("codex", f"› earlier message\n{hint}\n{footer}"), "empty")
+        self.assertEqual(mc.composer_state("codex", f"{hint}\n\n{footer}"), "empty")  # blank gap is fine
+        self.assertEqual(mc.composer_state("codex", f"\x1b[1m›\x1b[0m Ask Codex to do anything\n{footer}"), "draft")  # same words, not dim
+        self.assertEqual(mc.composer_state("codex", f"› fix the build\n{footer}"), "draft")
+        # Shift+Enter at an empty prompt, then a marker: a bare › row, an indented row, then the footer.
+        self.assertIsNone(mc.composer_state("codex", f"\x1b[1m›\x1b[0m \n    STAGE-MARK\n{footer}"))
+        self.assertIsNone(mc.composer_state("codex", hint))  # no footer: not recognised, refused
+
+    def test_repeated_claude_switches_without_clearing_scrollback(self):
+        pane = FakeClaude()
+        models = mc.catalogue_for("claude", self.env)
+        for model_id, effort in (("claude-haiku-5-5", "high"), ("claude-sonnet-5-5", "low"), ("claude-haiku-5-5", None)):
+            option, effort = mc.validate(models, model_id, effort)
+            driver("claude").switch(pane, option, effort)
+        self.assertEqual(pane.model, "Haiku 5.5")
+        self.assertGreaterEqual(sum(1 for line in pane.history if line == "❯ /model"), 3)
+        self.assertEqual(driver("claude").read(pane, models).label, "Haiku 5.5")
         self.assertIsNone(pane.saved_default)
 
     def test_claude_footer_effort_is_read_passively(self):
@@ -334,6 +427,8 @@ class ModelRouteTests(unittest.TestCase):
             return json.dumps({"result": {"agent": next(a for a in self.roster if a["pane_id"] == args[2])}})
         pane = self.panes[args[2]]
         if args[:2] == ("agent", "read"):
+            if args[3:] == ("--source", "visible", "--format", "ansi"):
+                return pane.styled()  # the prompt check reads the styled screen
             self.assertEqual(args[3:], ("--source", "visible"))
             return pane.screen()
         if args[:2] == ("agent", "send-keys"):

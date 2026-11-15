@@ -81,3 +81,21 @@ The same credentials as `/ag-ui` apply: a bridge-wide token, or a per-agent toke
 ## Turning it off
 
 Set `OPENBOT_BRIDGE_MODEL_SWITCH=off` in the gateway's `config.env`: reads still work and switches return 403.
+
+## Idle, empty prompt only
+
+Nothing is typed or pressed unless the agent sits at an idle, **empty** prompt. Herdr reports an agent as
+idle even when its user has typed an unsent draft, so the gateway also reads the pane's styled screen
+(`agent read --format ansi`):
+
+- **Claude Code**: the live prompt is the single `❯` line framed by a rule directly above and below it.
+  Earlier `❯ /model` echoes in the scrollback are not framed, so repeated switches work. A multi-line
+  draft breaks the frame and is refused.
+- **Codex**: the live prompt is the nearest `›` line above the `<model> <effort> · <dir>` footer, and every
+  row between them must be blank. A multi-line draft (even one whose first line is blank) leaves a
+  continuation row there and is refused.
+- Text after the prompt glyph counts as empty only when it is drawn as a hint (dim, SGR 2, or the
+  grey palette). The same words typed by a person are not dim, so they count as a draft.
+- An open menu, a draft, or any screen these rules cannot place returns **409 `agent_not_ready`** with
+  nothing typed or pressed. A menu the user already had open is never closed; only a menu the gateway
+  opened itself is closed with Esc.
