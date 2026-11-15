@@ -603,8 +603,10 @@ def available_models(inventory: dict) -> list[dict]:
         flags = (row.get("capabilities") or {}).get(model) or {}
         # Brewster's provider supports these levels across its reasoning models. Other providers
         # remain model-only until the bridge can verify their per-model effort vocabulary.
-        efforts = ["low", "medium", "high"] if (provider in {"xai", "xai-oauth"}
-            and flags.get("reasoning") is True) else []
+        # The xAI inventory can mark an explicitly non-reasoning variant as reasoning-capable.
+        supports_effort = (provider in {"xai", "xai-oauth"} and flags.get("reasoning") is True
+                           and "non-reasoning" not in model.lower())
+        efforts = ["low", "medium", "high"] if supports_effort else []
         models.append({"id": model, "label": model, "section": "main", "efforts": efforts})
     return models
 

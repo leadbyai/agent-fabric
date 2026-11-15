@@ -794,6 +794,18 @@ class PinnedModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mutation.kwargs["payload"],
                          {"model": "grok-4.7", "provider": "xai-oauth", "reasoning": "high"})
 
+    async def test_non_reasoning_xai_variant_does_not_offer_effort(self):
+        model = "grok-4.20-0309-non-reasoning"
+        row = self.inventory["providers"][0]
+        row["models"].append(model)
+        row["capabilities"][model] = {"reasoning": True}
+        result = await hermes_bridge.pinned_model_control(self.client, "pinned")
+        self.assertEqual(result["models"][-1]["efforts"], [])
+        with self.assertRaises(hermes_bridge.ModelControlRefused) as err:
+            await hermes_bridge.pinned_model_control(self.client, "pinned", {"model": model, "effort": "high"})
+        self.assertEqual(err.exception.status, 422)
+        self.assertFalse(any(call.args == ("session.mutate",) for call in self.client.rpc.await_args_list))
+
     async def test_effort_only_uses_native_reasoning_without_switching_models(self):
         await hermes_bridge.pinned_model_control(
             self.client, "pinned", {"model": "grok-4.6", "effort": "medium"})
