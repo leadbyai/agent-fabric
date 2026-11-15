@@ -184,6 +184,7 @@ def validate(models: list[ModelOption], model_id: object, effort: object) -> tup
 _ROW = re.compile(r"^\s*(?P<cursor>❯)?\s*(?:(?P<number>\d+)\.\s+(?P<label>.+?)(?P<check>\s✔)?(?:\s{2,}.*)?|(?P<more>[▸▾])\s+More models)\s*$")
 _CLAUDE_EFFORT = re.compile(r"^\s*\S\s+(?P<label>Low|Medium|High|xHigh|Max)\s+effort\b")
 _CLAUDE_DONE = re.compile(r"Set model to (?P<label>.+?) for this session only(?: with (?P<effort>\w+) effort)?\s*$")
+_CLAUDE_SWITCH_YES = re.compile(r"^\s*(?P<cursor>❯)?\s*1\.\s+Yes, switch to (?P<label>.+?)\s*$")
 _CLAUDE_FOOTER_EFFORT = re.compile(r"[○◐●◉◈]\s+(?P<effort>low|medium|high|xhigh|max)\s+·\s+/effort")
 _CODEX_FOOTER = re.compile(
     r"^\s*(?P<label>\S.*?) (?P<effort>none|minimal|low|medium|high|xhigh|max|ultra|default) · ")
@@ -219,6 +220,21 @@ def claude_menu(screen: str) -> dict | None:
     if not rows or cursor is None:
         return None
     return {"rows": rows, "cursor": cursor, "current": current, "effort": effort, "expanded": expanded}
+
+
+def claude_switch_prompt(screen: str) -> dict | None:
+    """Claude Code's "Switch model?" question, shown after `s` when the conversation is cached for the
+    current model: which model it names and whether the cursor is on its "Yes" row."""
+    lines = screen.splitlines()
+    try:
+        start = max(i for i, line in enumerate(lines) if line.strip() == "Switch model?")
+    except ValueError:
+        return None
+    for line in lines[start + 1:]:
+        match = _CLAUDE_SWITCH_YES.match(line)
+        if match:
+            return {"label": match.group("label").strip(), "on_yes": bool(match.group("cursor"))}
+    return None
 
 
 def claude_confirmation(screen: str) -> tuple[str, str | None] | None:
@@ -303,8 +319,8 @@ def composer_state(kind: str, styled: str) -> str | None:
     Claude Code: the live prompt is the ONE glyph line framed by a rule directly above and below it
     (earlier `❯ /model` echoes in the scrollback are not framed, so repeated switches still work; a
     multi-line draft breaks the frame and is refused). Codex: the live prompt is the nearest glyph line
-    above the status footer, and every row between them must be blank (a multi-line draft, even one
-    whose first line is blank, leaves continuation rows there and is refused)."""
+    two rows above the status footer with exactly one blank spacer between, and it must show Codex's dim
+    hint (a multi-line draft, even a blank Shift+Enter one, changes that geometry and is refused)."""
     glyphs = COMPOSER_GLYPHS.get(kind)
     if not glyphs:
         return None
@@ -318,19 +334,25 @@ def composer_state(kind: str, styled: str) -> str | None:
             return None
         i = framed[0]
     else:
+        # Tested Codex geometry (codex-cli 0.169): prompt row, exactly ONE blank spacer row, footer. A
+        # multi-line draft adds rows (a Shift+Enter-only draft shows a bare glyph and two blank rows).
         footers = [i for i, line in enumerate(plain) if _CODEX_FOOTER.match(line)]
         if not footers:
             return None
-        i = footers[-1] - 1
-        while i >= 0 and not plain[i].replace("\u00a0", " ").strip():
-            i -= 1  # blank rows between the prompt and the footer are fine
-        if i < 0 or not is_prompt[i]:
-            return None  # a continuation row (or anything else) sits above the footer: refuse
+        f = footers[-1]
+        if f < 2 or plain[f - 1].replace("\u00a0", " ").strip() or not is_prompt[f - 2]:
+            return None
+        i = f - 2
     raw = lines[i]
     glyph_at = min(raw.find(g) for g in glyphs if raw.find(g) >= 0)
     after = next(g for g in glyphs if raw.startswith(g, glyph_at))
-    rest = _typed_text(raw[glyph_at + len(after):])
-    return "empty" if not rest.replace("\u00a0", " ").strip() else "draft"
+    tail = raw[glyph_at + len(after):]
+    rest = _typed_text(tail)
+    if rest.replace("\u00a0", " ").strip():
+        return "draft"
+    if kind == "codex" and not _OTHER_ESC.sub("", _SGR.sub("", tail)).replace("\u00a0", " ").strip():
+        return None  # Codex always draws a dim hint at an empty prompt; a bare glyph is not recognised
+    return "empty"
 
 
 def require_empty_prompt(pane: Pane, kind: str) -> None:
@@ -362,8 +384,11 @@ class ClaudeDriver:
         self.sleep, self.clock = sleep, clock
 
     def _close(self, pane: Pane) -> None:
-        for _ in range(3):
-            if claude_menu(pane.screen()) is None:
+        """Close what THIS driver opened: the model menu and its "Switch model?" question (Esc on the
+        question returns to the menu, a second Esc closes the menu). Never called before _ready()."""
+        for _ in range(4):
+            screen = pane.screen()
+            if claude_menu(screen) is None and claude_switch_prompt(screen) is None:
                 return
             pane.keys("Escape")
             self.sleep(POLL_SECONDS)
@@ -442,16 +467,27 @@ class ClaudeDriver:
             pane.keys("s")
 
             def confirmed(screen: str):
-                # Only this request's line counts: the menu must have closed, and the line must name
-                # the requested model (an earlier switch's line stays on screen until it scrolls).
-                if claude_menu(screen) is not None:
+                # Only this request's line counts: the menu (and its question) must have closed, and the
+                # line must name the requested model (an earlier switch's line stays until it scrolls).
+                if claude_menu(screen) is not None or claude_switch_prompt(screen) is not None:
                     return None
                 found = claude_confirmation(screen)
                 if found and found[0] == option.label and (not effort or found[1] == effort):
                     return found
                 return None
 
-            result = _wait(pane, confirmed, self.sleep, self.clock)
+            def confirmed_or_asked(screen: str):
+                return confirmed(screen) or (claude_switch_prompt(screen) and "asked")
+
+            result = _wait(pane, confirmed_or_asked, self.sleep, self.clock)
+            if result == "asked":
+                # A cached conversation makes Claude Code ask before switching. Answer "Yes" only when it
+                # names the requested model and its cursor already rests on "Yes"; otherwise fail closed.
+                question = claude_switch_prompt(pane.screen())
+                if not question or question["label"] != option.label or not question["on_yes"]:
+                    raise Unverified("Claude Code asked about a different switch; nothing was confirmed")
+                pane.keys("Enter")  # on the question's "Yes" row, not on a model row: saves no default
+                result = _wait(pane, confirmed, self.sleep, self.clock)
         except Exception:
             self._close(pane)
             raise

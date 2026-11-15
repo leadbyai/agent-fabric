@@ -78,6 +78,10 @@ class FakeClaude:
         self.history = ["▝▜██████▀  Opus 5.5 · Claude Ultra"]
         self.saved_default = None  # set if anything saves a user-wide default
         self.typed = ""
+        self.cached = False  # a cached conversation makes Claude Code ask "Switch model?" (2.1.325, staged)
+        self.question = None
+        self.ask_label = None  # tests: make the question name another model
+        self.answer_works = True  # tests: make "Yes" do nothing
 
     def rows(self):
         rows = [label for label, _ in CLAUDE_MAIN] + ["More models"]
@@ -87,6 +91,12 @@ class FakeClaude:
 
     def screen(self):
         lines = list(self.history)
+        if self.question:
+            label = self.question["label"]
+            lines += ["▔" * 40, "   Switch model?", "   Your next response will be slower and use more tokens",
+                      f"   {'❯' if self.question['cursor'] == 0 else ' '} 1. Yes, switch to {label}",
+                      f"   {'❯' if self.question['cursor'] == 1 else ' '} 2. No, go back"]
+            return "\n".join(lines)
         if self.menu:
             lines += ["▔" * 40, "   Select model",
                       "   Switch between Claude models. Your pick becomes the default for new sessions."]
@@ -109,7 +119,7 @@ class FakeClaude:
         return "\n".join(lines)
 
     def styled(self):
-        if self.menu:
+        if self.menu or self.question:
             return self.screen()  # no prompt line while a menu is open
         typed = self.typed if self.typed else '\x1b[0m\x1b[2mTry "create a util logging.py that..."\x1b[0m'
         lines = list(self.history) + [f"{' ' * 60}● {self.effort} · /effort", "─" * 40, f"❯\u00a0{typed}\r", "─" * 40]
@@ -129,6 +139,20 @@ class FakeClaude:
 
     def keys(self, *names):
         for name in names:
+            if self.question:
+                if name in ("Up", "Down"):
+                    self.question["cursor"] = 1 - self.question["cursor"]
+                elif name == "Escape" or (name == "Enter" and self.question["cursor"] == 1):
+                    self.question = None  # back to the model menu
+                    self.menu = {"cursor": 0, "expanded": False, "effort": self.effort}
+                elif name == "Enter":
+                    q, self.question = self.question, None
+                    if self.answer_works:
+                        self.model, self.effort = q["target"], q["effort"]
+                        self.history.append(f"  ⎿  Set model to {q['target']} for this session only with {q['effort']} effort")
+                else:
+                    raise AssertionError(f"unexpected key {name} on the question")
+                continue
             if not self.menu:
                 if name == "Escape":
                     continue
@@ -155,6 +179,10 @@ class FakeClaude:
                 label = rows[menu["cursor"]]
                 if label == "More models":
                     continue
+                if self.cached and label != self.model:
+                    self.question = {"label": self.ask_label or label, "target": label, "effort": menu["effort"], "cursor": 0}
+                    self.menu = None
+                    continue
                 self.model, self.effort = label, menu["effort"]
                 self.history.append(f"  ⎿  Set model to {label} for this session only with {self.effort} effort")
                 self.menu = None
@@ -173,7 +201,7 @@ class FakeCodex:
         # Real codex-cli 0.169 shape (Codex staging, 2026-11-15): ESC[0m ESC[1m›ESC[0m then a DIM hint,
         # the prompt directly above the "<model> <effort> · <dir>" footer.
         prompt = self.draft if self.draft else "\x1b[0m\x1b[2mAsk Codex to do anything\x1b[0m"
-        return self.screen().replace("› Ask Codex to do anything", f"\x1b[0m\x1b[1m›\x1b[0m {prompt}")
+        return self.screen().replace("› Ask Codex to do anything\n", f"\x1b[0m\x1b[1m›\x1b[0m {prompt}\n\n")
 
     def screen(self):
         return CODEX_SCREEN.replace("GPT-6.1-Sol default", f"{self.label} {self.effort}")
@@ -349,16 +377,45 @@ class ModelControlTests(unittest.TestCase):
     def test_composer_state_on_codex_screens_anchors_to_the_footer(self):
         footer = "  GPT-6.1-Sol low · ~/work"
         hint = "\x1b[0m\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m"
-        self.assertEqual(mc.composer_state("codex", f"› earlier message\n{hint}\n{footer}"), "empty")
-        self.assertEqual(mc.composer_state("codex", f"{hint}\n\n{footer}"), "empty")  # blank gap is fine
-        self.assertEqual(mc.composer_state("codex", f"\x1b[1m›\x1b[0m Ask Codex to do anything\n{footer}"), "draft")  # same words, not dim
-        self.assertEqual(mc.composer_state("codex", f"› fix the build\n{footer}"), "draft")
-        # Shift+Enter at an empty prompt, then a marker: a bare › row, an indented row, then the footer.
-        self.assertIsNone(mc.composer_state("codex", f"\x1b[1m›\x1b[0m \n    STAGE-MARK\n{footer}"))
+        # Real geometry: prompt row, ONE blank spacer, footer.
+        self.assertEqual(mc.composer_state("codex", f"› earlier message\n{hint}\n\n{footer}"), "empty")
+        self.assertEqual(mc.composer_state("codex", f"\x1b[1m›\x1b[0m Ask Codex to do anything\n\n{footer}"), "draft")  # same words, not dim
+        self.assertEqual(mc.composer_state("codex", f"› fix the build\n\n{footer}"), "draft")
+        # Shift+Enter at an empty prompt, then a marker: a bare › row, an indented row, a spacer, the footer.
+        self.assertIsNone(mc.composer_state("codex", f"\x1b[1m›\x1b[0m \n    STAGE-MARK\n\n{footer}"))
+        # Shift+Enter only: a bare › and two blank rows. Never treated as empty.
+        self.assertIsNone(mc.composer_state("codex", f"\x1b[1m›\x1b[0m \n\n\n{footer}"))
+        self.assertIsNone(mc.composer_state("codex", f"\x1b[1m›\x1b[0m \n\n{footer}"))  # bare glyph, no hint
+        self.assertIsNone(mc.composer_state("codex", f"{hint}\n{footer}"))  # no spacer: untested geometry
         self.assertIsNone(mc.composer_state("codex", hint))  # no footer: not recognised, refused
+
+    def test_cached_conversation_question_is_answered_yes_for_the_requested_model(self):
+        pane = FakeClaude()
+        pane.cached = True
+        option, effort = mc.validate(mc.catalogue_for("claude", self.env), "claude-haiku-5-5", "high")
+        state = driver("claude").switch(pane, option, effort)
+        self.assertEqual((state.label, state.effort, pane.model, pane.saved_default), ("Haiku 5.5", "high", "Haiku 5.5", None))
+        self.assertIsNone(pane.question)
+
+    def test_question_about_another_model_fails_closed_and_leaves_nothing_open(self):
+        pane = FakeClaude()
+        pane.cached, pane.ask_label = True, "Sonnet 5.5"
+        option, effort = mc.validate(mc.catalogue_for("claude", self.env), "claude-haiku-5-5", "high")
+        with self.assertRaises(mc.Unverified):
+            driver("claude").switch(pane, option, effort)
+        self.assertEqual((pane.question, pane.menu, pane.model, pane.saved_default), (None, None, "Opus 5.5", None))
+
+    def test_unanswered_question_is_closed_after_the_timeout(self):
+        pane = FakeClaude()
+        pane.cached, pane.answer_works = True, False
+        option, effort = mc.validate(mc.catalogue_for("claude", self.env), "claude-haiku-5-5", "high")
+        with self.assertRaises(mc.Unverified):
+            driver("claude").switch(pane, option, effort)
+        self.assertEqual((pane.question, pane.menu, pane.saved_default), (None, None, None))
 
     def test_repeated_claude_switches_without_clearing_scrollback(self):
         pane = FakeClaude()
+        pane.cached = True  # a real agent always has history, so every model change is asked about
         models = mc.catalogue_for("claude", self.env)
         for model_id, effort in (("claude-haiku-5-5", "high"), ("claude-sonnet-5-5", "low"), ("claude-haiku-5-5", None)):
             option, effort = mc.validate(models, model_id, effort)

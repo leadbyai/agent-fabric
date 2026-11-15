@@ -91,9 +91,13 @@ idle even when its user has typed an unsent draft, so the gateway also reads the
 - **Claude Code**: the live prompt is the single `❯` line framed by a rule directly above and below it.
   Earlier `❯ /model` echoes in the scrollback are not framed, so repeated switches work. A multi-line
   draft breaks the frame and is refused.
-- **Codex**: the live prompt is the nearest `›` line above the `<model> <effort> · <dir>` footer, and every
-  row between them must be blank. A multi-line draft (even one whose first line is blank) leaves a
-  continuation row there and is refused.
+- **Codex**: the live prompt is the `›` line exactly two rows above the `<model> <effort> · <dir>` footer,
+  with one blank spacer between, showing Codex's dim hint (the geometry tested on codex-cli 0.169). A
+  multi-line draft, even a blank Shift+Enter one, changes that geometry and is refused.
+- **Claude Code's "Switch model?" question**: a cached conversation makes Claude Code ask before
+  switching. The gateway answers "Yes" only when the question names the requested model and its cursor
+  already rests on "Yes" (Enter there saves no default). Anything else fails closed, and the question
+  and menu the gateway opened are closed with Esc.
 - Text after the prompt glyph counts as empty only when it is drawn as a hint (dim, SGR 2, or the
   grey palette). The same words typed by a person are not dim, so they count as a draft.
 - An open menu, a draft, or any screen these rules cannot place returns **409 `agent_not_ready`** with
