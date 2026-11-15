@@ -662,8 +662,12 @@ async def pinned_model_control(client, session_id: str, selection: dict | None =
                     or (effort is not None and info.get("reasoning_effort") != effort)):
                 raise ModelControlRefused(409, "Hermes has not confirmed the requested settings yet.")
     active_model = info.get("model")
+    current_effort = info.get("reasoning_effort") or None
+    if active_model and menu.get("provider") in {"xai", "xai-oauth"} and "non-reasoning" in active_model.lower():
+        # Hermes may retain the earlier session preference; this model does not send it to xAI.
+        current_effort = None
     current = None if not active_model else {
-        "model": active_model, "label": active_model, "effort": info.get("reasoning_effort") or None,
+        "model": active_model, "label": active_model, "effort": current_effort,
         "observed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     return {"agent": "hermes", "provider": menu.get("provider") or None, "current": current,

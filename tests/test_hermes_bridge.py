@@ -806,6 +806,9 @@ class PinnedModelTests(unittest.IsolatedAsyncioTestCase):
             await hermes_bridge.pinned_model_control(self.client, "pinned", {"model": model, "effort": "high"})
         self.assertEqual(err.exception.status, 422)
         self.assertFalse(any(call.args == ("session.mutate",) for call in self.client.rpc.await_args_list))
+        self.info.update(model=model, reasoning_effort="high")
+        result = await hermes_bridge.pinned_model_control(self.client, "pinned")
+        self.assertIsNone(result["current"]["effort"])
 
     async def test_profile_default_model_can_be_restored_even_when_absent_from_inventory(self):
         result = await hermes_bridge.pinned_model_control(
