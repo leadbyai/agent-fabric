@@ -537,6 +537,93 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.events(body)[-1]["type"], "RUN_FINISHED")
         self.assertEqual(len(self.prompts), 1)
 
+    def test_working_turn_outlives_the_correlation_window(self):
+        self.enable_bounded_queue()
+        self.bridge.LEDGER = self.bridge.RequestLedger(str(Path(self.tmp.name) / "long-reply.sqlite3"))
+        self.bridge.RECOVERY_SECONDS = 0.04
+        self.bridge.ACTIVE_WAIT_SECONDS = 1
+        self.bridge.STATE_POLL_SECONDS = 0.02
+        target = self.roster["Main"][0]
+        finished_at = 0
+        working_checks = 0
+        base = self.fake_command
+
+        def late_reply(*args, **kwargs):
+            nonlocal finished_at, working_checks
+            if args[:2] == ("agent", "prompt"):
+                base(*args, **kwargs)
+                finished_at = time.monotonic() + 0.16
+                raise RuntimeError("timed out waiting for agent status")
+            if args[:2] == ("agent", "get") and finished_at:
+                target["agent_status"] = "working" if time.monotonic() < finished_at else "done"
+                working_checks += target["agent_status"] == "working"
+            if args[:2] == ("agent", "read"):
+                self.assertEqual(target["agent_status"], "done")
+            return base(*args, **kwargs)
+
+        self.bridge.command = late_reply
+        status, body = self.request("POST", "/ag-ui", self.message("A late answer"))
+        events = self.events(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(events[-1]["type"], "RUN_FINISHED")
+        self.assertIn("Reply from Main/wA:p1", body)
+        self.assertTrue(any(event.get("value", {}).get("state") == "working" for event in events))
+        self.assertGreater(working_checks, 1)
+        self.assertEqual(len(self.prompts), 1)
+        key = self.bridge.LEDGER.key("Main", "wA:p1", "t1", "r1")
+        self.assertEqual(self.bridge.LEDGER.get(key)["state"], "finished")
+
+    def test_active_wait_limit_leaves_one_uncertain_submission(self):
+        self.enable_bounded_queue()
+        self.bridge.LEDGER = self.bridge.RequestLedger(str(Path(self.tmp.name) / "long-reply.sqlite3"))
+        self.bridge.RECOVERY_SECONDS = 0.04
+        self.bridge.ACTIVE_WAIT_SECONDS = 0.12
+        self.bridge.STATE_POLL_SECONDS = 0.02
+        target = self.roster["Main"][0]
+        base = self.fake_command
+
+        def never_finishes(*args, **kwargs):
+            if args[:2] == ("agent", "prompt"):
+                base(*args, **kwargs)
+                target["agent_status"] = "working"
+                raise RuntimeError("timed out waiting for agent status")
+            if args[:2] == ("agent", "read"):
+                self.fail("Cannot collect the reply while Herdr reports working")
+            return base(*args, **kwargs)
+
+        self.bridge.command = never_finishes
+        request = self.message("An active turn must not hold the gateway forever")
+        status, body = self.request("POST", "/ag-ui", request)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.events(body)[-1]["type"], "RUN_ERROR")
+        self.assertIn("active wait limit", body)
+        key = self.bridge.LEDGER.key("Main", "wA:p1", "t1", "r1")
+        self.assertEqual(self.bridge.LEDGER.get(key)["state"], "uncertain")
+        self.assertIn("No duplicate prompt sent", self.request("POST", "/ag-ui", request)[1])
+        self.assertEqual(len(self.prompts), 1)
+
+    def test_recovery_refuses_a_pane_replaced_after_submission(self):
+        self.enable_bounded_queue()
+        self.bridge.RECOVERY_SECONDS = 1
+        target = self.roster["Main"][0]
+        target["terminal_id"] = "original"
+        base = self.fake_command
+
+        def replace_while_waiting(*args, **kwargs):
+            if args[:2] == ("agent", "prompt"):
+                base(*args, **kwargs)
+                target["terminal_id"] = "replacement"
+                raise RuntimeError("timed out waiting for agent status")
+            if args[:2] == ("agent", "read"):
+                self.fail("Must not read the replacement pane's transcript")
+            return base(*args, **kwargs)
+
+        self.bridge.command = replace_while_waiting
+        status, body = self.request("POST", "/ag-ui", self.message("Only the original may reply"))
+        self.assertEqual(status, 200)
+        self.assertIn("Agent session changed after submission", body)
+        self.assertEqual(len(self.prompts), 1)
+
     def test_ambiguous_timeout_never_retries_submitted_prompt(self):
         self.bridge.RECOVERY_SECONDS = 0.12
         self.bridge.HEARTBEAT_SECONDS = 0.02

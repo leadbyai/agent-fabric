@@ -57,6 +57,7 @@ PORT = int(os.environ.get("OPENBOT_BRIDGE_PORT", "8765"))
 TIMEOUT_MS = int(os.environ.get("OPENBOT_BRIDGE_TIMEOUT_MS", "120000"))
 BUSY_WAIT_SECONDS = int(os.environ.get("OPENBOT_BRIDGE_BUSY_WAIT_SECONDS", "0"))
 RECOVERY_SECONDS = int(os.environ.get("OPENBOT_BRIDGE_RECOVERY_SECONDS", "0"))
+ACTIVE_WAIT_SECONDS = int(os.environ.get("OPENBOT_BRIDGE_ACTIVE_WAIT_SECONDS", "7200"))
 LEDGER_PATH = os.environ.get("OPENBOT_BRIDGE_LEDGER_PATH", "").strip()
 LEDGER: RequestLedger | None = None
 HEARTBEAT_SECONDS = 15.0
@@ -1096,7 +1097,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def prompt_with_liveness(self, session: str, pane_id: str, prompt: str,
                              marker_id: str) -> str:
-        """Submit exactly once. On an ambiguous timeout, observe; never retry."""
+        """Submit once. Give a working turn time to finish before timing reply correlation."""
+        extend_working = RECOVERY_SECONDS > 0 and ACTIVE_WAIT_SECONDS > 0
+        active_deadline = time.monotonic() + ACTIVE_WAIT_SECONDS
+        initial_agent = agent_record(session, pane_id) if extend_working else {}
+        terminal_id = initial_agent.get("terminal_id")
+
+        def native_session(agent: dict):
+            identity = agent.get("agent_session")
+            return identity.get("value") if isinstance(identity, dict) else None
+
+        session_id = native_session(initial_agent)
         args = ("agent", "prompt", pane_id, prompt, "--wait", "--until", "idle",
                 "--until", "done", "--until", "blocked", "--timeout", str(TIMEOUT_MS))
         timeout_error: Exception | None = None
@@ -1120,28 +1131,49 @@ class Handler(BaseHTTPRequestHandler):
                          isinstance(timeout_error, subprocess.TimeoutExpired))):
                 raise timeout_error
 
-        # A successful Herdr --wait return does not guarantee the response
-        # markers are already visible in recent-unwrapped. Poll for them even
-        # without an explicit Herdr timeout; otherwise a fast status change
-        # can mark the request uncertain and release the pane to the next run.
-        deadline = time.monotonic() + RECOVERY_SECONDS
+        # Herdr cannot read recent history from an active Claude pane. A CLI
+        # wait timeout does not mean the turn stopped. Only start the shorter
+        # marker-correlation window when the pane is available to read.
+        correlation_deadline = None
         while True:
-            if normalized_state(agent_record(session, pane_id)) == "blocked":
+            agent = agent_record(session, pane_id)
+            state = normalized_state(agent)
+            current_session = native_session(agent)
+            if ((terminal_id and agent.get("terminal_id") != terminal_id)
+                    or (session_id and current_session and current_session != session_id)):
+                raise RuntimeError("Agent session changed after submission. Inspect Herdr before retrying.")
+            session_id = session_id or current_session
+            if state == "blocked":
                 raise RuntimeError(f"Agent {pane_id} needs an approval or answer in Herdr")
+
+            now = time.monotonic()
+            if extend_working and state == "working":
+                if now >= active_deadline:
+                    raise RuntimeError(
+                        "Agent is still working after the gateway's active wait limit. "
+                        "The request was submitted once. Inspect Herdr before retrying."
+                    )
+                correlation_deadline = None
+                self.send_submitted_progress("working")
+                time.sleep(min(STATE_POLL_SECONDS, max(0.0, active_deadline - time.monotonic())))
+                continue
+
+            if correlation_deadline is None:
+                correlation_deadline = now + RECOVERY_SECONDS
             try:
                 transcript = command("agent", "read", pane_id,
                                      "--source", "recent-unwrapped", "--lines", "200",
                                      session=session, wait_seconds=30)
                 return normalize_prose_wrapping(extract_reply(transcript, marker_id))
-            except RuntimeError as exc:
-                if time.monotonic() >= deadline:
+            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+                if time.monotonic() >= correlation_deadline:
                     raise RuntimeError(
                         "Submitted agent reply could not be correlated "
                         "within the recovery window. Inspect Herdr before retrying; "
                         "automatic resubmission is disabled."
                     ) from exc
             self.send_submitted_progress("recovering")
-            time.sleep(min(STATE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+            time.sleep(min(STATE_POLL_SECONDS, max(0.0, correlation_deadline - time.monotonic())))
 
     def read_request_body(self) -> bytes:
         """Read bounded JSON bodies using Content-Length or HTTP chunked framing."""
@@ -1505,6 +1537,8 @@ def main() -> None:
         sys.exit("OPENBOT_BRIDGE_BUSY_WAIT_SECONDS must be between 0 and 3600")
     if RECOVERY_SECONDS < 0 or RECOVERY_SECONDS > 3600:
         sys.exit("OPENBOT_BRIDGE_RECOVERY_SECONDS must be between 0 and 3600")
+    if not 0 <= ACTIVE_WAIT_SECONDS <= 86400:
+        sys.exit("OPENBOT_BRIDGE_ACTIVE_WAIT_SECONDS must be between 0 and 86400")
     if BUSY_WAIT_SECONDS and not LEDGER_PATH:
         sys.exit("Enable a persistent OPENBOT_BRIDGE_LEDGER_PATH before enabling busy waiting")
     if LEDGER_PATH:
