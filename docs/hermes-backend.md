@@ -86,7 +86,8 @@ dedicated to one verified private OpenBot thread and one exact native Discord se
 Both require the route's bearer credential and the exact pinned thread.
 
 The bridge uses the active provider's native Hermes inventory and a revision-fenced session
-mutation. The preview accepts low, medium and high effort on xAI reasoning models. The
+mutation. The preview accepts low, medium and high effort on xAI reasoning models.
+The Profile default model choice clears the session's model override through Hermes. The
 OpenBot server must verify the chat owner's linked Discord identity before forwarding requests.
 This setting does not isolate messages, tools or memory on a shared Hermes profile.
 

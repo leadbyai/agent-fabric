@@ -45,6 +45,7 @@ ROUTE_RE = re.compile(r"/profiles/([a-z0-9][a-z0-9_-]{0,63})/ag-ui\Z")
 MODEL_ROUTE = re.compile(r"/profiles/([a-z0-9][a-z0-9_-]{0,63})/model\Z")
 SESSION_SOURCE = "gui"
 CLIENT_NAME = "agent-fabric"
+PROFILE_DEFAULT_MODEL = "hermes:profile-default"
 HEARTBEAT_SECONDS = 15.0
 DENY_CHOICES = ("deny", "reject", "no", "cancel", "abort")
 # Toolsets a GUI-source session gets from its client surface even when every platform toolset is empty.
@@ -621,6 +622,9 @@ async def pinned_model_control(client, session_id: str, selection: dict | None =
         raise ModelControlRefused(404, "Not found")
     menu = await client.rpc("model.options", session_id=session_id, explicit_only=True)
     models = available_models(menu)
+    if models:
+        models.append({"id": PROFILE_DEFAULT_MODEL, "label": "Profile default model",
+                       "section": "main", "efforts": []})
     if selection is not None:
         if snapshot.get("running") is not False:
             raise ModelControlRefused(409, "Wait for the active Hermes turn to finish.")
@@ -632,7 +636,11 @@ async def pinned_model_control(client, session_id: str, selection: dict | None =
         generation = snapshot.get("execution_generation")
         if type(revision) is not int or type(generation) is not int:
             raise ModelControlRefused(409, "Hermes did not provide the session version.")
-        if model["id"] == info.get("model"):
+        reset = model["id"] == PROFILE_DEFAULT_MODEL
+        if reset:
+            operation, payload = "model", {"model": "reset"}
+            change = True
+        elif model["id"] == info.get("model"):
             operation, payload = "reasoning", {"effort": effort}
             change = effort is not None and effort != info.get("reasoning_effort")
         else:
@@ -649,7 +657,9 @@ async def pinned_model_control(client, session_id: str, selection: dict | None =
             if result.get("status") == "queued":
                 raise ModelControlRefused(409, "Hermes queued the settings change for the next turn.")
             info = await client.rpc("session.info", session_id=session_id)
-            if info.get("model") != model["id"] or (effort is not None and info.get("reasoning_effort") != effort):
+            expected_model = result.get("model") if reset else model["id"]
+            if (not expected_model or info.get("model") != expected_model
+                    or (effort is not None and info.get("reasoning_effort") != effort)):
                 raise ModelControlRefused(409, "Hermes has not confirmed the requested settings yet.")
     active_model = info.get("model")
     current = None if not active_model else {

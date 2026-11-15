@@ -774,9 +774,10 @@ class PinnedModelTests(unittest.IsolatedAsyncioTestCase):
         if method == "session.mutate":
             data = params["payload"]
             if "model" in data:
-                self.info["model"] = data["model"]
-            self.info["reasoning_effort"] = data.get("reasoning") or data.get("effort")
-            return {"revision": 43}
+                self.info["model"] = "grok-profile-default" if data["model"] == "reset" else data["model"]
+            if "reasoning" in data or "effort" in data:
+                self.info["reasoning_effort"] = data.get("reasoning") or data.get("effort")
+            return {"revision": 43, "model": self.info["model"]}
         raise AssertionError(method)
 
     async def test_fenced_model_effort_on_pinned_session_and_unrelated_fields_omitted(self):
@@ -784,7 +785,7 @@ class PinnedModelTests(unittest.IsolatedAsyncioTestCase):
             self.client, "pinned", {"model": "grok-4.7", "effort": "high"})
         self.assertEqual((result["current"]["model"], result["current"]["effort"]), ("grok-4.7", "high"))
         self.assertNotIn("must-not-leave-hermes", json.dumps(result))
-        self.assertEqual([option["id"] for option in result["models"]], ["grok-4.6", "grok-4.7"])
+        self.assertEqual([option["id"] for option in result["models"]], ["grok-4.6", "grok-4.7", "hermes:profile-default"])
         mutation = self.client.rpc.await_args_list[3]
         self.assertEqual(mutation.args, ("session.mutate",))
         self.assertEqual(mutation.kwargs["session_id"], "pinned")
@@ -800,11 +801,18 @@ class PinnedModelTests(unittest.IsolatedAsyncioTestCase):
         row["models"].append(model)
         row["capabilities"][model] = {"reasoning": True}
         result = await hermes_bridge.pinned_model_control(self.client, "pinned")
-        self.assertEqual(result["models"][-1]["efforts"], [])
+        self.assertEqual(next(option for option in result["models"] if option["id"] == model)["efforts"], [])
         with self.assertRaises(hermes_bridge.ModelControlRefused) as err:
             await hermes_bridge.pinned_model_control(self.client, "pinned", {"model": model, "effort": "high"})
         self.assertEqual(err.exception.status, 422)
         self.assertFalse(any(call.args == ("session.mutate",) for call in self.client.rpc.await_args_list))
+
+    async def test_profile_default_model_can_be_restored_even_when_absent_from_inventory(self):
+        result = await hermes_bridge.pinned_model_control(
+            self.client, "pinned", {"model": hermes_bridge.PROFILE_DEFAULT_MODEL, "effort": None})
+        self.assertEqual(self.client.rpc.await_args_list[3].kwargs["payload"], {"model": "reset"})
+        self.assertEqual((result["current"]["model"], result["current"]["effort"]),
+                         ("grok-profile-default", "low"))
 
     async def test_effort_only_uses_native_reasoning_without_switching_models(self):
         await hermes_bridge.pinned_model_control(
