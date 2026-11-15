@@ -77,6 +77,20 @@ Images saved there are embedded in the authenticated reply with the existing scr
 size and file checks. Identical retries replay the stored reply and changed input under
 the same run ID is refused. Deployments without a media directory retain text-only behavior.
 
+### Session-only model control for a pinned Discord DM
+
+The staging option `HERMES_PINNED_MODEL_CONTROL=1` is off by default. Use it only with a bridge
+dedicated to one verified private OpenBot thread and one exact native Discord session. It exposes
+`GET /profiles/{profile}/model?threadId={threadId}` and
+`PUT /profiles/{profile}/model` with `threadId`, `model`, and optional `effort`.
+Both require the route's bearer credential and the exact pinned thread.
+
+The bridge uses the active provider's native Hermes inventory and a revision-fenced session
+mutation. The preview accepts low, medium and high effort on xAI reasoning models.
+The Profile default model choice clears the session's model override through Hermes. The
+OpenBot server must verify the chat owner's linked Discord identity before forwarding requests.
+This setting does not isolate messages, tools or memory on a shared Hermes profile.
+
 ### Isolated shared profile (`HERMES_ISOLATED_PROFILE=1`)
 
 For people an owner shares a Bot with, run a **second** bridge in front of a **separate** Hermes profile, never the
