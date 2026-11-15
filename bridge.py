@@ -29,6 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+import model_control
 from request_ledger import RequestLedger
 
 
@@ -122,6 +123,11 @@ TEXT_MIMES = {
 PANE_RE = re.compile(r"w[0-9A-Za-z]+:p[0-9A-Za-z]+\Z")
 SESSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 AGENT_ROUTE = re.compile(r"/sessions/([A-Za-z0-9][A-Za-z0-9_-]{0,63})/agents/(w[0-9A-Za-z]+:p[0-9A-Za-z]+)/ag-ui\Z")
+MODEL_ROUTE = re.compile(r"/sessions/([A-Za-z0-9][A-Za-z0-9_-]{0,63})/agents/(w[0-9A-Za-z]+:p[0-9A-Za-z]+)/model\Z")
+# Session-only model/effort switching (model_control.py). "off" keeps reading but refuses switches.
+MODEL_SWITCH = os.environ.get("OPENBOT_BRIDGE_MODEL_SWITCH", "on").strip().lower() != "off"
+MODEL_CACHE_SECONDS = 600.0
+MAX_MODEL_BODY = 4096
 ALL_ROUTES = "*"  # scope of a bridge-wide credential
 DISCOVERY = "discovery"  # scope of the discovery-only credential: GET /agents and /attention only
 
@@ -309,6 +315,103 @@ def waiting_queue(session: str, pane_id: str) -> deque[object]:
         if key not in WAIT_QUEUES:
             WAIT_QUEUES[key] = deque()
         return WAIT_QUEUES[key]
+
+
+class HerdrPane:
+    """model_control.Pane over Herdr's agent commands for one live agent pane."""
+
+    def __init__(self, session: str, pane_id: str):
+        self.session, self.pane_id = session, pane_id
+
+    def screen(self) -> str:
+        # The visible screen, read at once ("recent" waits ~0.4 s to settle; the drivers poll anyway).
+        return command("agent", "read", self.pane_id, "--source", "visible", session=self.session)
+
+    def styled(self) -> str:
+        # The same screen with ANSI styling, so a dim placeholder hint is not mistaken for a typed draft.
+        return command("agent", "read", self.pane_id, "--source", "visible", "--format", "ansi", session=self.session)
+
+    def keys(self, *names: str) -> None:
+        command("agent", "send-keys", self.pane_id, *names, session=self.session)
+
+    def submit(self, text: str) -> None:
+        command("agent", "prompt", self.pane_id, text, session=self.session)
+
+
+MODEL_STATE_GUARD = threading.Lock()
+MODEL_STATES: dict[tuple[str, str], tuple[float, str, object]] = {}  # route -> (at, agent session id, state)
+
+
+def agent_identity(agent: dict) -> str:
+    """The CLI session in the pane, so a cached model never outlives the agent it was read from."""
+    identity = agent.get("agent_session")
+    if isinstance(identity, dict):
+        return str(identity.get("value") or "")
+    return str(agent.get("terminal_id") or "")
+
+
+def cached_model_state(session: str, pane_id: str, agent: dict):
+    with MODEL_STATE_GUARD:
+        entry = MODEL_STATES.get((session, pane_id))
+    if entry and entry[1] == agent_identity(agent) and time.monotonic() - entry[0] < MODEL_CACHE_SECONDS:
+        return entry[2], entry[0]
+    return None, None
+
+
+def remember_model_state(session: str, pane_id: str, agent: dict, state) -> None:
+    with MODEL_STATE_GUARD:
+        MODEL_STATES[(session, pane_id)] = (time.monotonic(), agent_identity(agent), state)
+
+
+def observed_iso(at: float | None) -> str | None:
+    if at is None:
+        return None
+    wall = time.time() - (time.monotonic() - at)
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(wall))
+
+
+def model_view(session: str, pane_id: str, agent: dict, *, refresh: bool) -> dict:
+    """What the agent offers and runs on. Reading Claude Code's model means opening and closing its
+    menu, which holds the pane for a second or two, so it happens only on `?refresh=1` (OpenBot asks
+    when someone opens the picker), and only while the agent is idle and no request holds its pane.
+    Otherwise the model is the last one read or set here, with the effort shown beside the prompt."""
+    kind = str(agent.get("agent") or "")
+    try:
+        models = model_control.catalogue_for(kind)
+    except model_control.Unsupported as exc:
+        return model_control.describe(kind, None, None, switchable=False, reason=str(exc), observed_at=None)
+    except (OSError, ValueError) as exc:
+        return model_control.describe(kind, None, None, switchable=False,
+                                      reason=f"Model list unreadable ({type(exc).__name__})", observed_at=None)
+    state, at = cached_model_state(session, pane_id, agent)
+    reason = None if MODEL_SWITCH else "Model switching is turned off on this gateway"
+    idle = normalized_state(agent) in ("idle", "done")
+    if kind == "codex":
+        try:
+            state, at = model_control.CodexDriver().read(HerdrPane(session, pane_id), models), time.monotonic()
+            remember_model_state(session, pane_id, agent, state)
+        except (model_control.Unverified, RuntimeError, subprocess.TimeoutExpired):
+            pass
+    elif not refresh:
+        # Passive: the effort beside the prompt; the model as last read or set here.
+        try:
+            effort = model_control.claude_footer_effort(HerdrPane(session, pane_id).screen())
+        except (RuntimeError, subprocess.TimeoutExpired):
+            effort = None
+        if state is not None and effort and effort != state.effort:
+            state = model_control.ModelState(state.model, state.label, effort)
+    elif idle:
+        lock = target_lock(session, pane_id)
+        if lock.acquire(blocking=False):
+            try:
+                state, at = model_control.ClaudeDriver().read(HerdrPane(session, pane_id), models), time.monotonic()
+                remember_model_state(session, pane_id, agent, state)
+            except (model_control.NotIdle, model_control.Unverified, RuntimeError, subprocess.TimeoutExpired):
+                pass
+            finally:
+                lock.release()
+    return model_control.describe(kind, models, state, switchable=MODEL_SWITCH, reason=reason,
+                                  observed_at=observed_iso(at))
 
 
 def last_user_text(body: dict) -> str:
@@ -807,7 +910,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/health":
             self.json_response(200, {"ok": True, "version": "0.7.0", "mode": "multi-agent",
-                                     "busy_wait_enabled": BUSY_WAIT_SECONDS > 0})
+                                     "busy_wait_enabled": BUSY_WAIT_SECONDS > 0,
+                                     "model_control": {"read": True, "switch": MODEL_SWITCH}})
             return
         # Public capability links do not carry the gateway's broad bearer
         # credential. Possession of a 256-bit random path is the only grant.
@@ -852,6 +956,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if scope == DISCOVERY and path not in ("/agents", "/attention"):
             self.json_response(404, {"error": "not_found"})
+            return
+        model_route = MODEL_ROUTE.fullmatch(path.rstrip("/"))
+        if model_route:
+            agent = self.model_target(scope, model_route)
+            if agent is not None:
+                refresh = "refresh=1" in (urlsplit(self.path).query or "").split("&")
+                self.json_response(200, model_view(*model_route.groups(), agent, refresh=refresh))
             return
         if path.startswith("/requests/") and LEDGER is not None:
             key = path.removeprefix("/requests/")
@@ -904,6 +1015,98 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_response(503, {"error": str(exc)})
             return
         self.json_response(404, {"error": "not_found"})
+
+    def model_target(self, scope, route) -> dict | None:
+        """The live agent behind a model route, or None once an error response has been sent."""
+        session, pane_id = route.groups()
+        if not in_scope(scope, session, pane_id):
+            self.json_response(404, {"error": "agent_not_found"})
+            return None
+        try:
+            return live_target(session, pane_id)
+        except LookupError:
+            self.json_response(404, {"error": "agent_not_found"})
+        except (RuntimeError, OSError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError):
+            self.json_response(503, {"error": "Herdr session unavailable"})
+        return None
+
+    def do_PUT(self) -> None:
+        """Switch an agent's model and effort for its current session only (model_control.py)."""
+        path = urlsplit(self.path).path.rstrip("/")
+        route = MODEL_ROUTE.fullmatch(path)
+        if not route:
+            self.json_response(404, {"error": "not_found"})
+            return
+        scope = self.scope()
+        if scope is None:
+            self.json_response(401, {"error": "unauthorized"})
+            return
+        if scope == DISCOVERY:
+            self.json_response(404, {"error": "agent_not_found"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            length = -1
+        if length <= 0 or length > MAX_MODEL_BODY:
+            self.json_response(400, {"error": "Expected a small JSON body: {\"model\": ..., \"effort\": ...}"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length))
+        except (ValueError, UnicodeDecodeError):
+            self.json_response(400, {"error": "Invalid JSON"})
+            return
+        if not isinstance(body, dict):
+            self.json_response(400, {"error": "Invalid JSON"})
+            return
+        agent = self.model_target(scope, route)
+        if agent is None:
+            return
+        session, pane_id = route.groups()
+        kind = str(agent.get("agent") or "")
+        if not MODEL_SWITCH:
+            self.json_response(403, {"error": "model_switch_disabled"})
+            return
+        try:
+            models = model_control.catalogue_for(kind)
+            option, effort = model_control.validate(models, body.get("model"), body.get("effort"))
+        except model_control.Unsupported as exc:
+            self.json_response(501, {"error": "unsupported", "message": str(exc)})
+            return
+        except model_control.InvalidChoice as exc:
+            self.json_response(422, {"error": "invalid_choice", "message": str(exc)})
+            return
+        except (OSError, ValueError):
+            self.json_response(501, {"error": "unsupported", "message": "Model list unreadable on this host"})
+            return
+        lock = target_lock(session, pane_id)
+        if not lock.acquire(blocking=False):
+            self.json_response(409, {"error": "agent_busy", "message": "A request is running on this agent"})
+            return
+        try:
+            try:
+                current = agent_record(session, pane_id)
+                if agent_identity(current) != agent_identity(agent) or normalized_state(current) not in ("idle", "done"):
+                    self.json_response(409, {"error": "agent_busy",
+                                             "message": "Models switch only while the agent is idle"})
+                    return
+                state = model_control.driver_for(kind).switch(HerdrPane(session, pane_id), option, effort)
+            except model_control.NotIdle as exc:
+                self.json_response(409, {"error": "agent_not_ready", "message": str(exc)})
+                return
+            except model_control.Unverified as exc:
+                self.log_message("Model switch unverified on %s/%s (%s)", session, pane_id, kind)
+                self.json_response(502, {"error": "switch_unverified", "message": str(exc)})
+                return
+            except (RuntimeError, OSError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError):
+                self.json_response(503, {"error": "Herdr session unavailable"})
+                return
+            remember_model_state(session, pane_id, agent, state)
+            self.log_message("Model switched on %s/%s (%s) for this session", session, pane_id, kind)
+            self.json_response(200, model_control.describe(kind, models, state, switchable=True, reason=None,
+                                                           observed_at=observed_iso(time.monotonic())))
+        finally:
+            lock.release()
 
     def send_event(self, payload: dict) -> None:
         message = "data: " + json.dumps(payload, separators=(",", ":")) + "\n\n"
