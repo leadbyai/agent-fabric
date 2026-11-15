@@ -34,7 +34,7 @@ import uuid
 from http.server import ThreadingHTTPServer
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import bridge
 from request_ledger import RequestLedger
@@ -42,6 +42,7 @@ from request_ledger import RequestLedger
 VERSION = "0.8.0-hermes.6"
 PROFILE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 ROUTE_RE = re.compile(r"/profiles/([a-z0-9][a-z0-9_-]{0,63})/ag-ui\Z")
+MODEL_ROUTE = re.compile(r"/profiles/([a-z0-9][a-z0-9_-]{0,63})/model\Z")
 SESSION_SOURCE = "gui"
 CLIENT_NAME = "agent-fabric"
 HEARTBEAT_SECONDS = 15.0
@@ -83,6 +84,7 @@ def env_config() -> dict:
         "timeout": int(os.environ.get("OPENBOT_BRIDGE_TIMEOUT_SECONDS", "900")),
         "approval_wait": int(os.environ.get("HERMES_APPROVAL_WAIT_SECONDS", "0")),
         "allow_native": os.environ.get("HERMES_ALLOW_NATIVE_ATTACH", "0").strip() == "1",
+        "pinned_model_control": os.environ.get("HERMES_PINNED_MODEL_CONTROL", "").strip() == "1",
         "bound_thread": os.environ.get("HERMES_BOUND_THREAD_ID", "").strip(),
         "bound_session": os.environ.get("HERMES_BOUND_SESSION_ID", "").strip(),
         "media_root": os.environ.get("HERMES_BRIDGE_MEDIA_ROOT", "").strip(),
@@ -579,6 +581,84 @@ async def open_session(client, ledger: HermesLedger, profile_id: str, thread_id:
     return session_id, True
 
 
+class ModelControlRefused(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+def available_models(inventory: dict) -> list[dict]:
+    """The active Hermes provider's models; never expose credential, URL, or account details."""
+    provider = inventory.get("provider")
+    providers = inventory.get("providers")
+    if not provider or not isinstance(providers, list):
+        return []
+    row = next((row for row in providers if row.get("slug") == provider), {})
+    if row.get("authenticated") is False:
+        return []
+    models = []
+    for model in row.get("models") or []:
+        if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}", model):
+            continue
+        flags = (row.get("capabilities") or {}).get(model) or {}
+        # Brewster's provider supports these levels across its reasoning models. Other providers
+        # remain model-only until the bridge can verify their per-model effort vocabulary.
+        efforts = ["low", "medium", "high"] if (provider in {"xai", "xai-oauth"}
+            and flags.get("reasoning") is True) else []
+        models.append({"id": model, "label": model, "section": "main", "efforts": efforts})
+    return models
+
+
+async def pinned_model_control(client, session_id: str, selection: dict | None = None) -> dict:
+    """Read or change the exact existing Discord DM using the native owner's revision fences."""
+    snapshot = await client.rpc("session.resume", session_id=session_id, omit_messages=True)
+    if snapshot.get("session_id") != session_id or snapshot.get("stored_session_id") != session_id:
+        raise ModelControlRefused(404, "Not found")
+    info = await client.rpc("session.info", session_id=session_id)
+    if info.get("source") != "discord":
+        raise ModelControlRefused(404, "Not found")
+    menu = await client.rpc("model.options", session_id=session_id, explicit_only=True)
+    models = available_models(menu)
+    if selection is not None:
+        if snapshot.get("running") is not False:
+            raise ModelControlRefused(409, "Wait for the active Hermes turn to finish.")
+        model = next((model for model in models if model["id"] == selection["model"]), None)
+        effort = selection["effort"]
+        if model is None or (effort is not None and effort not in model["efforts"]):
+            raise ModelControlRefused(422, "That model or effort is unavailable for this session.")
+        revision = snapshot.get("revision")
+        generation = snapshot.get("execution_generation")
+        if type(revision) is not int or type(generation) is not int:
+            raise ModelControlRefused(409, "Hermes did not provide the session version.")
+        if model["id"] == info.get("model"):
+            operation, payload = "reasoning", {"effort": effort}
+            change = effort is not None and effort != info.get("reasoning_effort")
+        else:
+            operation, payload = "model", {"model": model["id"], "provider": menu["provider"]}
+            if effort is not None:
+                payload["reasoning"] = effort
+            change = True
+        if change:
+            result = await client.rpc("session.mutate", session_id=session_id, request_id=uuid.uuid4().hex,
+                                      expected_revision=revision, expected_generation=generation,
+                                      operation=operation, payload=payload)
+            if result.get("status") == "confirmation_required":
+                raise ModelControlRefused(409, "Hermes requires confirmation before switching models.")
+            if result.get("status") == "queued":
+                raise ModelControlRefused(409, "Hermes queued the settings change for the next turn.")
+            info = await client.rpc("session.info", session_id=session_id)
+            if info.get("model") != model["id"] or (effort is not None and info.get("reasoning_effort") != effort):
+                raise ModelControlRefused(409, "Hermes has not confirmed the requested settings yet.")
+    active_model = info.get("model")
+    current = None if not active_model else {
+        "model": active_model, "label": active_model, "effort": info.get("reasoning_effort") or None,
+        "observed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    return {"agent": "hermes", "provider": menu.get("provider") or None, "current": current,
+            "models": models, "switchable": bool(models),
+            "reason": None if models else "Hermes did not list models for this session."}
+
+
 class HermesHandler(bridge.Handler):
     server_version = f"AgentFabricHermes/{VERSION}"
     config: dict = {}
@@ -591,10 +671,75 @@ class HermesHandler(bridge.Handler):
     def profile_id_scope(self, scope: tuple[str, ...]) -> set[str]:
         return {str(self.connector.profile_home(name)) for name in scope}
 
-    def do_GET(self) -> None:
+    def bound_model(self, path: str, thread: str, selection: dict | None = None) -> None:
+        match = MODEL_ROUTE.fullmatch(path)
+        scope = self.scope()
+        if not scope:
+            self.json_response(401, {"error": "unauthorized"})
+            return
+        if (not match or match.group(1) not in scope or not self.config.get("pinned_model_control")
+                or not self.config.get("allow_native") or not self.config.get("bound_session")
+                or not thread or thread != self.config.get("bound_thread")):
+            self.json_response(404, {"error": "not_found"})
+            return
+        found = self.connector.discover(match.group(1))
+        if found.endpoint is None or found.state != "ready":
+            self.json_response(503, {"error": "Hermes gateway unavailable"})
+            return
+
+        async def work():
+            async with self.connector.connect(found.endpoint) as client:
+                return await pinned_model_control(client, self.config["bound_session"], selection)
+
+        try:
+            response = asyncio.run(work())
+        except ModelControlRefused as exc:
+            self.json_response(exc.status, {"error": str(exc)})
+        except Exception as exc:
+            self.log_message("Hermes model control failed: %s", type(exc).__name__)
+            self.json_response(503, {"error": "Hermes could not verify the session settings."})
+        else:
+            self.json_response(200, response)
+
+    def do_PUT(self) -> None:
         path = urlsplit(self.path).path
+        if not MODEL_ROUTE.fullmatch(path):
+            self.json_response(404, {"error": "not_found"})
+            return
+        if not self.scope():
+            self.json_response(401, {"error": "unauthorized"})
+            return
+        try:
+            size = int(self.headers.get("Content-Length") or "0")
+            if not 0 < size <= 4096 or self.headers.get("Transfer-Encoding"):
+                raise ValueError
+            self.connection.settimeout(10)
+            raw = self.rfile.read(size)
+            if len(raw) != size:
+                raise ValueError
+            body = json.loads(raw)
+            if (not isinstance(body, dict) or set(body) - {"threadId", "model", "effort"}
+                    or not isinstance(body.get("threadId"), str) or not isinstance(body.get("model"), str)
+                    or (body.get("effort") is not None and not isinstance(body["effort"], str))):
+                raise ValueError
+        except (ValueError, TimeoutError):
+            self.close_connection = True
+            self.json_response(400, {"error": "Expected threadId, model, and optional effort."})
+            return
+        self.bound_model(path, body["threadId"], {"model": body["model"], "effort": body.get("effort")})
+
+    def do_GET(self) -> None:
+        url = urlsplit(self.path)
+        path = url.path
+        if MODEL_ROUTE.fullmatch(path):
+            threads = parse_qs(url.query).get("threadId", [])
+            self.bound_model(path, threads[0] if len(threads) == 1 else "")
+            return
         if path == "/health":
-            self.json_response(200, {"ok": True, "version": VERSION, "mode": "hermes"})
+            health = {"ok": True, "version": VERSION, "mode": "hermes"}
+            if self.config.get("pinned_model_control"):
+                health["model_control"] = {"read": True, "switch": True}
+            self.json_response(200, health)
             return
         scope = self.scope()
         if not scope:
@@ -767,6 +912,9 @@ def main() -> None:
         if (not config["bound_thread"] or not config["bound_session"] or not config["allow_native"]
                 or len(config["profiles"]) != 1):
             sys.exit("A pinned bridge requires native attach, a thread, a session and one dedicated HERMES_HOME")
+    if config["pinned_model_control"] and not (config["allow_native"] and config["bound_session"]
+                                               and config["bound_thread"]):
+        sys.exit("Hermes model control requires one explicitly pinned native session and thread")
     if config["media_root"]:
         root = Path(config["media_root"])
         if (not config["bound_session"] or not root.is_absolute() or not root.is_dir()

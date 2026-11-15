@@ -146,6 +146,24 @@ class HermesBridgeTests(unittest.TestCase):
         self.assertEqual(self.run_turn.__func__(self, profile="pilot")[0], 200)
         self.assertEqual(self.request("POST", "/profiles/pilot/ag-ui", {}, token="wrong")[0], 401)
 
+    def test_model_control_requires_exact_pinned_thread_before_contacting_hermes(self):
+        path = "/profiles/pilot/model"
+        config = self.server.RequestHandlerClass.config
+        config.update(allow_native=True, bound_thread="thread-private", bound_session="discord-owner")
+        callback = unittest.mock.AsyncMock(return_value={"switchable": True})
+        with unittest.mock.patch.object(hermes_bridge, "pinned_model_control", callback):
+            self.assertEqual(self.request("GET", path + "?threadId=thread-private")[0], 404)
+            config["pinned_model_control"] = True
+            self.assertEqual(self.request("GET", path + "?threadId=thread-other")[0], 404)
+            self.assertEqual(self.request("GET", path + "?threadId=thread-private", token="crossed")[0], 401)
+            self.assertEqual(self.request("PUT", path, {"threadId": "thread-other", "model": "other"})[0], 404)
+            callback.assert_not_awaited()
+            self.assertEqual(self.request("GET", path + "?threadId=thread-private")[0], 200)
+            choice = {"model": "grok-4.7", "effort": "high"}
+            self.assertEqual(self.request("PUT", path, {"threadId": "thread-private", **choice})[0], 200)
+            self.assertEqual([call.args[1:] for call in callback.await_args_list],
+                             [("discord-owner", None), ("discord-owner", choice)])
+
     def test_agents_lists_only_allowed_profiles_with_stable_identity(self):
         status, data = self.request("GET", "/agents")
         self.assertEqual(status, 200)
@@ -518,8 +536,6 @@ class HermesBridgeTests(unittest.TestCase):
                 hermes_bridge.check_bind_host(bad)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class IsolatedProfileTests(unittest.TestCase):
@@ -733,3 +749,68 @@ class IsolatedConnectorTests(unittest.TestCase):
             with unittest.mock.patch.dict("os.environ", {"HERMES_HOME": str(home), "HOME": tmp}, clear=True):
                 self.assertEqual(connector.isolated_profile_problems(),
                                  ["an isolated profile cannot live in the default Hermes home"])
+
+
+class PinnedModelTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.snapshot = {"session_id": "pinned", "stored_session_id": "pinned",
+                         "revision": 42, "execution_generation": 7, "running": False}
+        self.info = {"source": "discord", "model": "grok-4.6", "reasoning_effort": "low"}
+        self.inventory = {"provider": "xai-oauth", "providers": [
+            {"slug": "xai-oauth", "models": ["grok-4.6", "grok-4.7"],
+             "capabilities": {"grok-4.6": {"reasoning": True}, "grok-4.7": {"reasoning": True}},
+             "api_url": "must-not-leave-hermes"},
+            {"slug": "other", "models": ["foreign-provider"]},
+        ]}
+        self.client = SimpleNamespace(rpc=unittest.mock.AsyncMock(side_effect=self.rpc))
+
+    def rpc(self, method, **params):
+        if method == "session.resume":
+            return dict(self.snapshot)
+        if method == "session.info":
+            return dict(self.info)
+        if method == "model.options":
+            return dict(self.inventory)
+        if method == "session.mutate":
+            data = params["payload"]
+            if "model" in data:
+                self.info["model"] = data["model"]
+            self.info["reasoning_effort"] = data.get("reasoning") or data.get("effort")
+            return {"revision": 43}
+        raise AssertionError(method)
+
+    async def test_fenced_model_effort_on_pinned_session_and_unrelated_fields_omitted(self):
+        result = await hermes_bridge.pinned_model_control(
+            self.client, "pinned", {"model": "grok-4.7", "effort": "high"})
+        self.assertEqual((result["current"]["model"], result["current"]["effort"]), ("grok-4.7", "high"))
+        self.assertNotIn("must-not-leave-hermes", json.dumps(result))
+        self.assertEqual([option["id"] for option in result["models"]], ["grok-4.6", "grok-4.7"])
+        mutation = self.client.rpc.await_args_list[3]
+        self.assertEqual(mutation.args, ("session.mutate",))
+        self.assertEqual(mutation.kwargs["session_id"], "pinned")
+        self.assertEqual(mutation.kwargs["expected_revision"], 42)
+        self.assertEqual(mutation.kwargs["expected_generation"], 7)
+        self.assertEqual(mutation.kwargs["operation"], "model")
+        self.assertEqual(mutation.kwargs["payload"],
+                         {"model": "grok-4.7", "provider": "xai-oauth", "reasoning": "high"})
+
+    async def test_effort_only_uses_native_reasoning_without_switching_models(self):
+        await hermes_bridge.pinned_model_control(
+            self.client, "pinned", {"model": "grok-4.6", "effort": "medium"})
+        self.assertEqual(self.client.rpc.await_args_list[3].kwargs["operation"], "reasoning")
+
+    async def test_foreign_binding_and_running_session_refuse_before_mutation(self):
+        self.snapshot["stored_session_id"] = "foreign"
+        with self.assertRaises(hermes_bridge.ModelControlRefused) as err:
+            await hermes_bridge.pinned_model_control(self.client, "pinned")
+        self.assertEqual(err.exception.status, 404)
+        self.snapshot.update(stored_session_id="pinned", running=True)
+        with self.assertRaises(hermes_bridge.ModelControlRefused) as err:
+            await hermes_bridge.pinned_model_control(
+                self.client, "pinned", {"model": "grok-4.7", "effort": "high"})
+        self.assertEqual(err.exception.status, 409)
+        self.assertFalse(any(call.args == ("session.mutate",) for call in self.client.rpc.await_args_list))
+
+
+if __name__ == "__main__":
+    unittest.main()
