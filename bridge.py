@@ -29,6 +29,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+import activity_line
+import herdr_browser
 import model_control
 from request_ledger import RequestLedger
 
@@ -62,6 +64,12 @@ LEDGER_PATH = os.environ.get("OPENBOT_BRIDGE_LEDGER_PATH", "").strip()
 LEDGER: RequestLedger | None = None
 HEARTBEAT_SECONDS = 15.0
 STATE_POLL_SECONDS = 2.0
+# OpenBot's Bot activity line (activity_line.py): read the pane every ACTIVITY_SECONDS while a request
+# runs and send what it is doing when that changes. OPENBOT_ACTIVITY_LINE=0 keeps the bare heartbeat.
+ACTIVITY_LINE = os.environ.get("OPENBOT_ACTIVITY_LINE", "1").strip() != "0"
+ACTIVITY_SECONDS = 2.0
+BROWSER_ROUTE = re.compile(r"/openbot-browser/([A-Za-z0-9_-]{40,64})")
+BROWSER_CLI = Path(__file__).resolve().parent / "openbot_browser_cli.py"
 WORKDIR = os.environ.get("OPENBOT_BRIDGE_WORKDIR", "").strip()
 ALLOWED_ROOTS = tuple(s.strip() for s in
     os.environ.get("OPENBOT_BRIDGE_ALLOWED_ROOTS", "").split(":") if s.strip())
@@ -1095,6 +1103,34 @@ class Handler(BaseHTTPRequestHandler):
         self.send_event({"type": "RUN_FINISHED", "threadId": thread_id,
                          "runId": run_id})
 
+    @staticmethod
+    def read_activity(session: str, pane_id: str) -> tuple[str, int] | None:
+        """What the agent is doing, from its visible screen; None when that cannot be read."""
+        try:
+            screen = command("agent", "read", pane_id, "--source", "visible",
+                             session=session, wait_seconds=5)
+            return activity_line.summary(screen)
+        except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired):
+            return None
+
+    def gateway_address(self) -> str:
+        """This gateway as an agent on the same machine reaches it."""
+        host = HOST if HOST not in ("", "0.0.0.0", "::") else "127.0.0.1"
+        return f"http://[{host}]:{PORT}" if ":" in host else f"http://{host}:{PORT}"
+
+    def browser_call(self, key: str) -> None:
+        """POST /openbot-browser/<key>: one browser action for the agent's current turn."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if not 0 < length <= 8192:
+                raise ValueError("bad length")
+            body = json.loads(self.rfile.read(length))
+        except (ValueError, json.JSONDecodeError):
+            self.json_response(400, {"error": "Invalid browser request."})
+            return
+        status, result = herdr_browser.call(key, body)
+        self.json_response(status, result)
+
     def prompt_with_liveness(self, session: str, pane_id: str, prompt: str,
                              marker_id: str) -> str:
         """Submit once. Give a working turn time to finish before timing reply correlation."""
@@ -1114,12 +1150,22 @@ class Handler(BaseHTTPRequestHandler):
         with ThreadPoolExecutor(max_workers=1) as pool:
             submitted = pool.submit(command, *args, session=session,
                                     wait_seconds=TIMEOUT_MS / 1000 + 15)
+            last_beat, last_line = time.monotonic(), None
             while True:
                 try:
-                    submitted.result(timeout=HEARTBEAT_SECONDS)
+                    submitted.result(timeout=ACTIVITY_SECONDS if ACTIVITY_LINE else HEARTBEAT_SECONDS)
                     break
                 except FutureTimeout:
-                    self.send_submitted_progress("working")
+                    activity = self.read_activity(session, pane_id) if ACTIVITY_LINE else None
+                    now = time.monotonic()
+                    if activity is not None and activity[0] != last_line:
+                        last_line, last_beat = activity[0], now
+                        self.send_submitted_event({"type": "CUSTOM", "name": "agent-fabric.progress",
+                                                   "value": {"state": "working", "line": activity[0],
+                                                             "elapsedSeconds": activity[1]}})
+                    elif now - last_beat >= HEARTBEAT_SECONDS:
+                        last_beat = now
+                        self.send_submitted_progress("working")
                 except (RuntimeError, subprocess.TimeoutExpired) as exc:
                     timeout_error = exc
                     break
@@ -1228,6 +1274,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path.rstrip("/")
+        browser = BROWSER_ROUTE.fullmatch(path)
+        if browser:
+            # Authorised by the turn's own random key (herdr_browser.py), held only by that turn's agent.
+            self.browser_call(browser.group(1))
+            return
         match = AGENT_ROUTE.fullmatch(path)
         legacy = path == "/ag-ui" and bool(TARGET)
         if not match and not legacy:
@@ -1331,6 +1382,7 @@ class Handler(BaseHTTPRequestHandler):
         have_slot = not wait_enabled
         stream_started = False
         ledger_reserved = False
+        browser_turn: Path | None = None
         queue_ticket: object | None = None
         pane_queue = waiting_queue(session, pane_id) if wait_enabled else None
         last_progress = 0.0
@@ -1443,6 +1495,16 @@ class Handler(BaseHTTPRequestHandler):
                     "not guaranteed to be byte-for-byte identical to the upload:\n" +
                     "\n".join(f"- {path}" for path in staged)
                 )
+            browser_hint = ""
+            try:
+                browser_turn = herdr_browser.open_turn(body.get("forwardedProps"),
+                                                       self.headers.get("Authorization"),
+                                                       outbox, self.gateway_address())
+            except OSError as exc:
+                self.log_message("OpenBot browser unavailable for this request (%s)", type(exc).__name__)
+            if browser_turn is not None:
+                browser_hint = herdr_browser.prompt_hint(
+                    browser_turn, f".openbot-outbox/{marker_id}/{browser_turn.name}", BROWSER_CLI)
             prompt = (
                 f"[OpenBot pilot request {marker_id}]\n{user_text}"
                 f"{attachment_instructions}\n\n"
@@ -1453,7 +1515,8 @@ class Handler(BaseHTTPRequestHandler):
                 f"into .openbot-outbox/{marker_id}/. The gateway automatically attaches "
                 "the image files in that directory. No OPENBOT_IMAGE declaration or "
                 "special reply formatting is needed. This is optional; never claim a "
-                "screenshot was attached unless you saved the image. Keep the response concise."
+                "screenshot was attached unless you saved the image. "
+                f"{browser_hint}Keep the response concise."
             )
             if LEDGER:
                 try:
@@ -1491,6 +1554,7 @@ class Handler(BaseHTTPRequestHandler):
                 LEDGER.uncertain(request_key)
             pass
         finally:
+            herdr_browser.close_turn(browser_turn)
             if queue_ticket is not None and pane_queue is not None:
                 with WAIT_QUEUES_GUARD:
                     pane_queue.remove(queue_ticket)
