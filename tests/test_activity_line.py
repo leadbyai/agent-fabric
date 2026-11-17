@@ -55,6 +55,12 @@ class Redaction(unittest.TestCase):
             "● Cloning https://derek:hunter2@github.com/x.git": "hunter2",
             "● Running deploy --token s3cr3tvalue": "s3cr3tvalue",
             "● Using ghp_0123456789abcdefghijklmnopqrstuvwxyz": "ghp_0123456789abcdef",
+            "● Running mysql -uroot -pS3cretPass db": "S3cretPass",
+            "● Running curl -u derek:hunter2 https://api.example.com": "hunter2",
+            "● Running curl --user=derek:hunter2 https://x": "hunter2",
+            "● Running sshpass -p hunter2 ssh host": "hunter2",
+            "● Running sshpass -phunter2 ssh host": "hunter2",
+            "● Running PGPASSWORD=hunter2 psql": "hunter2",
         }
         for line, secret in cases.items():
             shown = al.summary_line(line + "\n✢ Zesting… (2s · ↓ 10 tokens)")

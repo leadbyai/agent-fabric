@@ -36,10 +36,34 @@ For each person-started run (`forwardedProps.openbotRun`):
 - Codex sessions in a sandbox without network access can't reach the gateway, even on loopback. Codex Bots run with full access today.
 - No browsing in group chats or in Bot-to-Bot runs: OpenBot refuses them.
 
-## Install
-`install.sh` installs the three new files with pinned checksums, and backs them up and restores them like the others. `tests/test_herdr_browser.py` fails if a pin drifts from its file.
+## Which branch for which gateway
+Build on the bridge the host actually runs, so nothing live is rolled back:
 
-**Keep the fixed `request_ledger.py` (b1359fbc) wherever it is installed.**
+| Host's live bridge | Branch |
+| --- | --- |
+| `c6bbd1d4`: #17 model control + #19 long replies | `feat/herdr-browser-activity-on-c6bbd1d` (its first commit reproduces c6bbd1d4 byte for byte) |
+| `e55f991d`: d0713fd + c56eb7e + #19 | `feat/herdr-browser-activity-long-replies` |
+
+## Install
+- `install.sh` installs the three new files with pinned checksums, and backs them up and restores them like the others. `tests/test_herdr_browser.py` fails if a pin drifts from its file.
+- **Keep the fixed `request_ledger.py` (b1359fbc).** Put it in the source directory and pass `--expect-ledger-sha256 <its full sha256>` (needs `--source-dir`). Without that flag the installer accepts only the release ledger, which has the file-handle leak.
+- The installer always targets **the production service** (`openbot-herdr-gateway`, `/etc/openbot-herdr-bridge`). Never point a production install at a staging OpenBot.
+
+## Staging (never the production gateway)
+`tools/staging-gateway.sh` runs this checkout's bridge in the foreground beside production. It uses:
+- a scratch Herdr session named `staging-…` (scratch panes only, never live agents);
+- its own port (not 8765/8766), bearer token, ledger and artifact folder;
+- `--openbot-browser-url` set to the staging OpenBot.
+
+It refuses production's token file, state directory and ports, and never touches systemd or `/etc`. Register the staging Bots in the staging OpenBot against that port, so production Bots' credentials and signed runs never reach staging. Run Codex checks where Codex is signed in.
+
+## Redaction
+Lines are scrubbed of:
+- `KEY=value` secrets and `PGPASSWORD=…`;
+- Bearer and Basic values, passwords in URLs;
+- `--password`, `--token`, `--secret`, `--api-key` and `--auth` flags;
+- `-pSECRET`, `sshpass -p …`, `-u/--user user:pass`;
+- tokens of 32 or more characters.
 
 ## Tests
 - `tests/test_activity_line.py`: real screens, shapes, redaction.
