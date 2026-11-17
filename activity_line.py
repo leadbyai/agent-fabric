@@ -33,6 +33,11 @@ BEARER = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}")
 URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@")
 FLAG_SECRET = re.compile(r"(?i)(--?(?:password|token|secret|api-key|auth)[= ])\S+")
 LONG_TOKEN = re.compile(r"[A-Za-z0-9_+/=-]{32,}")
+# sshpass -p SECRET / -pSECRET (mysql and friends; also hides a harmless -p8080, which is fine).
+SSHPASS = re.compile(r"(?i)\b(sshpass\s+-p)\s*\S+")
+ATTACHED_P = re.compile(r"(?<=\s)(-p)(?=\S)\S+")
+# curl -u user:pass, --user user:pass, -U user:pass: keep the user, hide the password.
+USER_PASS = re.compile(r"(?i)((?:^|\s)(?:-u|-U|--user|--proxy-user)(?:\s+|=))([^\s:]+):\S+")
 
 VERBS = {
     "ran": "Running", "edited": "Editing", "updated": "Editing", "added": "Adding", "deleted": "Deleting",
@@ -47,6 +52,9 @@ def redact(text: str) -> str:
     text = URL_USERINFO.sub(r"\1…@", text)
     text = BEARER.sub(r"\1 …", text)
     text = FLAG_SECRET.sub(r"\1…", text)
+    text = SSHPASS.sub(r"\1 …", text)
+    text = USER_PASS.sub(r"\1\2:…", text)
+    text = ATTACHED_P.sub(r"\1…", text)
     text = SECRET_ASSIGN.sub(lambda m: f"{m.group(1)}{m.group(2)}…", text)
     return LONG_TOKEN.sub("…", text)
 
