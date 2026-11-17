@@ -8,6 +8,13 @@ RELEASE_URL="https://raw.githubusercontent.com/leadbyai/agent-fabric/${RELEASE_V
 BRIDGE_SHA256="daf0cfa9c7a7d6cce37db7ca98d01144b5e63e947ab6deb4ed8ff09f1dc31e05"
 LEDGER_SHA256="c675b60a26a462690361951e6569848831f3efecf15577bb34dcb71babf2f49d"
 MODEL_SHA256="2a9d74a3f3eb96190f68157d543fab365c0c3b0eafa0d775e7b2505f7924b1c2"
+# OpenBot activity line and browser (activity_line.py, herdr_browser.py, openbot_browser_cli.py).
+EXTRA_MODULES=(activity_line.py herdr_browser.py openbot_browser_cli.py)
+declare -A EXTRA_SHA256=(
+  [activity_line.py]="0362ef204a7c25e7a46fc2969dfbb639f6c0f7d5819b8fb66f5fa342232570d3"
+  [herdr_browser.py]="495258749d16f5a67d1c9aabaa885705adf9dadf5ad660b7d3b2d15679939ecb"
+  [openbot_browser_cli.py]="f095971783a6f8810a1091c93d8dd5a92177a0bec4a737e67d8b4732410eddf5"
+)
 RUN_USER=""
 HERDR_SESSIONS=""
 UPLOAD_ROOTS=""
@@ -28,9 +35,10 @@ EXPECT_BRIDGE_SHA256=""
 DENY_SESSIONS=""
 DISCOVERY_SHA256=""
 VERIFY_TOKEN_FILE=""
+OPENBOT_BROWSER_URL=""
 
 usage() {
-  printf 'Usage: sudo bash install.sh --user USER --sessions NAME[,NAME] --roots DIR[:DIR] [--artifact-mode inline|signed_url --public-origin https://AGENT-HOST] [--legacy-target NAME --legacy-workdir DIR] [--token-file PATH] [--port 8766] [--busy-wait-seconds 600] [--recovery-seconds 600] [--source-dir DIR [--expect-bridge-sha256 HEX]] [--bind 127.0.0.1|TAILSCALE-IP] [--token-sha256 HEX | --route-token-sha256 SESSION/PANE=HEX ...] [--sessions auto --deny-sessions NAME[,NAME]] [--discovery-token-sha256 HEX] [--no-start]\n'
+  printf 'Usage: sudo bash install.sh --user USER --sessions NAME[,NAME] --roots DIR[:DIR] [--artifact-mode inline|signed_url --public-origin https://AGENT-HOST] [--legacy-target NAME --legacy-workdir DIR] [--token-file PATH] [--port 8766] [--busy-wait-seconds 600] [--recovery-seconds 600] [--source-dir DIR [--expect-bridge-sha256 HEX]] [--bind 127.0.0.1|TAILSCALE-IP] [--token-sha256 HEX | --route-token-sha256 SESSION/PANE=HEX ...] [--sessions auto --deny-sessions NAME[,NAME]] [--discovery-token-sha256 HEX] [--openbot-browser-url https://OPENBOT-HOST/api/agent-fabric/browser] [--no-start]\n'
 }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -63,7 +71,7 @@ esac
 
 while (($#)); do
   case "$1" in
-    --user|--sessions|--roots|--legacy-target|--legacy-workdir|--token-file|--port|--busy-wait-seconds|--recovery-seconds|--source-dir|--public-origin|--artifact-mode|--bind|--token-sha256|--route-token-sha256|--expect-bridge-sha256|--deny-sessions|--discovery-token-sha256|--verify-token-file)
+    --user|--sessions|--roots|--legacy-target|--legacy-workdir|--token-file|--port|--busy-wait-seconds|--recovery-seconds|--source-dir|--public-origin|--artifact-mode|--bind|--token-sha256|--route-token-sha256|--expect-bridge-sha256|--deny-sessions|--discovery-token-sha256|--verify-token-file|--openbot-browser-url)
       (($# >= 2)) || die "Missing value for $1"
       case "$1" in
         --user) RUN_USER="$2" ;;
@@ -74,6 +82,7 @@ while (($#)); do
         --token-file) TOKEN_SOURCE="$2" ;;
         --port) GATEWAY_PORT="$2" ;;
         --busy-wait-seconds) BUSY_WAIT_SECONDS="$2" ;;
+        --openbot-browser-url) OPENBOT_BROWSER_URL="$2" ;;
         --recovery-seconds) RECOVERY_SECONDS="$2" ;;
         --source-dir) SOURCE_DIR="$2" ;;
         --public-origin) PUBLIC_ORIGIN="$2" ;;
@@ -152,6 +161,8 @@ fi
 [[ -z "$EXPECT_BRIDGE_SHA256" || -n "$SOURCE_DIR" ]] || die "--expect-bridge-sha256 needs --source-dir"
 [[ -n "$EXPECT_BRIDGE_SHA256" ]] && BRIDGE_SHA256="$EXPECT_BRIDGE_SHA256"
 [[ -z "$DISCOVERY_SHA256" || "$DISCOVERY_SHA256" != "$TOKEN_SHA256" ]] || die "The discovery token must differ from the bridge-wide token"
+[[ -z "$OPENBOT_BROWSER_URL" || "$OPENBOT_BROWSER_URL" =~ ^(https://[A-Za-z0-9.-]+(:[0-9]+)?|http://(127\.0\.0\.1|100\.[0-9.]+|10\.[0-9.]+|192\.168\.[0-9.]+)(:[0-9]+)?)/[A-Za-z0-9/_.-]*$ ]] \
+  || die "--openbot-browser-url must be OpenBot's https browser route (or http to a private address)"
 
 IFS=: read -r -a root_list <<< "$UPLOAD_ROOTS"
 for path in "${root_list[@]}"; do
@@ -169,6 +180,9 @@ if [[ -n "$SOURCE_DIR" ]]; then
   [[ -f "$SOURCE_DIR/bridge.py" ]] || die "Missing bridge.py in source directory"
   [[ -f "$SOURCE_DIR/request_ledger.py" ]] || die "Missing request_ledger.py in source directory"
   [[ -f "$SOURCE_DIR/model_control.py" ]] || die "Missing model_control.py in source directory"
+  for module in "${EXTRA_MODULES[@]}"; do
+    [[ -f "$SOURCE_DIR/$module" ]] || die "Missing $module in source directory"
+  done
 fi
 
 APP_DIR="/opt/openbot-herdr-bridge"
@@ -191,11 +205,13 @@ install -d -o "$RUN_USER" -g "$(id -gn "$RUN_USER")" -m 0700 "$ARTIFACT_DIR"
 TEMP_FILE="$(mktemp "$APP_DIR/.bridge.py.XXXXXX")"
 TEMP_LEDGER="$(mktemp "$APP_DIR/.request_ledger.py.XXXXXX")"
 TEMP_MODEL="$(mktemp "$APP_DIR/.model_control.py.XXXXXX")"
-trap 'test ! -e "$TEMP_FILE" || rm -f -- "$TEMP_FILE"; test ! -e "$TEMP_LEDGER" || rm -f -- "$TEMP_LEDGER"; test ! -e "$TEMP_MODEL" || rm -f -- "$TEMP_MODEL"' EXIT
+TEMP_EXTRA="$(mktemp -d "$APP_DIR/.extra.XXXXXX")"
+trap 'test ! -e "$TEMP_FILE" || rm -f -- "$TEMP_FILE"; test ! -e "$TEMP_LEDGER" || rm -f -- "$TEMP_LEDGER"; test ! -e "$TEMP_MODEL" || rm -f -- "$TEMP_MODEL"; test ! -e "$TEMP_EXTRA" || rm -rf -- "$TEMP_EXTRA"' EXIT
 if [[ -n "$SOURCE_DIR" ]]; then
   cp -- "$SOURCE_DIR/bridge.py" "$TEMP_FILE"
   cp -- "$SOURCE_DIR/request_ledger.py" "$TEMP_LEDGER"
   cp -- "$SOURCE_DIR/model_control.py" "$TEMP_MODEL"
+  for module in "${EXTRA_MODULES[@]}"; do cp -- "$SOURCE_DIR/$module" "$TEMP_EXTRA/$module"; done
 else
   command -v curl >/dev/null || die "curl required"
   curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --max-time 30 \
@@ -204,7 +220,15 @@ else
     "$RELEASE_URL/request_ledger.py" -o "$TEMP_LEDGER"
   curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --max-time 30 \
     "$RELEASE_URL/model_control.py" -o "$TEMP_MODEL"
+  for module in "${EXTRA_MODULES[@]}"; do
+    curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --max-time 30 \
+      "$RELEASE_URL/$module" -o "$TEMP_EXTRA/$module"
+  done
 fi
+for module in "${EXTRA_MODULES[@]}"; do
+  printf '%s  %s\n' "${EXTRA_SHA256[$module]}" "$TEMP_EXTRA/$module" | sha256sum -c - >/dev/null \
+    || die "$module SHA256 mismatch"
+done
 
 if [[ "$BRIDGE_SHA256" != __BRIDGE_SHA256__ && "$LEDGER_SHA256" != __LEDGER_SHA256__ &&
       "$MODEL_SHA256" != __MODEL_SHA256__ ]]; then
@@ -214,7 +238,8 @@ if [[ "$BRIDGE_SHA256" != __BRIDGE_SHA256__ && "$LEDGER_SHA256" != __LEDGER_SHA2
 elif [[ -z "$SOURCE_DIR" ]]; then
   die "Release checksum not finalized; use a signed release or --source-dir"
 fi
-python3 -m py_compile "$TEMP_FILE" "$TEMP_LEDGER" "$TEMP_MODEL" || die "Gateway code did not compile"
+python3 -m py_compile "$TEMP_FILE" "$TEMP_LEDGER" "$TEMP_MODEL" "${EXTRA_MODULES[@]/#/$TEMP_EXTRA/}" \
+  || die "Gateway code did not compile"
 BACKUP_STAMP="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 if [[ -f "$APP_DIR/bridge.py" ]]; then
   cp -p -- "$APP_DIR/bridge.py" "$APP_DIR/bridge.py.bak.$BACKUP_STAMP"
@@ -228,6 +253,11 @@ fi
 install -m 0755 "$TEMP_FILE" "$APP_DIR/bridge.py"
 install -m 0644 "$TEMP_LEDGER" "$APP_DIR/request_ledger.py"
 install -m 0644 "$TEMP_MODEL" "$APP_DIR/model_control.py"
+for module in "${EXTRA_MODULES[@]}"; do
+  [[ ! -f "$APP_DIR/$module" ]] || cp -p -- "$APP_DIR/$module" "$APP_DIR/$module.bak.$BACKUP_STAMP"
+  mode=0644; [[ "$module" != openbot_browser_cli.py ]] || mode=0755
+  install -m "$mode" "$TEMP_EXTRA/$module" "$APP_DIR/$module"
+done
 
 CREDENTIAL_ENV='OPENBOT_BRIDGE_TOKEN_FILE=%d/bridge.token'
 CREDENTIAL_LOAD="bridge.token:$CONF_DIR/bridge.token"
@@ -291,6 +321,7 @@ fi
   printf 'OPENBOT_BRIDGE_ARTIFACT_DIR=%s\n' "$ARTIFACT_DIR"
   printf 'OPENBOT_BRIDGE_ARTIFACT_MODE=%s\n' "$ARTIFACT_MODE"
   printf 'OPENBOT_BRIDGE_PUBLIC_ORIGIN=%s\n' "$PUBLIC_ORIGIN"
+  [[ -z "$OPENBOT_BROWSER_URL" ]] || printf 'OPENBOT_BROWSER_CALLBACK_URL=%s\n' "$OPENBOT_BROWSER_URL"
   if (( BUSY_WAIT_SECONDS > 0 || RECOVERY_SECONDS > 0 )); then
     printf 'OPENBOT_BRIDGE_LEDGER_PATH=%s/requests.sqlite3\n' "$STATE_DIR"
   fi
@@ -365,6 +396,13 @@ if ((SKIP_START == 0)); then
       else
         rm -f -- "$APP_DIR/model_control.py"  # the restored bridge predates it
       fi
+      for module in "${EXTRA_MODULES[@]}"; do
+        if [[ -f "$APP_DIR/$module.bak.$BACKUP_STAMP" ]]; then
+          cp -p -- "$APP_DIR/$module.bak.$BACKUP_STAMP" "$APP_DIR/$module"
+        else
+          rm -f -- "$APP_DIR/$module"  # the restored bridge predates it
+        fi
+      done
       systemctl daemon-reload
       systemctl restart openbot-herdr-gateway.service || true
       die "Gateway failed health check; attempted restoration of previous code, config and service"
