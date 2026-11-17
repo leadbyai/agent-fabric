@@ -1,0 +1,40 @@
+ ▐▛███▛█   Claude Code v2.1.326
+▝▜██████▀  Opus 5.5 · Claude
+ ▝▝   ▝▝   /home/user/project
+
+
+❯ Make a todo list with two items, then read note.txt, then run: sleep 20, then run ls. Then say done.
+
+● I don't have a todo tool in this session, so here's the list:
+
+  1. Read note.txt
+  2. Run sleep 20, then ls
+
+  Read 1 file
+
+● This session blocks a foreground sleep, so I'll run it in the background.
+
+  Ran 1 shell command
+
+● The 20-second sleep is running in the background. I'll run ls as soon as it finishes.
+
+✻ Cogitated for 7s · done 8:56 AM
+
+● Background command "Wait 20 seconds" completed (exit code 0)
+
+  Listed 1 directory
+
+● Done.
+
+  - To-do list: this session has no to-do tool, so I wrote the two items out as text.
+  - note.txt: it contains hello.
+  - sleep 20: this session doesn't allow a 20-second wait in the foreground, so I ran it in the background. It finished
+    normally.
+  - ls: the directory has note.txt and shot1.txt through shot7.txt.
+
+✻ Worked for 3s · done 8:56 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

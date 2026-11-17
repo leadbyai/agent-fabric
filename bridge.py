@@ -29,6 +29,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+import activity_line
+import herdr_browser
 import model_control
 from request_ledger import RequestLedger
 
@@ -66,10 +68,17 @@ PORT = int(os.environ.get("OPENBOT_BRIDGE_PORT", "8765"))
 TIMEOUT_MS = int(os.environ.get("OPENBOT_BRIDGE_TIMEOUT_MS", "120000"))
 BUSY_WAIT_SECONDS = int(os.environ.get("OPENBOT_BRIDGE_BUSY_WAIT_SECONDS", "0"))
 RECOVERY_SECONDS = int(os.environ.get("OPENBOT_BRIDGE_RECOVERY_SECONDS", "0"))
+ACTIVE_WAIT_SECONDS = int(os.environ.get("OPENBOT_BRIDGE_ACTIVE_WAIT_SECONDS", "7200"))
 LEDGER_PATH = os.environ.get("OPENBOT_BRIDGE_LEDGER_PATH", "").strip()
 LEDGER: RequestLedger | None = None
 HEARTBEAT_SECONDS = 15.0
 STATE_POLL_SECONDS = 2.0
+# OpenBot's Bot activity line (activity_line.py): read the pane every ACTIVITY_SECONDS while a request
+# runs and send what it is doing when that changes. OPENBOT_ACTIVITY_LINE=0 keeps the bare heartbeat.
+ACTIVITY_LINE = os.environ.get("OPENBOT_ACTIVITY_LINE", "1").strip() != "0"
+ACTIVITY_SECONDS = 2.0
+BROWSER_ROUTE = re.compile(r"/openbot-browser/([A-Za-z0-9_-]{40,64})")
+BROWSER_CLI = Path(__file__).resolve().parent / "openbot_browser_cli.py"
 WORKDIR = os.environ.get("OPENBOT_BRIDGE_WORKDIR", "").strip()
 ALLOWED_ROOTS = tuple(s.strip() for s in
     os.environ.get("OPENBOT_BRIDGE_ALLOWED_ROOTS", "").split(":") if s.strip())
@@ -1155,21 +1164,69 @@ class Handler(BaseHTTPRequestHandler):
         self.send_event({"type": "RUN_FINISHED", "threadId": thread_id,
                          "runId": run_id})
 
+    @staticmethod
+    def read_activity(session: str, pane_id: str) -> tuple[str, int] | None:
+        """What the agent is doing, from its visible screen; None when that cannot be read."""
+        try:
+            screen = command("agent", "read", pane_id, "--source", "visible",
+                             session=session, wait_seconds=5)
+            return activity_line.summary(screen)
+        except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired):
+            return None
+
+    def gateway_address(self) -> str:
+        """This gateway as an agent on the same machine reaches it."""
+        host = HOST if HOST not in ("", "0.0.0.0", "::") else "127.0.0.1"
+        return f"http://[{host}]:{PORT}" if ":" in host else f"http://{host}:{PORT}"
+
+    def browser_call(self, key: str) -> None:
+        """POST /openbot-browser/<key>: one browser action for the agent's current turn."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if not 0 < length <= 8192:
+                raise ValueError("bad length")
+            body = json.loads(self.rfile.read(length))
+        except (ValueError, json.JSONDecodeError):
+            self.json_response(400, {"error": "Invalid browser request."})
+            return
+        status, result = herdr_browser.call(key, body)
+        self.json_response(status, result)
+
     def prompt_with_liveness(self, session: str, pane_id: str, prompt: str,
                              marker_id: str) -> str:
-        """Submit exactly once. On an ambiguous timeout, observe; never retry."""
+        """Submit once. Give a working turn time to finish before timing reply correlation."""
+        extend_working = RECOVERY_SECONDS > 0 and ACTIVE_WAIT_SECONDS > 0
+        active_deadline = time.monotonic() + ACTIVE_WAIT_SECONDS
+        initial_agent = agent_record(session, pane_id) if extend_working else {}
+        terminal_id = initial_agent.get("terminal_id")
+
+        def native_session(agent: dict):
+            identity = agent.get("agent_session")
+            return identity.get("value") if isinstance(identity, dict) else None
+
+        session_id = native_session(initial_agent)
         args = ("agent", "prompt", pane_id, prompt, "--wait", "--until", "idle",
                 "--until", "done", "--until", "blocked", "--timeout", str(TIMEOUT_MS))
         timeout_error: Exception | None = None
         with ThreadPoolExecutor(max_workers=1) as pool:
             submitted = pool.submit(command, *args, session=session,
                                     wait_seconds=TIMEOUT_MS / 1000 + 15)
+            last_beat, last_line = time.monotonic(), None
             while True:
                 try:
-                    submitted.result(timeout=HEARTBEAT_SECONDS)
+                    submitted.result(timeout=ACTIVITY_SECONDS if ACTIVITY_LINE else HEARTBEAT_SECONDS)
                     break
                 except FutureTimeout:
-                    self.send_submitted_progress("working")
+                    activity = self.read_activity(session, pane_id) if ACTIVITY_LINE else None
+                    now = time.monotonic()
+                    if activity is not None and activity[0] != last_line:
+                        last_line, last_beat = activity[0], now
+                        self.send_submitted_event({"type": "CUSTOM", "name": "agent-fabric.progress",
+                                                   "value": {"state": "working", "line": activity[0],
+                                                             "elapsedSeconds": activity[1]}})
+                    elif now - last_beat >= HEARTBEAT_SECONDS:
+                        last_beat = now
+                        self.send_submitted_progress("working")
                 except (RuntimeError, subprocess.TimeoutExpired) as exc:
                     timeout_error = exc
                     break
@@ -1181,28 +1238,49 @@ class Handler(BaseHTTPRequestHandler):
                          isinstance(timeout_error, subprocess.TimeoutExpired))):
                 raise timeout_error
 
-        # A successful Herdr --wait return does not guarantee the response
-        # markers are already visible in recent-unwrapped. Poll for them even
-        # without an explicit Herdr timeout; otherwise a fast status change
-        # can mark the request uncertain and release the pane to the next run.
-        deadline = time.monotonic() + RECOVERY_SECONDS
+        # Herdr cannot read recent history from an active Claude pane. A CLI
+        # wait timeout does not mean the turn stopped. Only start the shorter
+        # marker-correlation window when the pane is available to read.
+        correlation_deadline = None
         while True:
-            if normalized_state(agent_record(session, pane_id)) == "blocked":
+            agent = agent_record(session, pane_id)
+            state = normalized_state(agent)
+            current_session = native_session(agent)
+            if ((terminal_id and agent.get("terminal_id") != terminal_id)
+                    or (session_id and current_session and current_session != session_id)):
+                raise RuntimeError("Agent session changed after submission. Inspect Herdr before retrying.")
+            session_id = session_id or current_session
+            if state == "blocked":
                 raise RuntimeError(f"Agent {pane_id} needs an approval or answer in Herdr")
+
+            now = time.monotonic()
+            if extend_working and state == "working":
+                if now >= active_deadline:
+                    raise RuntimeError(
+                        "Agent is still working after the gateway's active wait limit. "
+                        "The request was submitted once. Inspect Herdr before retrying."
+                    )
+                correlation_deadline = None
+                self.send_submitted_progress("working")
+                time.sleep(min(STATE_POLL_SECONDS, max(0.0, active_deadline - time.monotonic())))
+                continue
+
+            if correlation_deadline is None:
+                correlation_deadline = now + RECOVERY_SECONDS
             try:
                 transcript = command("agent", "read", pane_id,
                                      "--source", "recent-unwrapped", "--lines", "200",
                                      session=session, wait_seconds=30)
                 return normalize_prose_wrapping(extract_reply(transcript, marker_id))
-            except RuntimeError as exc:
-                if time.monotonic() >= deadline:
+            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+                if time.monotonic() >= correlation_deadline:
                     raise RuntimeError(
                         "Submitted agent reply could not be correlated "
                         "within the recovery window. Inspect Herdr before retrying; "
                         "automatic resubmission is disabled."
                     ) from exc
             self.send_submitted_progress("recovering")
-            time.sleep(min(STATE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+            time.sleep(min(STATE_POLL_SECONDS, max(0.0, correlation_deadline - time.monotonic())))
 
     def read_request_body(self) -> bytes:
         """Read bounded JSON bodies using Content-Length or HTTP chunked framing."""
@@ -1257,6 +1335,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path.rstrip("/")
+        browser = BROWSER_ROUTE.fullmatch(path)
+        if browser:
+            # Authorised by the turn's own random key (herdr_browser.py), held only by that turn's agent.
+            self.browser_call(browser.group(1))
+            return
         match = AGENT_ROUTE.fullmatch(path)
         legacy = path == "/ag-ui" and bool(TARGET)
         if not match and not legacy:
@@ -1362,6 +1445,7 @@ class Handler(BaseHTTPRequestHandler):
         have_slot = not wait_enabled
         stream_started = False
         ledger_reserved = False
+        browser_turn: Path | None = None
         queue_ticket: object | None = None
         pane_queue = waiting_queue(session, pane_id) if wait_enabled else None
         last_progress = 0.0
@@ -1491,6 +1575,15 @@ class Handler(BaseHTTPRequestHandler):
                     "special reply formatting is needed. This is optional; never claim a "
                     "screenshot was attached unless you saved the image. "
                 )
+                try:
+                    browser_turn = herdr_browser.open_turn(body.get("forwardedProps"),
+                                                           self.headers.get("Authorization"),
+                                                           outbox, self.gateway_address())
+                except OSError as exc:
+                    self.log_message("OpenBot browser unavailable for this request (%s)", type(exc).__name__)
+                if browser_turn is not None:
+                    shown = browser_turn.as_posix() if dedicated_media else f"{screenshot_path}/{browser_turn.name}"
+                    screenshot_instructions += herdr_browser.prompt_hint(browser_turn, shown, BROWSER_CLI)
             prompt = (
                 f"[OpenBot pilot request {marker_id}]\n{user_text}"
                 f"{attachment_instructions}\n\n"
@@ -1536,6 +1629,7 @@ class Handler(BaseHTTPRequestHandler):
                 LEDGER.uncertain(request_key)
             pass
         finally:
+            herdr_browser.close_turn(browser_turn)
             if queue_ticket is not None and pane_queue is not None:
                 with WAIT_QUEUES_GUARD:
                     pane_queue.remove(queue_ticket)
@@ -1606,6 +1700,8 @@ def main() -> None:
         sys.exit("OPENBOT_BRIDGE_BUSY_WAIT_SECONDS must be between 0 and 3600")
     if RECOVERY_SECONDS < 0 or RECOVERY_SECONDS > 3600:
         sys.exit("OPENBOT_BRIDGE_RECOVERY_SECONDS must be between 0 and 3600")
+    if not 0 <= ACTIVE_WAIT_SECONDS <= 86400:
+        sys.exit("OPENBOT_BRIDGE_ACTIVE_WAIT_SECONDS must be between 0 and 86400")
     if BUSY_WAIT_SECONDS and not LEDGER_PATH:
         sys.exit("Enable a persistent OPENBOT_BRIDGE_LEDGER_PATH before enabling busy waiting")
     if LEDGER_PATH:
