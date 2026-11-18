@@ -67,10 +67,39 @@ attach to an interactive session another process owns (see "Existing running ses
   - Without that, the result is two writers.
 
 ## Configuration
-`SDK_BRIDGE_TOKEN_SHA256` (required), `SDK_BRIDGE_WORKSPACE` (absolute, required), `SDK_BRIDGE_LEDGER`
-(absolute, required), `SDK_BRIDGE_PORT` (8768), `SDK_BRIDGE_MODEL`, `SDK_BRIDGE_MAX_TURNS` (8),
-`SDK_BRIDGE_MAX_BUDGET_USD` (2), `SDK_BRIDGE_TIMEOUT_SECONDS` (600). `CLAUDE_CONFIG_DIR` is passed through
-to the SDK, which relocates its config and transcripts.
+Both profiles:
+- `SDK_BRIDGE_TOKEN_SHA256` (required): the bridge holds only the hash; OpenBot holds the bearer.
+- `SDK_BRIDGE_LEDGER` (absolute, required).
+- `SDK_BRIDGE_HOST`: `127.0.0.1` (default) or `172.17.0.1`, the docker0 gateway, which the OpenBot container can reach. Anything else is refused.
+- `SDK_BRIDGE_PORT` (8768; 1024-65535) and `SDK_BRIDGE_MODEL`.
+- Caps: `SDK_BRIDGE_MAX_TURNS` (8; 1-500), `SDK_BRIDGE_MAX_BUDGET_USD` (2; 0.01-100), `SDK_BRIDGE_TIMEOUT_SECONDS` (600; 10-7200).
+- **Concurrency.** `SDK_BRIDGE_MAX_CONCURRENT` (1; 1-4) sets how many live conversations run at once. Each conversation runs one run at a time, so an OpenBot Retry or a second tab gets 409 `conversation_busy`; over the cap gets 429 `bridge_busy`. In both cases no prompt is sent and no ledger row is written.
+- **Failure codes.** `RUN_ERROR` carries a `code` naming what stopped the run: the SDK result subtype (`error_max_turns`, `error_max_budget_usd`, ...), `timeout`, `denied_session` or `workspace_pinned_file_changed`/`_missing`.
+- `SDK_BRIDGE_DENY_SESSIONS`: session ids that are never resumed or adopted, such as the agent's live interactive session.
+- `CLAUDE_CONFIG_DIR` is passed through, so the SDK uses that account's own sign-in where it already is.
+- The bridge never passes `continue`, and it resumes only sessions it created and recorded in its ledger.
+
+### `SDK_BRIDGE_PROFILE=pilot` (default)
+Isolated: no settings, strict empty MCP, Read/Write/Glob/Agent limited to `SDK_BRIDGE_WORKSPACE`, plus the `word-counter` subagent. Agent-profile variables are refused.
+
+### `SDK_BRIDGE_PROFILE=agent` (an existing agent's own setup)
+- **Workspace.** `SDK_BRIDGE_WORKSPACE_ROOT` (required). Each conversation gets `<root>/<conversation-id>/`, a 16-hex id derived from the thread, so raw thread ids never reach paths. It is seeded once from `<root>/_template/`.
+- **Template pins.** `SDK_BRIDGE_TEMPLATE_SHA256` (required): `<relative path>=<sha256>,...`.
+  - The template must hold exactly those files, with no symlinks and no extras.
+  - Hashes are checked before and after every seed.
+  - The pinned paths inside the conversation folder are re-checked before **every** turn. A session that edited its own CLAUDE.md or deny list is refused, and the folder is never silently re-seeded. Other files and worktrees are ignored.
+  - New conversation folders are made private: 0700 folders and 0600 files.
+  - Run the unit with `UMask=0077`.
+- **Title.** `SDK_BRIDGE_TITLE` (required) must contain `{id}`, for example `Vex (OpenBot {id})`, so a bridge session never takes the agent's own title. Watchdog duplicate guards match by title.
+- **Setting sources.** `SDK_BRIDGE_SETTING_SOURCES` (`user,project`) must include `project`, so the workspace's CLAUDE.md and its `permissions.deny` load.
+- **Extra settings.** `SDK_BRIDGE_SETTINGS` (optional absolute file) is layered on top as flag settings.
+- **Tools.** `SDK_BRIDGE_TOOLS`: `preset` (all Claude Code tools, the default) or a comma list.
+- **Permission mode.** `SDK_BRIDGE_PERMISSION_MODE`: `default`, `acceptEdits`, `dontAsk`, `plan` or `bypassPermissions`. Bypass also sets `allowDangerouslySkipPermissions`. Bypass removes prompts, not deny rules.
+- **MCP.** `SDK_BRIDGE_STRICT_MCP` (0; 1 means no MCP servers) and `SDK_BRIDGE_CLAUDEAI_MCP` (0).
+- **CLI.** `SDK_BRIDGE_CLAUDE_PATH` (optional absolute path). The default is the CLI bundled with the pinned SDK: 0.3.325 bundles Claude Code 2.1.325. The bundled CLI is recommended, because an auto-updated user install changes underneath the bridge. The CLI version reported at session start is logged.
+- The system prompt is the `claude_code` preset, and there is no toy subagent.
+
+Caps for full Vex (agreed with Main): `SDK_BRIDGE_MAX_TURNS=60`, `SDK_BRIDGE_MAX_BUDGET_USD=15`, `SDK_BRIDGE_TIMEOUT_SECONDS=1800`, `SDK_BRIDGE_MAX_CONCURRENT=1`.
 
 ## Tests
 `npm test` in `claude-sdk/` runs offline tests with a fake `query`:
@@ -80,4 +109,17 @@ to the SDK, which relocates its config and transcripts.
 - replay and 409;
 - uncertain not resent;
 - session ownership;
-- policy.
+- policy;
+- host, cap and port bounds;
+- profile validation;
+- agent options (bypass flag, never `continue`, no toy subagent);
+- titles;
+- per-conversation seeding;
+- template pins (changed file, extra file, unpinned, symlink);
+- the CLI path;
+- denied and foreign sessions refused, even when a ledger row names them;
+- single flight per conversation, for new and resumed threads;
+- the global concurrency cap;
+- RUN_ERROR codes;
+- the per-turn pinned-file check;
+- folder modes.
