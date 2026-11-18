@@ -207,19 +207,25 @@ export function createBridge({ query, config, ledger }) {
     const options = { ...sdkOptions(config, workspaceFor(thread)), abortController: signal,
       ...(known ? { resume: known } : { title: sessionTitle(config, thread) }) };
     const messageId = randomUUID();
-    let started = false, reply = "", sessionId = known;
+    let started = false, reply = "", sessionId = known, bound = null;
     for await (const m of query({ prompt: text, options })) {
       if (m.type === "system" && m.subtype === "init") {
-        sessionId = m.session_id;
-        if (denied.has(sessionId)) throw new BridgeError("denied_session", "SDK returned a denied session");
+        if (denied.has(m.session_id)) throw new BridgeError("denied_session", "SDK returned a denied session");
+        // A run can report init more than once (e.g. a background task finishing re-enters the loop).
+        // Later inits must name the session this run is already bound to; nothing is re-mapped.
+        if (bound) {
+          if (m.session_id !== bound) throw new BridgeError("session_changed", "Session id changed during the run");
+          continue;
+        }
+        sessionId = bound = m.session_id;
         if (m.claude_code_version && m.claude_code_version !== reportedVersion) {
           reportedVersion = m.claude_code_version;
           console.log(`Claude Code CLI version ${reportedVersion}`);
         }
         if (!known) {
-          if (ledger.owner(sessionId)) throw new Error("SDK returned a session another thread owns");
+          if (ledger.owner(sessionId)) throw new BridgeError("session_owned_elsewhere", "SDK returned a session another thread owns");
           ledger.map(thread, sessionId);
-        } else if (sessionId !== known) throw new Error("Resumed session id changed");
+        } else if (sessionId !== known) throw new BridgeError("session_changed", "Resumed session id changed");
         emit({ type: "CUSTOM", name: "agent-fabric.progress", value: { state: "submitted", session: known ? "resumed" : "created" } });
       }
       if (m.type === "stream_event" && !m.parent_tool_use_id && m.event?.type === "content_block_delta" && m.event.delta?.type === "text_delta") {
@@ -298,6 +304,8 @@ export function createBridge({ query, config, ledger }) {
     } catch (e) {
       ledger.uncertain(key);  // never resent automatically
       const reason = abort.signal.aborted ? "timeout" : e instanceof BridgeError ? e.reason : (e?.name ?? "Error");
+      // Journal line for the operator: the code, and for unexpected errors the type and a short message.
+      console.error(`run ${key.slice(0, 12)} failed: ${reason}${e instanceof BridgeError ? "" : ` (${String(e?.message ?? "").slice(0, 200)})`}`);
       emit({ type: "RUN_ERROR", code: reason,
         message: `Run did not complete (${reason}). No duplicate prompt will be sent; check /requests/${key}.` });
     } finally { active.delete(thread); clearTimeout(timer); res.end(); }

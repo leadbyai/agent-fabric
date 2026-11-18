@@ -364,3 +364,37 @@ test("RUN_ERROR names the cap or guard that stopped the run; a changed pinned fi
   assert.deepEqual([blocked.type, blocked.code], ["RUN_ERROR", "workspace_pinned_file_changed"]);
   assert.equal(g.seen.length, before);                       // no prompt reached the SDK
 });
+
+test("a repeated init in one run (background task re-entry) is accepted; a different session id is refused", async (t) => {
+  const root = agentTemplate();
+  const dir = mkdtempSync(path.join(os.tmpdir(), "sdkb-"));
+  let second = "same";
+  const query = ({ options }) => (async function* () {
+    const sid = options.resume ?? "R1";
+    yield { type: "system", subtype: "init", session_id: sid };
+    yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "started; " } } };
+    yield { type: "result", subtype: "success", session_id: sid };
+    yield { type: "system", subtype: "init", session_id: second === "same" ? sid : "OTHER" };   // background task finished
+    yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "SLEPT" } } };
+    yield { type: "result", subtype: "success", session_id: sid };
+  })();
+  const config = configFromEnv({ ...AGENT, SDK_BRIDGE_WORKSPACE_ROOT: root });
+  const ledger = new Ledger(path.join(dir, "ledger.sqlite3"));
+  const handle = createBridge({ query, config, ledger });
+  const server = createServer((req, res) => handle(req, res));
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => server.close());
+  const post = async (thread, run) => (await (await fetch(`http://127.0.0.1:${server.address().port}/ag-ui`, { method: "POST",
+    headers: { authorization: `Bearer ${TOKEN}` }, body: JSON.stringify({ threadId: thread, runId: run,
+      messages: [{ role: "user", content: "hi" }] }) })).text()).split("\n").filter((l) => l.startsWith("data:")).map((l) => JSON.parse(l.slice(5)));
+  const ok = await post("bg", "r1");
+  assert.equal(ok.at(-1).type, "RUN_FINISHED");
+  assert.equal(ok.filter((e) => e.type === "TEXT_MESSAGE_CONTENT").map((e) => e.delta).join(""), "started; SLEPT");
+  assert.equal(ok.filter((e) => e.name === "agent-fabric.progress").length, 1);
+  assert.equal(ledger.session("bg"), "R1");
+  const resumed = await post("bg", "r2");                       // resumed thread with a repeated init
+  assert.equal(resumed.at(-1).type, "RUN_FINISHED");
+  second = "other";
+  const bad = await post("bg", "r3");
+  assert.deepEqual([bad.at(-1).type, bad.at(-1).code], ["RUN_ERROR", "session_changed"]);
+});
