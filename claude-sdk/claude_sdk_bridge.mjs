@@ -9,13 +9,15 @@
 //
 // Env (both profiles): SDK_BRIDGE_TOKEN_SHA256 (64 hex, required), SDK_BRIDGE_HOST (127.0.0.1 | 172.17.0.1),
 // SDK_BRIDGE_PORT (8768), SDK_BRIDGE_LEDGER (required), SDK_BRIDGE_MODEL, SDK_BRIDGE_MAX_TURNS (8),
-// SDK_BRIDGE_MAX_BUDGET_USD (2), SDK_BRIDGE_TIMEOUT_SECONDS (600), SDK_BRIDGE_DENY_SESSIONS (comma list of
+// SDK_BRIDGE_MAX_BUDGET_USD (2), SDK_BRIDGE_TIMEOUT_SECONDS (600), SDK_BRIDGE_MAX_CONCURRENT (1; 1-4 live
+// conversations; one run per conversation at a time, extra runs are refused before any prompt is sent),
+// SDK_BRIDGE_DENY_SESSIONS (comma list of
 // session ids that must never be resumed or adopted, e.g. the agent's live interactive session).
 // SDK_BRIDGE_PROFILE=pilot (default): isolated, no settings, workspace-only tools; SDK_BRIDGE_WORKSPACE.
 // SDK_BRIDGE_PROFILE=agent: an existing agent's own setup, one workspace per conversation:
 //   SDK_BRIDGE_WORKSPACE_ROOT (required; <root>/_template/ is copied to <root>/<conversation>/ on first run),
 //   SDK_BRIDGE_TEMPLATE_SHA256 (required: "<relative path>=<sha256>,..." naming EXACTLY the template's files;
-//   checked before every seed), SDK_BRIDGE_CLAUDE_PATH (optional absolute CLI path; default: the SDK's bundled CLI),
+//   checked before every seed and, inside the conversation folder, before every turn), SDK_BRIDGE_CLAUDE_PATH (optional absolute CLI path; default: the SDK's bundled CLI),
 //   SDK_BRIDGE_TITLE (required, must contain {id}, e.g. "Vex (OpenBot {id})"), SDK_BRIDGE_SETTING_SOURCES
 //   (user,project), SDK_BRIDGE_SETTINGS (optional extra settings file), SDK_BRIDGE_TOOLS ("preset" or a list),
 //   SDK_BRIDGE_PERMISSION_MODE (default | acceptEdits | dontAsk | plan | bypassPermissions),
@@ -23,7 +25,7 @@
 // CLAUDE_CONFIG_DIR is passed through, so the SDK uses that account's own sign-in where it already is;
 // the bridge never reads or copies credentials.
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { cpSync, existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, readFileSync, readdirSync } from "node:fs";
 import { createServer } from "node:http";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -32,7 +34,13 @@ export const VERSION = "0.2.0-sdk-agent";
 export const ALLOWED_HOSTS = ["127.0.0.1", "172.17.0.1"];
 export const PERMISSION_MODES = ["default", "acceptEdits", "dontAsk", "plan", "bypassPermissions"];
 const SETTING_SOURCES = ["user", "project", "local"];
-const LIMITS = { maxTurns: [1, 500, true], maxBudgetUsd: [0.01, 100, false], timeoutSeconds: [10, 7200, true] };
+const LIMITS = { maxTurns: [1, 500, true], maxBudgetUsd: [0.01, 100, false], timeoutSeconds: [10, 7200, true],
+  maxConcurrent: [1, 4, true] };
+
+/** An error whose short reason is safe to show the person (cap names, guard refusals; never content). */
+export class BridgeError extends Error {
+  constructor(reason, message = reason) { super(message); this.name = "BridgeError"; this.reason = reason; }
+}
 const MAX_BODY = 1024 * 1024;
 const sha256 = (s) => createHash("sha256").update(s).digest("hex");
 export const stableId = (...parts) => sha256(JSON.stringify(parts)).slice(0, 32);
@@ -115,6 +123,26 @@ export function verifyTemplate(template, pins) {
       throw new Error(`Workspace template file ${f} does not match its pinned hash`);
 }
 
+/** The pinned files inside a conversation folder still match (other files, e.g. worktrees, are ignored). */
+export function verifyPinned(dir, pins) {
+  for (const [f, hash] of Object.entries(pins)) {
+    const p = path.join(dir, f);
+    let st;
+    try { st = lstatSync(p); } catch { throw new BridgeError("workspace_pinned_file_missing", `Pinned file ${f} is missing`); }
+    if (!st.isFile()) throw new BridgeError("workspace_pinned_file_changed", `Pinned file ${f} is not a regular file`);
+    if (createHash("sha256").update(readFileSync(p)).digest("hex") !== hash)
+      throw new BridgeError("workspace_pinned_file_changed", `Pinned file ${f} changed`);
+  }
+}
+
+function privateTree(dir) {
+  chmodSync(dir, 0o700);
+  for (const name of readdirSync(dir)) {
+    const p = path.join(dir, name), st = lstatSync(p);
+    if (st.isDirectory()) privateTree(p); else if (st.isFile()) chmodSync(p, 0o600);
+  }
+}
+
 /** The conversation's own workspace under <root>, seeded from <root>/_template/ the first time. */
 export function conversationWorkspace(root, thread, pins) {
   const dir = path.join(root, conversationId(thread));
@@ -124,8 +152,10 @@ export function conversationWorkspace(root, thread, pins) {
     if (!pins || !Object.keys(pins).length) throw new Error("Workspace template hashes are not pinned");
     verifyTemplate(template, pins);
     cpSync(template, dir, { recursive: true, errorOnExist: true, force: false });
+    privateTree(dir);            // 0700 folders, 0600 files, whatever the template's modes
     verifyTemplate(dir, pins);   // what was copied is exactly what was checked
   } else if (lstatSync(dir).isSymbolicLink() || !lstatSync(dir).isDirectory()) throw new Error("Conversation workspace is not a folder");
+  verifyPinned(dir, pins);       // every turn: a session that edited its own deny list or CLAUDE.md is refused
   return dir;
 }
 
@@ -165,13 +195,15 @@ export function sdkOptions(config, cwd, env = process.env) {
 
 export function createBridge({ query, config, ledger }) {
   const denied = new Set(config.denySessions ?? []);
+  const active = new Set();                      // threads with a run in flight (single flight per conversation)
+  const maxConcurrent = config.maxConcurrent ?? 1;
   const workspaceFor = (thread) => (config.profile ?? "pilot") === "pilot" ? config.workspace
     : conversationWorkspace(config.agent.workspaceRoot, thread, config.agent.templatePins);
   let reportedVersion = null;
 
   async function runTurn(thread, text, emit, signal) {
     const known = ledger.session(thread);
-    if (known && denied.has(known)) throw new Error("Refusing to resume a denied session");
+    if (known && denied.has(known)) throw new BridgeError("denied_session", "Refusing to resume a denied session");
     const options = { ...sdkOptions(config, workspaceFor(thread)), abortController: signal,
       ...(known ? { resume: known } : { title: sessionTitle(config, thread) }) };
     const messageId = randomUUID();
@@ -179,7 +211,7 @@ export function createBridge({ query, config, ledger }) {
     for await (const m of query({ prompt: text, options })) {
       if (m.type === "system" && m.subtype === "init") {
         sessionId = m.session_id;
-        if (denied.has(sessionId)) throw new Error("SDK returned a denied session");
+        if (denied.has(sessionId)) throw new BridgeError("denied_session", "SDK returned a denied session");
         if (m.claude_code_version && m.claude_code_version !== reportedVersion) {
           reportedVersion = m.claude_code_version;
           console.log(`Claude Code CLI version ${reportedVersion}`);
@@ -210,7 +242,8 @@ export function createBridge({ query, config, ledger }) {
         for (const b of m.message.content) if (b.type === "tool_result") emit({ type: "CUSTOM", name: "agent-fabric.tool",
           value: { phase: "result", id: b.tool_use_id, error: Boolean(b.is_error), subagent: Boolean(m.parent_tool_use_id) } });
       }
-      if (m.type === "result" && m.subtype !== "success") throw new Error(`SDK result ${m.subtype}`);
+      if (m.type === "result" && m.subtype !== "success")
+        throw new BridgeError(/^[a-z_]{1,64}$/.test(String(m.subtype)) ? m.subtype : "sdk_error", `SDK result ${m.subtype}`);
     }
     if (started) emit({ type: "TEXT_MESSAGE_END", messageId });
     return reply.trim();
@@ -249,7 +282,11 @@ export function createBridge({ query, config, ledger }) {
       } else emit({ type: "RUN_ERROR", message: `Request ${key} is already ${previous.state}. No duplicate prompt sent.` });
       return res.end();
     }
+    // Synchronous from here to runTurn: no other request can slip between these checks and the claim.
+    if (active.has(thread)) return json(409, { error: "conversation_busy", message: "This conversation already has a run in progress. No prompt was sent." });
+    if (active.size >= maxConcurrent) return json(429, { error: "bridge_busy", message: "The agent is busy with another conversation. No prompt was sent." });
     if (!ledger.reserve(key, thread, fingerprint)) return json(409, { error: "Run already in progress" });
+    active.add(thread);
     stream(); emit({ type: "RUN_STARTED", threadId: thread, runId: run });
     emit({ type: "CUSTOM", name: "agent-fabric.request", value: { id: key, state: "submitted" } });
     const abort = new AbortController();
@@ -260,8 +297,10 @@ export function createBridge({ query, config, ledger }) {
       emit({ type: "RUN_FINISHED", threadId: thread, runId: run });
     } catch (e) {
       ledger.uncertain(key);  // never resent automatically
-      emit({ type: "RUN_ERROR", message: `Run did not complete (${e?.name ?? "Error"}). No duplicate prompt will be sent; check /requests/${key}.` });
-    } finally { clearTimeout(timer); res.end(); }
+      const reason = abort.signal.aborted ? "timeout" : e instanceof BridgeError ? e.reason : (e?.name ?? "Error");
+      emit({ type: "RUN_ERROR", code: reason,
+        message: `Run did not complete (${reason}). No duplicate prompt will be sent; check /requests/${key}.` });
+    } finally { active.delete(thread); clearTimeout(timer); res.end(); }
   };
 }
 
@@ -284,6 +323,7 @@ export function configFromEnv(env = process.env) {
     maxTurns: Number(env.SDK_BRIDGE_MAX_TURNS || 8),
     maxBudgetUsd: Number(env.SDK_BRIDGE_MAX_BUDGET_USD || 2),
     timeoutSeconds: Number(env.SDK_BRIDGE_TIMEOUT_SECONDS || 600),
+    maxConcurrent: Number(env.SDK_BRIDGE_MAX_CONCURRENT || 1),
     denySessions: list(env.SDK_BRIDGE_DENY_SESSIONS),
   };
   if (!/^[0-9a-f]{64}$/.test(config.tokenSha256)) throw new Error("SDK_BRIDGE_TOKEN_SHA256 must be a 64-character hex SHA-256");
@@ -338,5 +378,5 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     .listen(config.port, config.host, () => console.log(`Agent Fabric Claude SDK bridge ${VERSION} on ${config.host}:${config.port}`
       + ` profile=${config.profile}`
       + (config.agent ? ` mode=${config.agent.permissionMode} sources=${config.agent.settingSources.join("+")}` : "")
-      + ` caps=${config.maxTurns} turns/$${config.maxBudgetUsd}/${config.timeoutSeconds}s denied=${config.denySessions.length}`));
+      + ` caps=${config.maxTurns} turns/$${config.maxBudgetUsd}/${config.timeoutSeconds}s concurrent=${config.maxConcurrent} denied=${config.denySessions.length}`));
 }

@@ -117,7 +117,7 @@ test("helpers", () => {
 });
 
 // ------------------------------------------------------------------ agent profile (0.2.0)
-import { mkdirSync, readFileSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
 import { configFromEnv, conversationId, conversationWorkspace, sdkOptions, sessionTitle } from "./claude_sdk_bridge.mjs";
 
 const BASE = { SDK_BRIDGE_TOKEN_SHA256: HASH, SDK_BRIDGE_LEDGER: "/srv/l.sqlite3" };
@@ -203,9 +203,18 @@ test("each conversation gets its own workspace seeded once from the template", (
   assert.equal(path.dirname(a), root);
   assert.equal(path.basename(a), conversationId("thread-a"));
   assert.equal(readFileSync(path.join(a, ".claude", "settings.json"), "utf8"), TEMPLATE[".claude/settings.json"]);
-  writeFileSync(path.join(a, "CLAUDE.md"), "edited in conversation");
+  mkdirSync(path.join(a, "worktree", "src"), { recursive: true });            // extra files and worktrees are fine
+  writeFileSync(path.join(a, "worktree", "src", "x.txt"), "work");
   assert.equal(conversationWorkspace(root, "thread-a", PINS), a);
-  assert.equal(readFileSync(path.join(a, "CLAUDE.md"), "utf8"), "edited in conversation");   // not re-seeded
+  assert.equal(statSync(a).mode & 0o777, 0o700);
+  assert.equal(statSync(path.join(a, ".claude")).mode & 0o777, 0o700);
+  assert.equal(statSync(path.join(a, "CLAUDE.md")).mode & 0o777, 0o600);
+  writeFileSync(path.join(a, "CLAUDE.md"), "edited in conversation");        // a pinned file edited by the session
+  assert.throws(() => conversationWorkspace(root, "thread-a", PINS), /CLAUDE\.md changed/);
+  assert.equal(readFileSync(path.join(a, "CLAUDE.md"), "utf8"), "edited in conversation");   // never silently re-seeded
+  writeFileSync(path.join(a, "CLAUDE.md"), TEMPLATE["CLAUDE.md"]);
+  rmSync(path.join(a, ".claude", "settings.json"));
+  assert.throws(() => conversationWorkspace(root, "thread-a", PINS), /settings\.json is missing/);
   assert.equal(conversationWorkspace(root, "../../etc", PINS).startsWith(root + path.sep), true);  // raw ids never reach paths
 });
 
@@ -273,4 +282,85 @@ test("agent runs use the conversation workspace and title; denied and foreign se
   const before = seen.length;
   assert.equal((await post("t3", "r1")).at(-1).type, "RUN_ERROR");
   assert.equal(seen.length, before);
+});
+
+// ------------------------------------------------------------------ review fixes (single flight, global cap, codes)
+async function gatedBridge(t, extra = {}) {
+  const root = agentTemplate();
+  const dir = mkdtempSync(path.join(os.tmpdir(), "sdkb-"));
+  const gates = [], seen = [];
+  let n = 0, result = "success";
+  const query = ({ options }) => (async function* () {
+    seen.push(options);
+    const sid = options.resume ?? `G${++n}`;
+    yield { type: "system", subtype: "init", session_id: sid };
+    await new Promise((r) => gates.push(r));                 // held until the test releases it
+    yield { type: "result", subtype: result, session_id: sid };
+  })();
+  const config = configFromEnv({ ...AGENT, SDK_BRIDGE_WORKSPACE_ROOT: root, ...extra });
+  const ledger = new Ledger(path.join(dir, "ledger.sqlite3"));
+  const handle = createBridge({ query, config, ledger });
+  const server = createServer((req, res) => handle(req, res));
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => server.close());
+  const post = (thread, run) => fetch(`http://127.0.0.1:${server.address().port}/ag-ui`, { method: "POST",
+    headers: { authorization: `Bearer ${TOKEN}` }, body: JSON.stringify({ threadId: thread, runId: run,
+      messages: [{ role: "user", content: "hi" }] }) });
+  const events = async (r) => (await r.text()).split("\n").filter((l) => l.startsWith("data:")).map((l) => JSON.parse(l.slice(5)));
+  const waitFor = async (k) => { for (let i = 0; i < 200 && gates.length < k; i++) await new Promise((r) => setTimeout(r, 5)); };
+  return { root, post, events, seen, gates, waitFor, ledger, setResult: (r) => { result = r; } };
+}
+
+test("single flight: a second run on a busy conversation is refused before any SDK call", async (t) => {
+  const g = await gatedBridge(t, { SDK_BRIDGE_MAX_CONCURRENT: "4" });
+  const first = g.post("t1", "r1");                          // new thread, first run in flight
+  await g.waitFor(1);
+  const retry = await g.post("t1", "r2");                    // e.g. OpenBot Retry mints a new runId
+  assert.equal(retry.status, 409);
+  assert.equal((await retry.json()).error, "conversation_busy");
+  assert.equal(g.seen.length, 1);
+  g.gates.shift()();
+  assert.equal((await g.events(await first)).at(-1).type, "RUN_FINISHED");
+  const resumed = g.post("t1", "r3");                        // existing thread: busy again while resuming
+  await g.waitFor(1);
+  assert.equal((await g.post("t1", "r4")).status, 409);
+  assert.deepEqual(g.seen.map((o) => o.resume ?? null), [null, "G1"]);
+  g.gates.shift()();
+  await g.events(await resumed);
+  assert.equal(g.ledger.get(createHash("sha256").update(JSON.stringify(["t1", "r2"])).digest("hex")), null);  // refused run left no ledger row
+  const after = await g.events(await (async () => { const p = g.post("t1", "r2"); await g.waitFor(1); g.gates.shift()(); return p; })());
+  assert.equal(after.at(-1).type, "RUN_FINISHED");           // and can run once the conversation is free
+});
+
+test("global cap: with the default of one, another conversation is refused while one runs", async (t) => {
+  const g = await gatedBridge(t);
+  const first = g.post("a", "r1");
+  await g.waitFor(1);
+  const other = await g.post("b", "r1");
+  assert.equal(other.status, 429);
+  assert.equal((await other.json()).error, "bridge_busy");
+  assert.equal(g.seen.length, 1);
+  g.gates.shift()();
+  await g.events(await first);
+  const next = g.post("b", "r1");
+  await g.waitFor(1); g.gates.shift()();
+  assert.equal((await g.events(await next)).at(-1).type, "RUN_FINISHED");
+  assert.throws(() => configFromEnv({ ...AGENT, SDK_BRIDGE_MAX_CONCURRENT: "5" }), /MAX_CONCURRENT/);
+  assert.throws(() => configFromEnv({ ...AGENT, SDK_BRIDGE_MAX_CONCURRENT: "0" }), /MAX_CONCURRENT/);
+  assert.equal(configFromEnv(AGENT).maxConcurrent, 1);
+});
+
+test("RUN_ERROR names the cap or guard that stopped the run; a changed pinned file stops the next turn", async (t) => {
+  const g = await gatedBridge(t);
+  g.setResult("error_max_turns");
+  const r = g.post("t", "r1"); await g.waitFor(1); g.gates.shift()();
+  const err = (await g.events(await r)).at(-1);
+  assert.deepEqual([err.type, err.code], ["RUN_ERROR", "error_max_turns"]);
+  assert.match(err.message, /error_max_turns/);
+  g.setResult("success");
+  writeFileSync(path.join(g.root, conversationId("t"), ".claude", "settings.json"), '{"permissions":{"deny":[]}}');
+  const before = g.seen.length;
+  const blocked = (await g.events(await g.post("t", "r2"))).at(-1);
+  assert.deepEqual([blocked.type, blocked.code], ["RUN_ERROR", "workspace_pinned_file_changed"]);
+  assert.equal(g.seen.length, before);                       // no prompt reached the SDK
 });
