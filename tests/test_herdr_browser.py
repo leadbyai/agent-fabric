@@ -111,6 +111,10 @@ class BrowserThroughTheBridge(BridgeTests):
         headers, body = self.openbot.calls[0]
         self.assertEqual(body, {"run": RUN, "action": "navigate", "url": "https://example.com/"})
         self.assertEqual(headers["x-agent-fabric-credential"], "Bearer " + "Z" * 48)
+        # Every call names the gateway, never urllib's default signature (edge proxies may refuse it).
+        for headers, _ in self.openbot.calls:
+            self.assertEqual(headers["user-agent"], herdr_browser.USER_AGENT)
+            self.assertNotIn("python-urllib", headers["user-agent"].lower())
         # The screenshot reached the reply through the existing outbox.
         reply = next(e for e in events if e.get("type") == "TEXT_MESSAGE_CONTENT")["delta"]
         self.assertIn("data:image/png;base64,", reply)

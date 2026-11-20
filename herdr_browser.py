@@ -41,6 +41,9 @@ MAX_SHOT_BYTES = 2_000_000
 TURN_FILE = "browser.json"
 KEY_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
 PNG = b"\x89PNG\r\n\x1a\n"
+# Sent on every call to OpenBot. Some edge proxies refuse urllib's default
+# "Python-urllib/x.y" signature before the request reaches OpenBot.
+USER_AGENT = "agent-fabric-openbot-browser/0.7.0"
 
 
 @dataclass
@@ -124,7 +127,8 @@ def _post(turn: Turn, payload: dict) -> tuple[int, dict]:
     request = urllib.request.Request(
         url,
         data=json.dumps({"run": turn.assertion, **payload}).encode("utf-8"),
-        headers={"content-type": "application/json", "x-agent-fabric-credential": turn.credential},
+        headers={"content-type": "application/json", "user-agent": USER_AGENT,
+                 "x-agent-fabric-credential": turn.credential},
         method="POST",
     )
     try:
