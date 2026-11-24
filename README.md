@@ -115,6 +115,22 @@ Without these options the install is exactly as above (loopback bind, one bridge
 ## Safety and rollout
 
 - No agent input is submitted while Herdr marks that agent `working` or `blocked`.
+- With the bounded queue on (`OPENBOT_BRIDGE_BUSY_WAIT_SECONDS` > 0), a message to an agent that is
+  waiting on a question (`blocked`) is **held, not refused**. OpenBot shows "<agent> is waiting for an
+  answer on its own screen. Your message goes in once it's answered." in place of "Thinking". It adds the
+  question itself only with `OPENBOT_BRIDGE_SHOW_QUESTION_TEXT=1`, which is off by default because the
+  gateway can't tell a Bot's owner from someone it's shared with. Set it only where every requester may
+  see the operator's questions. The message goes in once the
+  question is answered on the agent's own screen and the agent is idle again. The gateway never answers
+  the question and never sends keys to the pane. Limits: `OPENBOT_BRIDGE_QUESTION_HOLD_SECONDS`
+  (default 1800, shared by every message held for one question; `0` restores the old refusal) and
+  `OPENBOT_BRIDGE_QUESTION_HOLD_MAX` (default 3 messages per agent). Beyond either limit, the message is
+  refused with a reason and is not submitted. A question asked mid-turn is shown the same way, and the
+  reply still arrives once it is answered, within the same hold limit.
+- A Claude Code agent that is signed out ("Login expired · Please run /login" as the last thing on its
+  screen) is not prompted. The run fails at once with "<agent> is signed out". If the CLI signs out
+  after the message was submitted, the run fails as soon as that shows, without waiting out the
+  recovery window.
 - Requests to unknown agent panes and stopped sessions are rejected.
 - A per-agent lock prevents two concurrent OpenBot requests targeting one pane.
 - Failed or ambiguous CLI submissions are **never retried automatically**.

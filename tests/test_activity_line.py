@@ -74,3 +74,29 @@ class Redaction(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PaneNoticeTests(unittest.TestCase):
+    def screen(self, name):
+        return (SCREENS / f"{name}.txt").read_text()
+
+    def test_open_question_is_read_from_a_selection_prompt(self):
+        self.assertEqual(
+            al.open_question(self.screen("claude-question")),
+            "Which rollout should we use for the new reply checks? The staged one is slower but easier to undo.")
+
+    def test_no_question_on_ordinary_screens(self):
+        for name in ("claude-finished", "claude-running", "claude-reading", "codex-finished"):
+            self.assertIsNone(al.open_question(self.screen(name)), name)
+
+    def test_signed_out_only_when_it_is_the_last_thing_shown(self):
+        self.assertEqual(al.signed_out(self.screen("claude-signed-out")),
+                         "Login expired · Please run /login")
+        self.assertIsNone(al.signed_out(self.screen("claude-signed-in-again")))
+        for name in ("claude-finished", "claude-running", "claude-question", "codex-finished"):
+            self.assertIsNone(al.signed_out(self.screen(name)), name)
+
+    def test_a_reply_that_mentions_logging_in_is_not_a_sign_out(self):
+        screen = ("● To fix it, please run /login in that terminal.\n\n✻ Worked for 3s · done 9:00 AM\n\n"
+                  + "─" * 40 + "\n❯ \n" + "─" * 40 + "\n")
+        self.assertIsNone(al.signed_out(screen))

@@ -109,7 +109,9 @@ class BridgeTests(unittest.TestCase):
             )
             return '{"result":{"agent_status":"done"}}'
         if args[:2] == ("agent", "read"):
-            return self.replies[(session, args[2])]
+            if (session, args[2]) in self.replies:
+                return self.replies[(session, args[2])]
+            return getattr(self, "screens", {}).get((session, args[2]), "")
         raise AssertionError(f"Unexpected Herdr command {args}")
 
     def request(self, method, path, data=None, auth=True, raw=False, token=None):
@@ -620,11 +622,193 @@ sys.exit(1)
 
     def test_blocked_agent_is_not_queued_or_prompted(self):
         self.enable_bounded_queue()
+        self.bridge.QUESTION_HOLD_SECONDS = 0  # the old behaviour, still available
         self.roster["Main"][0]["agent_status"] = "blocked"
         status, body = self.request("POST", "/ag-ui", self.message("Needs approval"))
         self.assertEqual(status, 200)
         self.assertEqual(self.events(body)[-1]["type"], "RUN_ERROR")
         self.assertEqual(self.prompts, [])
+
+    QUESTION_SCREEN = (PACKAGE_ROOT / "tests" / "fixtures" / "screens" / "claude-question.txt").read_text()
+    SIGNED_OUT_SCREEN = (PACKAGE_ROOT / "tests" / "fixtures" / "screens" / "claude-signed-out.txt").read_text()
+
+    def record_commands(self):
+        seen = []
+        base = self.bridge.command
+
+        def recording(*args, **kwargs):
+            seen.append(args[:2])
+            return base(*args, **kwargs)
+
+        self.bridge.command = recording
+        return seen
+
+    def test_message_is_held_while_a_question_is_open_then_delivered(self):
+        self.enable_bounded_queue()
+        self.bridge.QUESTION_HOLD_SECONDS = 5
+        agent = self.roster["Main"][0]
+        agent["agent_status"] = "blocked"
+        self.screens = {("Main", "wA:p1"): self.QUESTION_SCREEN}
+        seen = self.record_commands()
+
+        def answered_on_its_own_screen():
+            time.sleep(0.2)
+            self.screens = {}
+            agent["agent_status"] = "idle"
+
+        answering = threading.Thread(target=answered_on_its_own_screen)
+        answering.start()
+        try:
+            status, body = self.request("POST", "/ag-ui", self.message("Deliver after the answer"))
+        finally:
+            answering.join(timeout=2)
+        events = self.events(body)
+        self.assertEqual(status, 200)
+        held = [e for e in events if e.get("name") == "agent-fabric.progress" and e["value"]["state"] == "held"]
+        self.assertTrue(held)
+        # By default the question stays on the operator's screen: a Bot may be shared with others.
+        self.assertEqual(held[0]["value"]["line"],
+                         "Demo is waiting for an answer on its own screen. Your message goes in once it's answered.")
+        self.assertNotIn("rollout", body)
+        self.assertEqual(events[-1]["type"], "RUN_FINISHED")
+        self.assertEqual(len(self.prompts), 1)
+        # The gateway never answers the question itself.
+        self.assertNotIn(("agent", "send-keys"), seen)
+        self.assertNotIn(("pane", "send-keys"), seen)
+        self.assertEqual(self.bridge.HOLDS, {})
+
+    def test_question_text_is_shown_only_when_the_operator_opts_in(self):
+        self.enable_bounded_queue()
+        self.bridge.QUESTION_HOLD_SECONDS = 5
+        self.bridge.SHOW_QUESTION_TEXT = True
+        agent = self.roster["Main"][0]
+        agent["agent_status"] = "blocked"
+        self.screens = {("Main", "wA:p1"): self.QUESTION_SCREEN}
+
+        def answered_on_its_own_screen():
+            time.sleep(0.2)
+            agent["agent_status"] = "idle"
+
+        answering = threading.Thread(target=answered_on_its_own_screen)
+        answering.start()
+        try:
+            status, body = self.request("POST", "/ag-ui", self.message("Deliver after the answer"))
+        finally:
+            answering.join(timeout=2)
+        held = [e for e in self.events(body) if e.get("name") == "agent-fabric.progress"
+                and e["value"]["state"] == "held"]
+        self.assertIn("Demo is waiting for an answer on its own screen: Which rollout should we use",
+                      held[0]["value"]["line"])
+        self.assertEqual(self.events(body)[-1]["type"], "RUN_FINISHED")
+
+    def test_question_text_is_off_unless_the_flag_is_exactly_1(self):
+        for value, expected in (("", False), ("0", False), ("true", False), ("1", True)):
+            with patch.dict(os.environ, {"OPENBOT_BRIDGE_SHOW_QUESTION_TEXT": value}):
+                spec = importlib.util.spec_from_file_location("bridge_flag", BRIDGE_PATH)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            self.assertIs(module.SHOW_QUESTION_TEXT, expected, value)
+
+    def test_held_message_expires_with_a_clear_reason_and_is_not_submitted(self):
+        self.enable_bounded_queue()
+        self.bridge.QUESTION_HOLD_SECONDS = 0.15
+        self.roster["Main"][0]["agent_status"] = "blocked"
+        status, body = self.request("POST", "/ag-ui", self.message("Never delivered"))
+        events = self.events(body)
+        self.assertEqual(events[-1]["type"], "RUN_ERROR")
+        self.assertIn("still has a question open on its own screen", events[-1]["message"])
+        self.assertIn("No prompt submitted", events[-1]["message"])
+        self.assertEqual(self.prompts, [])
+        # The expired hold is gone, so a later message gets a fresh one.
+        self.assertEqual(self.bridge.HOLDS, {})
+
+    def test_held_messages_are_capped_per_agent(self):
+        self.enable_bounded_queue(seconds=2)
+        self.bridge.QUESTION_HOLD_SECONDS = 2
+        self.bridge.QUESTION_HOLD_MAX = 1
+        agent = self.roster["Main"][0]
+        agent["agent_status"] = "blocked"
+        first = {}
+
+        def first_message():
+            first["result"] = self.request("POST", "/ag-ui", self.message("First"))
+
+        holding = threading.Thread(target=first_message)
+        holding.start()
+        try:
+            deadline = time.monotonic() + 2
+            while not self.bridge.HOLDS and time.monotonic() < deadline:
+                time.sleep(0.01)
+            status, body = self.request("POST", "/ag-ui", self.message("Second"))
+            self.assertEqual(self.events(body)[-1]["type"], "RUN_ERROR")
+            self.assertIn("already has 1 message waiting", self.events(body)[-1]["message"])
+        finally:
+            agent["agent_status"] = "idle"
+            holding.join(timeout=5)
+        self.assertEqual(self.events(first["result"][1])[-1]["type"], "RUN_FINISHED")
+        self.assertEqual(len(self.prompts), 1)
+
+    def test_question_during_a_turn_is_held_and_the_reply_still_arrives(self):
+        self.bridge.RECOVERY_SECONDS = 1
+        self.bridge.HEARTBEAT_SECONDS = 0.02
+        self.bridge.STATE_POLL_SECONDS = 0.02
+        self.bridge.QUESTION_HOLD_SECONDS = 5
+        agent = self.roster["Main"][0]
+        base = self.fake_command
+
+        def asks_mid_turn(*args, **kwargs):
+            out = base(*args, **kwargs)
+            if args[:2] == ("agent", "prompt"):
+                agent["agent_status"] = "blocked"
+                self.screens = {("Main", "wA:p1"): self.QUESTION_SCREEN}
+
+                def answered():
+                    time.sleep(0.15)
+                    agent["agent_status"] = "done"
+
+                threading.Thread(target=answered, daemon=True).start()
+            return out
+
+        self.bridge.command = asks_mid_turn
+        status, body = self.request("POST", "/ag-ui", self.message("Do the thing"))
+        events = self.events(body)
+        self.assertTrue(any(e.get("name") == "agent-fabric.progress" and e["value"]["state"] == "held"
+                            for e in events))
+        self.assertEqual(events[-1]["type"], "RUN_FINISHED")
+        self.assertEqual(len(self.prompts), 1)
+
+    def test_signed_out_agent_is_not_prompted(self):
+        self.enable_bounded_queue()
+        self.screens = {("Main", "wA:p1"): self.SIGNED_OUT_SCREEN}
+        status, body = self.request("POST", "/ag-ui", self.message("Are you there?"))
+        events = self.events(body)
+        self.assertEqual(events[-1]["type"], "RUN_ERROR")
+        self.assertIn("Demo is signed out (Login expired · Please run /login)", events[-1]["message"])
+        self.assertIn("No prompt submitted", events[-1]["message"])
+        self.assertEqual(self.prompts, [])
+
+    def test_sign_out_after_submission_fails_fast_not_after_the_recovery_window(self):
+        self.bridge.RECOVERY_SECONDS = 30
+        self.bridge.STATE_POLL_SECONDS = 0.02
+        base = self.fake_command
+
+        def expires_on_submit(*args, **kwargs):
+            if args[:2] == ("agent", "prompt"):
+                self.prompts.append((kwargs.get("session"), args[2], args[3]))
+                self.screens = {("Main", "wA:p1"): self.SIGNED_OUT_SCREEN}
+                return '{"result":{"agent_status":"done"}}'
+            if args[:2] == ("agent", "read") and "recent-unwrapped" in args:
+                return "no marker here"
+            return base(*args, **kwargs)
+
+        self.bridge.command = expires_on_submit
+        started = time.monotonic()
+        status, body = self.request("POST", "/ag-ui", self.message("Hello"))
+        events = self.events(body)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(events[-1]["type"], "RUN_ERROR")
+        self.assertIn("reached it but could not be answered", events[-1]["message"])
+        self.assertEqual(len(self.prompts), 1)
 
     def test_replaced_agent_is_not_prompted_after_queue_wait(self):
         self.enable_bounded_queue()
@@ -715,7 +899,7 @@ sys.exit(1)
                 base(*args, **kwargs)
                 target["agent_status"] = "working"
                 raise RuntimeError("timed out waiting for agent status")
-            if args[:2] == ("agent", "read"):
+            if args[:2] == ("agent", "read") and self.prompts:
                 self.fail("Cannot collect the reply while Herdr reports working")
             return base(*args, **kwargs)
 
@@ -742,7 +926,8 @@ sys.exit(1)
                 base(*args, **kwargs)
                 target["terminal_id"] = "replacement"
                 raise RuntimeError("timed out waiting for agent status")
-            if args[:2] == ("agent", "read"):
+            if args[:2] == ("agent", "read") and self.prompts:
+                # (Before submission the gateway reads the original pane's screen for a sign-out.)
                 self.fail("Must not read the replacement pane's transcript")
             return base(*args, **kwargs)
 

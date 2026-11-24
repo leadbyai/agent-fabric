@@ -77,6 +77,15 @@ STATE_POLL_SECONDS = 2.0
 # runs and send what it is doing when that changes. OPENBOT_ACTIVITY_LINE=0 keeps the bare heartbeat.
 ACTIVITY_LINE = os.environ.get("OPENBOT_ACTIVITY_LINE", "1").strip() != "0"
 ACTIVITY_SECONDS = 2.0
+# A pane waiting on a question (Herdr "blocked") holds new messages instead of refusing them, for at
+# most QUESTION_HOLD_SECONDS per question and QUESTION_HOLD_MAX messages per pane. The gateway never
+# answers the question; the person (or whoever runs the agent) answers it on the agent's own screen.
+# 0 restores the old behaviour: refuse at once.
+QUESTION_HOLD_SECONDS = int(os.environ.get("OPENBOT_BRIDGE_QUESTION_HOLD_SECONDS", "1800"))
+QUESTION_HOLD_MAX = int(os.environ.get("OPENBOT_BRIDGE_QUESTION_HOLD_MAX", "3"))
+# The held line names the question only when this is 1. The gateway cannot tell a Bot's owner from
+# someone the Bot is shared with, and the question is the operator's, so the default is generic.
+SHOW_QUESTION_TEXT = os.environ.get("OPENBOT_BRIDGE_SHOW_QUESTION_TEXT", "0").strip() == "1"
 BROWSER_ROUTE = re.compile(r"/openbot-browser/([A-Za-z0-9_-]{40,64})")
 BROWSER_CLI = Path(__file__).resolve().parent / "openbot_browser_cli.py"
 WORKDIR = os.environ.get("OPENBOT_BRIDGE_WORKDIR", "").strip()
@@ -89,6 +98,9 @@ AGENT_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 LOCKS_GUARD = threading.Lock()
 WAIT_QUEUES: dict[tuple[str, str], deque[object]] = {}
 WAIT_QUEUES_GUARD = threading.Lock()
+# One hold per pane while it waits on a question: {"until": monotonic deadline}. Every message held
+# for that question shares the deadline, so queued messages cannot stretch it.
+HOLDS: dict[tuple[str, str], dict] = {}
 GLOBAL_SLOTS = threading.BoundedSemaphore(8)
 WAITING_SLOTS = threading.BoundedSemaphore(64)
 # OpenBot may inline up to 32 MiB of recent attachments; base64 plus history
@@ -324,6 +336,55 @@ def waiting_queue(session: str, pane_id: str) -> deque[object]:
         if key not in WAIT_QUEUES:
             WAIT_QUEUES[key] = deque()
         return WAIT_QUEUES[key]
+
+
+def pane_screen(session: str, pane_id: str) -> str | None:
+    try:
+        return command("agent", "read", pane_id, "--source", "visible", session=session, wait_seconds=5)
+    except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def agent_title(agent: dict, pane_id: str) -> str:
+    return str(agent.get("terminal_title_stripped") or agent.get("name") or pane_id)
+
+
+def held_line(title: str, question: str | None) -> str:
+    """What OpenBot shows in place of "Thinking" while a message is held."""
+    waiting = f"{title} is waiting for an answer on its own screen"
+    if question and SHOW_QUESTION_TEXT:
+        return f"{waiting}: {question}"
+    return f"{waiting}. Your message goes in once it's answered."
+
+
+def held_question(session: str, pane_id: str) -> str | None:
+    """The open question's text, read only when the held line may show it."""
+    if not SHOW_QUESTION_TEXT:
+        return None
+    screen = pane_screen(session, pane_id)
+    return activity_line.open_question(screen) if screen else None
+
+
+def signed_out_error(title: str, shown: str, submitted: bool) -> str:
+    if submitted:
+        return (f"{title} is signed out ({shown}). Your message reached it but could not be answered. "
+                "Sign it in again, then send your message again.")
+    return (f"{title} is signed out ({shown}). No prompt submitted. "
+            "Sign it in again, then send your message again.")
+
+
+def hold_for(key: tuple[str, str]) -> dict:
+    """The current hold for a pane's open question, started now if there is none."""
+    with WAIT_QUEUES_GUARD:
+        hold = HOLDS.get(key)
+        if hold is None:
+            hold = HOLDS[key] = {"until": time.monotonic() + QUESTION_HOLD_SECONDS}
+        return hold
+
+
+def end_hold(key: tuple[str, str]) -> None:
+    with WAIT_QUEUES_GUARD:
+        HOLDS.pop(key, None)
 
 
 class HerdrPane:
@@ -1136,6 +1197,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_event({"type": "CUSTOM", "name": "agent-fabric.progress",
                          "value": {"state": state}})
 
+    def send_progress_line(self, state: str, line: str) -> None:
+        # The same event the activity line uses, so OpenBot shows the words in place of "Thinking".
+        self.send_event({"type": "CUSTOM", "name": "agent-fabric.progress",
+                         "value": {"state": state, "line": line}})
+
     def send_submitted_event(self, payload: dict) -> None:
         """Continue tracking a submitted run if its browser stream closes.
 
@@ -1242,6 +1308,8 @@ class Handler(BaseHTTPRequestHandler):
         # wait timeout does not mean the turn stopped. Only start the shorter
         # marker-correlation window when the pane is available to read.
         correlation_deadline = None
+        blocked_since: float | None = None
+        last_question: str | None = None
         while True:
             agent = agent_record(session, pane_id)
             state = normalized_state(agent)
@@ -1251,7 +1319,26 @@ class Handler(BaseHTTPRequestHandler):
                 raise RuntimeError("Agent session changed after submission. Inspect Herdr before retrying.")
             session_id = session_id or current_session
             if state == "blocked":
-                raise RuntimeError(f"Agent {pane_id} needs an approval or answer in Herdr")
+                # A question mid-turn: the turn resumes once it is answered on the agent's own screen.
+                if QUESTION_HOLD_SECONDS <= 0:
+                    raise RuntimeError(f"Agent {pane_id} needs an approval or answer in Herdr")
+                now = time.monotonic()
+                blocked_since = blocked_since or now
+                if now - blocked_since >= QUESTION_HOLD_SECONDS or now >= active_deadline:
+                    raise RuntimeError(
+                        f"{agent_title(agent, pane_id)} is still waiting for an answer on its own screen. "
+                        "The request was submitted once. Answer it there; the reply stays in Herdr.")
+                line = held_line(agent_title(agent, pane_id), held_question(session, pane_id))
+                if line != last_question:
+                    last_question = line
+                    self.send_submitted_event({"type": "CUSTOM", "name": "agent-fabric.progress",
+                                               "value": {"state": "held", "line": line}})
+                else:
+                    self.send_submitted_progress("held")
+                correlation_deadline = None
+                time.sleep(STATE_POLL_SECONDS)
+                continue
+            blocked_since = None
 
             now = time.monotonic()
             if extend_working and state == "working":
@@ -1273,6 +1360,10 @@ class Handler(BaseHTTPRequestHandler):
                                      session=session, wait_seconds=30)
                 return normalize_prose_wrapping(extract_reply(transcript, marker_id))
             except (RuntimeError, subprocess.TimeoutExpired) as exc:
+                screen = pane_screen(session, pane_id)
+                shown = activity_line.signed_out(screen) if screen else None
+                if shown:
+                    raise RuntimeError(signed_out_error(agent_title(agent, pane_id), shown, True)) from exc
                 if time.monotonic() >= correlation_deadline:
                     raise RuntimeError(
                         "Submitted agent reply could not be correlated "
@@ -1448,6 +1539,11 @@ class Handler(BaseHTTPRequestHandler):
         browser_turn: Path | None = None
         queue_ticket: object | None = None
         pane_queue = waiting_queue(session, pane_id) if wait_enabled else None
+        hold_key = (session, pane_id)
+        hold_minutes = max(1, round(QUESTION_HOLD_SECONDS / 60))
+        question_expired = (
+            f"Not delivered: {agent_title(agent, pane_id)} still has a question open on its own screen "
+            f"after {hold_minutes} min. No prompt submitted. Answer it there, then send this again.")
         last_progress = 0.0
 
         def progress_if_due(state: str) -> None:
@@ -1466,6 +1562,15 @@ class Handler(BaseHTTPRequestHandler):
                 queue_ticket = object()
                 with WAIT_QUEUES_GUARD:
                     assert pane_queue is not None
+                    # The message holding the pane has left the queue: count it too.
+                    waiting = len(pane_queue) + 1
+                    if (session, pane_id) in HOLDS and waiting >= QUESTION_HOLD_MAX:
+                        queue_ticket = None
+                        raise RuntimeError(
+                            f"{agent_title(agent, pane_id)} already has {waiting} "
+                            f"message{'s' if waiting != 1 else ''} waiting "
+                            "for an answer on its own screen. No prompt submitted. "
+                            "Send this again once it's answered.")
                     pane_queue.append(queue_ticket)
                 while True:
                     with WAIT_QUEUES_GUARD:
@@ -1474,7 +1579,14 @@ class Handler(BaseHTTPRequestHandler):
                             have_lock = True
                             queue_ticket = None
                             break
+                    with WAIT_QUEUES_GUARD:
+                        hold = HOLDS.get((session, pane_id))
+                    if hold is not None:
+                        # The message ahead is held for a question: wait as long as that hold, no longer.
+                        deadline = max(deadline, hold["until"])
                     if time.monotonic() >= deadline:
+                        if hold is not None:
+                            raise RuntimeError(question_expired)
                         raise RuntimeError("Agent is still busy; waiting expired. No prompt submitted.")
                     progress_if_due("queued")
                     time.sleep(min(STATE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
@@ -1492,10 +1604,27 @@ class Handler(BaseHTTPRequestHandler):
                     raise RuntimeError("Agent changed while request was waiting. No prompt submitted.")
                 self.json_response(409, {"error": "Agent changed while request was preparing"})
                 return
-            while wait_enabled and state == "working":
-                if time.monotonic() >= deadline:
-                    raise RuntimeError("Agent is still working; waiting expired. No prompt submitted.")
-                progress_if_due("queued")
+            last_held = None
+            while wait_enabled and (state == "working" or
+                                    (state == "blocked" and QUESTION_HOLD_SECONDS > 0)):
+                if state == "blocked":
+                    hold = hold_for(hold_key)
+                    if time.monotonic() >= hold["until"]:
+                        raise RuntimeError(question_expired)
+                    # After the answer the agent usually works on; wait for that turn too.
+                    deadline = max(deadline, time.monotonic() + BUSY_WAIT_SECONDS)
+                    line = held_line(agent_title(current_agent, pane_id), held_question(session, pane_id))
+                    if line != last_held:
+                        last_held = line
+                        self.send_progress_line("held", line)
+                        last_progress = time.monotonic()
+                    else:
+                        progress_if_due("held")
+                else:
+                    end_hold(hold_key)
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Agent is still working; waiting expired. No prompt submitted.")
+                    progress_if_due("queued")
                 time.sleep(min(STATE_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
                 current_agent = agent_record(session, pane_id)
                 updated_ref = current_agent.get("agent_session", {}).get("value") if isinstance(
@@ -1506,8 +1635,18 @@ class Handler(BaseHTTPRequestHandler):
             if state not in ("idle", "done") and not wait_enabled:
                 self.json_response(409, {"error": f"Agent is {state}, no prompt submitted"})
                 return
+            if state in ("idle", "done"):
+                end_hold(hold_key)
             if state not in ("idle", "done"):
                 raise RuntimeError(f"Agent is {state}. No prompt submitted; inspect Herdr.")
+            screen = pane_screen(session, pane_id)
+            shown = activity_line.signed_out(screen) if screen else None
+            if shown:
+                if not stream_started:
+                    self.json_response(409, {"error": signed_out_error(agent_title(current_agent, pane_id),
+                                                                       shown, False)})
+                    return
+                raise RuntimeError(signed_out_error(agent_title(current_agent, pane_id), shown, False))
             if wait_enabled:
                 while not GLOBAL_SLOTS.acquire(blocking=False):
                     if time.monotonic() >= deadline:
@@ -1633,6 +1772,12 @@ class Handler(BaseHTTPRequestHandler):
             if queue_ticket is not None and pane_queue is not None:
                 with WAIT_QUEUES_GUARD:
                     pane_queue.remove(queue_ticket)
+            if pane_queue is not None:
+                with WAIT_QUEUES_GUARD:
+                    hold = HOLDS.get(hold_key)
+                    # An expired hold ends with the last message waiting on it; a later message gets its own.
+                    if hold is not None and time.monotonic() >= hold["until"] and not pane_queue:
+                        HOLDS.pop(hold_key, None)
             if have_lock:
                 lock.release()
             if have_slot:
