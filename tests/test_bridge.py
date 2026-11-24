@@ -666,14 +666,48 @@ sys.exit(1)
         self.assertEqual(status, 200)
         held = [e for e in events if e.get("name") == "agent-fabric.progress" and e["value"]["state"] == "held"]
         self.assertTrue(held)
-        self.assertIn("Demo is waiting for an answer on its own screen: Which rollout should we use",
-                      held[0]["value"]["line"])
+        # By default the question stays on the operator's screen: a Bot may be shared with others.
+        self.assertEqual(held[0]["value"]["line"],
+                         "Demo is waiting for an answer on its own screen. Your message goes in once it's answered.")
+        self.assertNotIn("rollout", body)
         self.assertEqual(events[-1]["type"], "RUN_FINISHED")
         self.assertEqual(len(self.prompts), 1)
         # The gateway never answers the question itself.
         self.assertNotIn(("agent", "send-keys"), seen)
         self.assertNotIn(("pane", "send-keys"), seen)
         self.assertEqual(self.bridge.HOLDS, {})
+
+    def test_question_text_is_shown_only_when_the_operator_opts_in(self):
+        self.enable_bounded_queue()
+        self.bridge.QUESTION_HOLD_SECONDS = 5
+        self.bridge.SHOW_QUESTION_TEXT = True
+        agent = self.roster["Main"][0]
+        agent["agent_status"] = "blocked"
+        self.screens = {("Main", "wA:p1"): self.QUESTION_SCREEN}
+
+        def answered_on_its_own_screen():
+            time.sleep(0.2)
+            agent["agent_status"] = "idle"
+
+        answering = threading.Thread(target=answered_on_its_own_screen)
+        answering.start()
+        try:
+            status, body = self.request("POST", "/ag-ui", self.message("Deliver after the answer"))
+        finally:
+            answering.join(timeout=2)
+        held = [e for e in self.events(body) if e.get("name") == "agent-fabric.progress"
+                and e["value"]["state"] == "held"]
+        self.assertIn("Demo is waiting for an answer on its own screen: Which rollout should we use",
+                      held[0]["value"]["line"])
+        self.assertEqual(self.events(body)[-1]["type"], "RUN_FINISHED")
+
+    def test_question_text_is_off_unless_the_flag_is_exactly_1(self):
+        for value, expected in (("", False), ("0", False), ("true", False), ("1", True)):
+            with patch.dict(os.environ, {"OPENBOT_BRIDGE_SHOW_QUESTION_TEXT": value}):
+                spec = importlib.util.spec_from_file_location("bridge_flag", BRIDGE_PATH)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            self.assertIs(module.SHOW_QUESTION_TEXT, expected, value)
 
     def test_held_message_expires_with_a_clear_reason_and_is_not_submitted(self):
         self.enable_bounded_queue()

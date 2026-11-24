@@ -117,7 +117,10 @@ Without these options the install is exactly as above (loopback bind, one bridge
 - No agent input is submitted while Herdr marks that agent `working` or `blocked`.
 - With the bounded queue on (`OPENBOT_BRIDGE_BUSY_WAIT_SECONDS` > 0), a message to an agent that is
   waiting on a question (`blocked`) is **held, not refused**. OpenBot shows "<agent> is waiting for an
-  answer on its own screen: <the question>" in place of "Thinking". The message goes in once the
+  answer on its own screen. Your message goes in once it's answered." in place of "Thinking". It adds the
+  question itself only with `OPENBOT_BRIDGE_SHOW_QUESTION_TEXT=1`, which is off by default because the
+  gateway can't tell a Bot's owner from someone it's shared with. Set it only where every requester may
+  see the operator's questions. The message goes in once the
   question is answered on the agent's own screen and the agent is idle again. The gateway never answers
   the question and never sends keys to the pane. Limits: `OPENBOT_BRIDGE_QUESTION_HOLD_SECONDS`
   (default 1800, shared by every message held for one question; `0` restores the old refusal) and

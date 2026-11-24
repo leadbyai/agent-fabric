@@ -83,6 +83,9 @@ ACTIVITY_SECONDS = 2.0
 # 0 restores the old behaviour: refuse at once.
 QUESTION_HOLD_SECONDS = int(os.environ.get("OPENBOT_BRIDGE_QUESTION_HOLD_SECONDS", "1800"))
 QUESTION_HOLD_MAX = int(os.environ.get("OPENBOT_BRIDGE_QUESTION_HOLD_MAX", "3"))
+# The held line names the question only when this is 1. The gateway cannot tell a Bot's owner from
+# someone the Bot is shared with, and the question is the operator's, so the default is generic.
+SHOW_QUESTION_TEXT = os.environ.get("OPENBOT_BRIDGE_SHOW_QUESTION_TEXT", "0").strip() == "1"
 BROWSER_ROUTE = re.compile(r"/openbot-browser/([A-Za-z0-9_-]{40,64})")
 BROWSER_CLI = Path(__file__).resolve().parent / "openbot_browser_cli.py"
 WORKDIR = os.environ.get("OPENBOT_BRIDGE_WORKDIR", "").strip()
@@ -349,7 +352,17 @@ def agent_title(agent: dict, pane_id: str) -> str:
 def held_line(title: str, question: str | None) -> str:
     """What OpenBot shows in place of "Thinking" while a message is held."""
     waiting = f"{title} is waiting for an answer on its own screen"
-    return f"{waiting}: {question}" if question else f"{waiting}. Your message goes in once it's answered."
+    if question and SHOW_QUESTION_TEXT:
+        return f"{waiting}: {question}"
+    return f"{waiting}. Your message goes in once it's answered."
+
+
+def held_question(session: str, pane_id: str) -> str | None:
+    """The open question's text, read only when the held line may show it."""
+    if not SHOW_QUESTION_TEXT:
+        return None
+    screen = pane_screen(session, pane_id)
+    return activity_line.open_question(screen) if screen else None
 
 
 def signed_out_error(title: str, shown: str, submitted: bool) -> str:
@@ -1315,9 +1328,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise RuntimeError(
                         f"{agent_title(agent, pane_id)} is still waiting for an answer on its own screen. "
                         "The request was submitted once. Answer it there; the reply stays in Herdr.")
-                screen = pane_screen(session, pane_id)
-                line = held_line(agent_title(agent, pane_id),
-                                 activity_line.open_question(screen) if screen else None)
+                line = held_line(agent_title(agent, pane_id), held_question(session, pane_id))
                 if line != last_question:
                     last_question = line
                     self.send_submitted_event({"type": "CUSTOM", "name": "agent-fabric.progress",
@@ -1602,9 +1613,7 @@ class Handler(BaseHTTPRequestHandler):
                         raise RuntimeError(question_expired)
                     # After the answer the agent usually works on; wait for that turn too.
                     deadline = max(deadline, time.monotonic() + BUSY_WAIT_SECONDS)
-                    screen = pane_screen(session, pane_id)
-                    line = held_line(agent_title(current_agent, pane_id),
-                                     activity_line.open_question(screen) if screen else None)
+                    line = held_line(agent_title(current_agent, pane_id), held_question(session, pane_id))
                     if line != last_held:
                         last_held = line
                         self.send_progress_line("held", line)
