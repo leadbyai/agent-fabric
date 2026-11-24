@@ -1,0 +1,14 @@
+> Please check the release notes as well
+  ⎿  Login expired · Please run /login
+
+> /login
+  ⎿  Login successful
+
+● The release notes are fine; nothing to change.
+
+✻ Worked for 12s · done 1:20 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

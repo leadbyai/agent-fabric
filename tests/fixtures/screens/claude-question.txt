@@ -1,0 +1,18 @@
+● The comparison is done. One decision is yours before I go on.
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Rollout
+
+│ Which rollout should we use for the new reply checks? The staged one is slower but easier to undo.
+
+❯ 1. Staged rollout (Recommended)
+     Turn it on for one assistant first, then the rest a day later.
+  2. All at once
+     Every assistant gets it today.
+  3. Not yet
+     Keep today's behaviour.
+  4. Type something.
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

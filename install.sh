@@ -11,7 +11,7 @@ MODEL_SHA256="2a9d74a3f3eb96190f68157d543fab365c0c3b0eafa0d775e7b2505f7924b1c2"
 # OpenBot activity line and browser (activity_line.py, herdr_browser.py, openbot_browser_cli.py).
 EXTRA_MODULES=(activity_line.py herdr_browser.py openbot_browser_cli.py)
 declare -A EXTRA_SHA256=(
-  [activity_line.py]="f05480e88bf2b84cb90c7d974d2e74381df0e743aa066765d6e346972b701866"
+  [activity_line.py]="63bfe3b211fe42794e6bf84780b82f6760a045f0be6969fbb6a61f39b69e549f"
   [herdr_browser.py]="495258749d16f5a67d1c9aabaa885705adf9dadf5ad660b7d3b2d15679939ecb"
   [openbot_browser_cli.py]="f095971783a6f8810a1091c93d8dd5a92177a0bec4a737e67d8b4732410eddf5"
 )

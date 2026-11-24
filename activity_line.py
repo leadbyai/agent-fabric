@@ -135,3 +135,69 @@ def summary_line(screen: str) -> str | None:
     hours, minutes = divmod(minutes, 60)
     clock = (f"{hours}h" if hours else "") + (f"{minutes}m" if minutes else "") + f"{secs}s"
     return f"{text} · {clock}"
+
+
+# ------------------------------------------------------------------------------------------------
+# A pane that cannot take a message right now: a question waiting for an answer, or a signed-out CLI.
+
+MAX_QUESTION = 200
+# The highlighted first choice of a selection prompt: Claude Code "❯ 1. Yes", Codex "› 1. Yes".
+CHOICE = re.compile(r"^\s*[❯›]\s*1\.\s+\S")
+QUESTION_HEADER = re.compile(r"^\s*[☐☒✔]\s+(.+)$")
+CHROME = re.compile(r"^\s*[─━═]{8,}")
+COMPOSER = re.compile(r"^\s*[❯›]\s?(?:\S.*)?$")
+SIGNED_OUT = re.compile(
+    r"(?i)(please run /login|login expired|not logged in|oauth token (?:has )?expired|"
+    r"invalid api key|authentication_error|please sign in again)")
+
+
+def open_question(screen: str) -> str | None:
+    """The question an agent is waiting on, as one short line, or None when none can be read.
+
+    Read only to tell the person why their message is held; nothing here answers it."""
+    lines = [ANSI.sub("", line).rstrip() for line in screen.splitlines()]
+    choice = next((i for i in range(len(lines) - 1, -1, -1) if CHOICE.match(lines[i])), None)
+    if choice is None:
+        return None
+    header, prose = None, []
+    for line in reversed(lines[max(0, choice - 12):choice]):
+        stripped = line.strip().lstrip("│┃|").strip()
+        if CHROME.match(line):
+            break
+        found = QUESTION_HEADER.match(line)
+        if found:
+            header = found.group(1).strip()
+            break
+        if stripped:
+            prose.insert(0, stripped)
+        elif prose:
+            break
+    text = " ".join(prose) or header
+    if not text:
+        return None
+    text = redact(re.sub(r"\s+", " ", text).strip())
+    return text if len(text) <= MAX_QUESTION else text[: MAX_QUESTION - 1].rstrip() + "…"
+
+
+def signed_out(screen: str) -> str | None:
+    """The CLI's own sign-in error when it is the last thing the agent showed, else None.
+
+    Only the few lines just above the input box count, so an old error that a later turn has scrolled
+    past, or a reply that merely mentions logging in further up, does not."""
+    lines = [ANSI.sub("", line).rstrip() for line in screen.splitlines()]
+    composer = next((i for i in range(len(lines) - 1, -1, -1) if COMPOSER.match(lines[i])), len(lines))
+    tail: list[str] = []
+    for line in reversed(lines[:composer]):
+        if CHROME.match(line) or not line.strip():
+            continue
+        tail.append(line.strip())
+        if len(tail) == 4:
+            break
+    for line in tail:
+        if line.startswith("✻") and "done" in line:
+            # A finished turn after the error: whatever came before it was answered.
+            return None
+        found = SIGNED_OUT.search(line)
+        if found:
+            return tidy(line.lstrip("⎿●⏺ ").strip())
+    return None
