@@ -1248,13 +1248,25 @@ class TranscriptFallbackTests(BridgeTests):
         self.assertEqual(len(self.prompts), 1)
 
     def test_a_reply_with_another_requests_marker(self):
-        self.final_text = lambda m: "OPENBOT_BEGIN_FEDCBA9876543210\nCreated it.\nOPENBOT_END_FEDCBA9876543210"
+        self.final_text = lambda m: ("A note for myself.\nOPENBOT_BEGIN_FEDCBA9876543210\nCreated it.\n"
+                                     "OPENBOT_END_FEDCBA9876543210")
         self.screen_after = self.final_text
         status, body = self.request("POST", "/ag-ui", self.message("Create it"))
         events = self.events(body)
         self.assertEqual(events[-1]["type"], "RUN_FINISHED")
-        self.assertIn("Created it.", "".join(e.get("delta", "") for e in events))
+        self.assertEqual("".join(e.get("delta", "") for e in events if e["type"] == "TEXT_MESSAGE_CONTENT"),
+                         "Created it.")
         self.assertEqual(self.bridge.LEDGER.get(self.key())["reply_source"], "transcript")
+
+    def test_a_transcript_reply_is_delivered_as_written_not_unwrapped(self):
+        markdown = "Steps:\n- first step\n- second step\nThis line stays separate from the list above."
+        self.final_text = lambda m: markdown
+        self.screen_after = lambda m: "nothing readable"
+        status, body = self.request("POST", "/ag-ui", self.message("List the steps"))
+        events = self.events(body)
+        self.assertEqual(events[-1]["type"], "RUN_FINISHED")
+        self.assertEqual("".join(e.get("delta", "") for e in events if e["type"] == "TEXT_MESSAGE_CONTENT"),
+                         markdown)
 
     def test_a_question_answered_mid_turn_then_a_reply_without_markers(self):
         self.final_text = lambda m: "Recorded. It is in place now."

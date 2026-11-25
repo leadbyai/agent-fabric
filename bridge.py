@@ -1395,8 +1395,10 @@ class Handler(BaseHTTPRequestHandler):
                 fallback = self.transcript_fallback(session, pane_id, marker_id, session_id,
                                                     idle=state in ("idle", "done"))
                 if fallback:
+                    # As written: a transcript has no terminal wrapping to undo, and unwrapping could
+                    # merge Markdown lines. It is already cleaned and capped.
                     self.reply_source = "transcript"
-                    return normalize_prose_wrapping(fallback)
+                    return fallback
                 if time.monotonic() >= correlation_deadline:
                     raise RuntimeError(
                         f"{agent_title(agent, pane_id)} got your message, but its reply couldn't be "

@@ -59,6 +59,25 @@ class Replies(unittest.TestCase):
         self.write(prompt(), says(marked("Done, the profile is set up.", OTHER)), END)
         self.assertEqual(tr.reply_for(self.path, ID, pane_idle=False), "Done, the profile is set up.")
 
+    def test_a_wrong_id_pair_delivers_only_its_inside(self):
+        text = ("Internal note: checked the other host first.\n" + marked("The profile is ready.", OTHER) +
+                "\nAfterwards: remember to tidy the scratch folder.")
+        self.write(prompt(), says(text), END)
+        self.assertEqual(tr.reply_for(self.path, ID, pane_idle=False), "The profile is ready.")
+
+    def test_no_markers_at_all_delivers_the_whole_final_text(self):
+        self.write(prompt(), says("Line one.\n\n- item a\n- item b"), END)
+        self.assertEqual(tr.reply_for(self.path, ID, pane_idle=False), "Line one.\n\n- item a\n- item b")
+
+    def test_a_message_queued_mid_turn_does_not_end_the_turn(self):
+        # A message sent while the agent works is stored as a queue operation and an attachment, not a
+        # person's entry, so the turn goes on and its final text is the reply.
+        queued = [{"type": "queue-operation", "operation": "enqueue", "content": "one more thing"},
+                  {"type": "attachment", "attachment": {"type": "queued_command", "prompt": "one more thing"}}]
+        self.write(prompt(), says("Interim: starting the checks."), *queued, calls("Bash"), result(),
+                   says(marked("Final: all checks pass.")), END)
+        self.assertEqual(tr.reply_for(self.path, ID, pane_idle=False), "Final: all checks pass.")
+
     def test_a_reply_with_no_markers_after_a_question_answered_mid_turn(self):
         self.write(prompt(), calls("AskUserQuestion", "toolu_q"), result("toolu_q", "User answered: yes"),
                    says("Recorded your approval; it is in place now."), END)

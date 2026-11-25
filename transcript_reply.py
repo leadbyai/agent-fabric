@@ -143,11 +143,23 @@ def _is_person(entry: dict) -> bool:
     return True
 
 
+ANY_PAIR = re.compile(r"OPENBOT_BEGIN_([A-Za-z0-9]+)\s*(.*?)\s*OPENBOT_END_\1", flags=re.DOTALL)
+
+
 def _clean(text: str, marker_id: str) -> str:
+    """What the agent meant for the person: the inside of its marker pair when it wrote one.
+
+    This request's pair first. Failing that, the inside of a pair with another id (the agent used a
+    wrong one): text outside an agent's markers was never meant for the Bot and could be an internal
+    note. With no pair at all, the whole final text."""
     pair = re.search(rf"OPENBOT_BEGIN_{re.escape(marker_id)}\s*(.*?)\s*OPENBOT_END_{re.escape(marker_id)}",
                      text, flags=re.DOTALL)
     if pair:
         text = pair.group(1)
+    else:
+        pairs = list(ANY_PAIR.finditer(text))
+        if pairs:
+            text = pairs[-1].group(2)
     return "\n".join(line for line in text.splitlines() if not MARKER_LINE.match(line)).strip()
 
 
