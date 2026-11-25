@@ -51,6 +51,12 @@ class RequestLedger:
                   updated_at INTEGER NOT NULL
                 )
             """)
+            # Where a finished reply came from: "marker" (the marked reply read from the pane) or
+            # "transcript" (the agent's own session transcript, when the marker could not be read).
+            # Added in place; NULL on rows written before it existed.
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(requests)")}
+            if "reply_source" not in columns:
+                connection.execute("ALTER TABLE requests ADD COLUMN reply_source TEXT")
         os.chmod(self.path, 0o600)
 
     @staticmethod
@@ -86,11 +92,13 @@ class RequestLedger:
             row = connection.execute("SELECT * FROM requests WHERE key=?", (key,)).fetchone()
             return dict(row) if row else None
 
-    def finish(self, key: str, reply: str) -> None:
+    def finish(self, key: str, reply: str, source: str = "marker") -> None:
+        if source not in ("marker", "transcript"):
+            raise ValueError("Unknown reply source")
         with self._open() as connection:
             connection.execute("""
-                UPDATE requests SET state='finished', reply=?, updated_at=? WHERE key=?
-            """, (reply, int(time.time()), key))
+                UPDATE requests SET state='finished', reply=?, reply_source=?, updated_at=? WHERE key=?
+            """, (reply, source, int(time.time()), key))
 
     def uncertain(self, key: str) -> None:
         with self._open() as connection:

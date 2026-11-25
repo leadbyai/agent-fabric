@@ -32,6 +32,7 @@ from urllib.parse import unquote, urlsplit
 import activity_line
 import herdr_browser
 import model_control
+import transcript_reply
 from request_ledger import RequestLedger
 
 
@@ -86,6 +87,10 @@ QUESTION_HOLD_MAX = int(os.environ.get("OPENBOT_BRIDGE_QUESTION_HOLD_MAX", "3"))
 # The held line names the question only when this is 1. The gateway cannot tell a Bot's owner from
 # someone the Bot is shared with, and the question is the operator's, so the default is generic.
 SHOW_QUESTION_TEXT = os.environ.get("OPENBOT_BRIDGE_SHOW_QUESTION_TEXT", "0").strip() == "1"
+# When the marked reply cannot be read from the pane's screen (a resize after the reply, a wrong or
+# missing marker), read the reply from the Claude Code agent's own session transcript instead.
+# On by default; 0 restores marker-only correlation. Local panes only (not with --machine).
+TRANSCRIPT_FALLBACK = os.environ.get("OPENBOT_BRIDGE_TRANSCRIPT_FALLBACK", "1").strip() != "0"
 BROWSER_ROUTE = re.compile(r"/openbot-browser/([A-Za-z0-9_-]{40,64})")
 BROWSER_CLI = Path(__file__).resolve().parent / "openbot_browser_cli.py"
 WORKDIR = os.environ.get("OPENBOT_BRIDGE_WORKDIR", "").strip()
@@ -1258,9 +1263,30 @@ class Handler(BaseHTTPRequestHandler):
         status, result = herdr_browser.call(key, body)
         self.json_response(status, result)
 
+    def transcript_fallback(self, session: str, pane_id: str, marker_id: str,
+                            herdr_session_id: str | None, idle: bool) -> str | None:
+        """The reply from the agent's own transcript, or None (not available, not Claude, not done)."""
+        if not TRANSCRIPT_FALLBACK or MACHINE:
+            return None
+        try:
+            output = command("pane", "process-info", "--pane", pane_id, session=session)
+            info = json.loads(output).get("result", {}).get("process_info", {})
+            path = transcript_reply.transcript_path(info if isinstance(info, dict) else {}, herdr_session_id)
+            return transcript_reply.reply_for(path, marker_id, idle)
+        except (transcript_reply.Unavailable, RuntimeError, ValueError, OSError,
+                subprocess.TimeoutExpired) as exc:
+            reason = str(exc) if isinstance(exc, transcript_reply.Unavailable) else type(exc).__name__
+            if getattr(self, "_fallback_reason", None) != reason:
+                self._fallback_reason = reason
+                self.log_message("transcript fallback unavailable pilot=%s reason=%s", marker_id, reason)
+            return None
+
     def prompt_with_liveness(self, session: str, pane_id: str, prompt: str,
                              marker_id: str) -> str:
-        """Submit once. Give a working turn time to finish before timing reply correlation."""
+        """Submit once. Give a working turn time to finish before timing reply correlation.
+
+        Sets self.reply_source to "marker" or "transcript" for the reply it returns."""
+        self.reply_source = "marker"
         extend_working = RECOVERY_SECONDS > 0 and ACTIVE_WAIT_SECONDS > 0
         active_deadline = time.monotonic() + ACTIVE_WAIT_SECONDS
         initial_agent = agent_record(session, pane_id) if extend_working else {}
@@ -1364,11 +1390,18 @@ class Handler(BaseHTTPRequestHandler):
                 shown = activity_line.signed_out(screen) if screen else None
                 if shown:
                     raise RuntimeError(signed_out_error(agent_title(agent, pane_id), shown, True)) from exc
+                # The marked reply could not be read from the screen. The agent's own transcript has
+                # the turn whatever its screen shows, so take the reply from there once the turn ended.
+                fallback = self.transcript_fallback(session, pane_id, marker_id, session_id,
+                                                    idle=state in ("idle", "done"))
+                if fallback:
+                    self.reply_source = "transcript"
+                    return normalize_prose_wrapping(fallback)
                 if time.monotonic() >= correlation_deadline:
                     raise RuntimeError(
-                        "Submitted agent reply could not be correlated "
-                        "within the recovery window. Inspect Herdr before retrying; "
-                        "automatic resubmission is disabled."
+                        f"{agent_title(agent, pane_id)} got your message, but its reply couldn't be "
+                        "fetched. It is on the agent's own screen in Herdr. The message was sent once "
+                        "and will not be sent again."
                     ) from exc
             self.send_submitted_progress("recovering")
             time.sleep(min(STATE_POLL_SECONDS, max(0.0, correlation_deadline - time.monotonic())))
@@ -1751,14 +1784,22 @@ class Handler(BaseHTTPRequestHandler):
             response = self.prompt_with_liveness(session, pane_id, prompt, marker_id)
             if outbox is not None:
                 response = persist_reply_images(response, outbox)
+            source = getattr(self, "reply_source", "marker")
+            if source != "marker":
+                self.log_message("reply_source=%s request=%s pilot=%s", source, request_key[:12], marker_id)
             if LEDGER:
-                LEDGER.finish(request_key, response)
+                LEDGER.finish(request_key, response, source)
                 ledger_reserved = False
             self.send_reply(msg_id, thread_id, run_id, response)
         except (RuntimeError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
             # A protocol run failure is not proof the Herdr prompt was not sent.
             if ledger_reserved and LEDGER:
                 LEDGER.uncertain(request_key)
+            # Journal every failed run, so a monitor sees it (the stream's error reaches only OpenBot).
+            self.log_message("run failed request=%s pilot=%s submitted=%s reason=%s",
+                             request_key[:12] if request_key else "-", locals().get("marker_id", "-"),
+                             "yes" if ledger_reserved or locals().get("reserved") else "unknown",
+                             re.sub(r"\s+", " ", str(exc))[:160])
             try:
                 self.send_event({"type": "RUN_ERROR", "message": str(exc)})
             except (BrokenPipeError, ConnectionResetError):

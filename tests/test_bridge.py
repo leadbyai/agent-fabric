@@ -113,6 +113,11 @@ class BridgeTests(unittest.TestCase):
             if (session, args[2]) in self.replies:
                 return self.replies[(session, args[2])]
             return getattr(self, "screens", {}).get((session, args[2]), "")
+        if args[:2] == ("pane", "process-info"):
+            # No Claude process unless a test sets one: the transcript fallback is then unavailable.
+            self.process_info_reads = getattr(self, "process_info_reads", 0) + 1
+            return json.dumps({"result": {"process_info": getattr(self, "process_info",
+                                                                  {"foreground_processes": []})}})
         raise AssertionError(f"Unexpected Herdr command {args}")
 
     def request(self, method, path, data=None, auth=True, raw=False, token=None):
@@ -956,7 +961,8 @@ sys.exit(1)
         status, body = self.request("POST", "/ag-ui", self.message("Do not retry"))
         self.assertEqual(status, 200)
         self.assertEqual(self.events(body)[-1]["type"], "RUN_ERROR")
-        self.assertIn("could not be correlated", self.events(body)[-1]["message"])
+        self.assertIn("reply couldn't be fetched", self.events(body)[-1]["message"])
+        self.assertIn("will not be sent again", self.events(body)[-1]["message"])
         self.assertEqual(len(self.prompts), 1)
 
     def test_early_idle_status_waits_for_correlated_reply_before_next_prompt(self):
@@ -1179,6 +1185,134 @@ sys.exit(1)
         self.assertEqual(len(self.prompts), 2)
         self.assertIn("Message one", self.prompts[0][2])
         self.assertIn("Message two", self.prompts[1][2])
+
+
+
+class TranscriptFallbackTests(BridgeTests):
+    """The reply from the agent's own transcript when the marked reply can't be read from its screen."""
+
+    def setUp(self):
+        super().setUp()
+        self.bridge.RECOVERY_SECONDS = 0.3
+        self.bridge.STATE_POLL_SECONDS = 0.02
+        self.bridge.LEDGER = self.bridge.RequestLedger(str(Path(self.tmp.name) / "fallback.sqlite3"))
+        self.transcript = Path(self.tmp.name) / "session.jsonl"
+        self.transcript.write_text("")
+        self.process_info = {"foreground_processes": [{"argv": ["claude"], "pid": 1, "cwd": "/w"}]}
+        self.addCleanup(setattr, self.bridge.transcript_reply, "transcript_path",
+                        self.bridge.transcript_reply.transcript_path)
+        self.bridge.transcript_reply.transcript_path = lambda info, sid=None: self.transcript
+        self.logged = []
+        original = self.bridge.Handler.log_message
+        self.bridge.Handler.log_message = lambda handler, fmt, *a: self.logged.append(fmt % a)
+        self.addCleanup(setattr, self.bridge.Handler, "log_message", original)
+        self.screen_after = None  # what the pane's screen shows after the turn (a function of the marker)
+        self.final_text = None  # what the agent's last message in the transcript says
+        base = self.fake_command
+
+        def agent(*args, **kwargs):
+            if args[:2] == ("agent", "prompt"):
+                self.prompts.append((kwargs.get("session"), args[2], args[3]))
+                marker = re.search(r"OPENBOT_BEGIN_([A-F0-9]{16})", args[3]).group(1)
+                self.markers = getattr(self, "markers", []) + [marker]
+                entries = [
+                    {"type": "user", "message": {"content": args[3]}},
+                    {"type": "assistant", "message": {"content": [{"type": "text",
+                                                                   "text": self.final_text(marker)}]}},
+                    {"type": "system", "subtype": "turn_duration"},
+                ]
+                with self.transcript.open("a") as handle:
+                    handle.writelines(json.dumps(entry) + "\n" for entry in entries)
+                self.screens = {("Main", "wA:p1"): self.screen_after(marker)}
+                return '{"result":{"agent_status":"done"}}'
+            return base(*args, **kwargs)
+
+        self.bridge.command = agent
+
+    def key(self, run="r1"):
+        return self.bridge.LEDGER.key("Main", "wA:p1", "t1", run)
+
+    def test_a_resize_after_the_reply_still_delivers_it_from_the_transcript(self):
+        # The screen read lost the reply's last line (and its end marker) after a resize.
+        self.final_text = lambda m: f"OPENBOT_BEGIN_{m}\nThe header fix is ready.\nOPENBOT_END_{m}"
+        self.screen_after = lambda m: f"OPENBOT_BEGIN_{m}\nThe header fix is rea Jump to bottom (ctrl+End)"
+        status, body = self.request("POST", "/ag-ui", self.message("Fix the header"))
+        events = self.events(body)
+        self.assertEqual(events[-1]["type"], "RUN_FINISHED")
+        text = "".join(e.get("delta", "") for e in events if e["type"] == "TEXT_MESSAGE_CONTENT")
+        self.assertEqual(text, "The header fix is ready.")
+        row = self.bridge.LEDGER.get(self.key())
+        self.assertEqual((row["state"], row["reply_source"]), ("finished", "transcript"))
+        self.assertTrue(any(line.startswith("reply_source=transcript") and self.markers[0] in line
+                            for line in self.logged))
+        self.assertEqual(len(self.prompts), 1)
+
+    def test_a_reply_with_another_requests_marker(self):
+        self.final_text = lambda m: "OPENBOT_BEGIN_FEDCBA9876543210\nCreated it.\nOPENBOT_END_FEDCBA9876543210"
+        self.screen_after = self.final_text
+        status, body = self.request("POST", "/ag-ui", self.message("Create it"))
+        events = self.events(body)
+        self.assertEqual(events[-1]["type"], "RUN_FINISHED")
+        self.assertIn("Created it.", "".join(e.get("delta", "") for e in events))
+        self.assertEqual(self.bridge.LEDGER.get(self.key())["reply_source"], "transcript")
+
+    def test_a_question_answered_mid_turn_then_a_reply_without_markers(self):
+        self.final_text = lambda m: "Recorded. It is in place now."
+        self.screen_after = lambda m: "Recorded. It is in place now."
+        status, body = self.request("POST", "/ag-ui", self.message("Approve it"))
+        events = self.events(body)
+        self.assertEqual(events[-1]["type"], "RUN_FINISHED")
+        self.assertIn("Recorded. It is in place now.", "".join(e.get("delta", "") for e in events))
+
+    def test_the_marked_reply_stays_first_choice(self):
+        self.final_text = lambda m: f"OPENBOT_BEGIN_{m}\nFrom the transcript.\nOPENBOT_END_{m}"
+        self.screen_after = lambda m: f"OPENBOT_BEGIN_{m}\nFrom the screen.\nOPENBOT_END_{m}"
+        status, body = self.request("POST", "/ag-ui", self.message("Hello"))
+        self.assertIn("From the screen.", "".join(e.get("delta", "") for e in self.events(body)))
+        self.assertEqual(self.bridge.LEDGER.get(self.key())["reply_source"], "marker")
+        self.assertEqual(getattr(self, "process_info_reads", 0), 0)
+
+    def test_two_requests_back_to_back_each_get_their_own_reply(self):
+        self.final_text = lambda m: f"Answer for {m}"
+        self.screen_after = lambda m: "nothing readable"
+        replies = []
+        for run in ("r1", "r2"):
+            message = self.message("Next")
+            message["runId"] = run
+            status, body = self.request("POST", "/ag-ui", message)
+            replies.append("".join(e.get("delta", "") for e in self.events(body)))
+        self.assertEqual(replies, [f"Answer for {m}" for m in self.markers])
+        self.assertNotEqual(*self.markers)
+
+    def test_no_transcript_falls_back_to_todays_behaviour_and_says_so_plainly(self):
+        self.transcript.unlink()
+        self.final_text = lambda m: "unused"
+        self.screen_after = lambda m: "nothing readable"
+        self.bridge.transcript_reply.transcript_path = (
+            lambda info, sid=None: (_ for _ in ()).throw(self.bridge.transcript_reply.Unavailable("transcript missing")))
+        status, body = self.request("POST", "/ag-ui", self.message("Hello"))
+        events = self.events(body)
+        self.assertEqual(events[-1]["type"], "RUN_ERROR")
+        self.assertIn("Demo got your message, but its reply couldn't be fetched", events[-1]["message"])
+        self.assertEqual(self.bridge.LEDGER.get(self.key())["state"], "uncertain")
+        self.assertTrue(any(line.startswith("run failed request=") and "submitted=yes" in line
+                            for line in self.logged))
+        self.assertTrue(any("transcript missing" in line for line in self.logged))
+        self.assertEqual(len(self.prompts), 1)
+
+    def test_the_fallback_can_be_turned_off(self):
+        self.bridge.TRANSCRIPT_FALLBACK = False
+        self.final_text = lambda m: "Would have been found."
+        self.screen_after = lambda m: "nothing readable"
+        status, body = self.request("POST", "/ag-ui", self.message("Hello"))
+        self.assertEqual(self.events(body)[-1]["type"], "RUN_ERROR")
+        self.assertEqual(getattr(self, "process_info_reads", 0), 0)
+
+
+# Only its own tests: the inherited ones already run in BridgeTests, under the plain setup.
+for _name in [n for n in vars(BridgeTests) if n.startswith("test_")]:
+    if _name not in vars(TranscriptFallbackTests):
+        setattr(TranscriptFallbackTests, _name, None)
 
 
 if __name__ == "__main__":
