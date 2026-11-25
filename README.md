@@ -131,6 +131,17 @@ Without these options the install is exactly as above (loopback bind, one bridge
   screen) is not prompted. The run fails at once with "<agent> is signed out". If the CLI signs out
   after the message was submitted, the run fails as soon as that shows, without waiting out the
   recovery window.
+- **Reply fallback (Claude Code panes).** The gateway first reads the reply the agent marked on its screen. If
+  that can't be read (the pane was resized after the reply, which truncates the screen history; or the agent
+  used another request's marker, or none), it reads the reply from the agent's own session transcript: the file
+  named by that pane's own process (its `CLAUDE_CONFIG_DIR` and Claude Code's `sessions/<pid>.json`), never a
+  search. It takes the last assistant text of the turn that began with this request's id, only once that turn
+  has ended, capped like a marked reply. The ledger row records `reply_source` (`marker` or `transcript`), and
+  the journal logs `reply_source=transcript`. Codex panes and `--machine` gateways keep marker-only behaviour.
+  `OPENBOT_BRIDGE_TRANSCRIPT_FALLBACK=0` turns it off.
+- Every failed run is journaled (`run failed request=… pilot=… submitted=… reason=…`). When a submitted reply
+  still can't be fetched, OpenBot shows that the agent got the message, that the reply is on the agent's own
+  screen in Herdr, and that it won't be sent again.
 - Requests to unknown agent panes and stopped sessions are rejected.
 - A per-agent lock prevents two concurrent OpenBot requests targeting one pane.
 - Failed or ambiguous CLI submissions are **never retried automatically**.

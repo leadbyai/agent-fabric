@@ -12,6 +12,8 @@ import json
 import os
 import sqlite3
 import time
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 
@@ -25,10 +27,13 @@ class RequestLedger:
         self.path = str(destination)
         self._initialize()
 
-    def _open(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        return connection
+    @contextmanager
+    def _open(self) -> Iterator[sqlite3.Connection]:
+        with closing(sqlite3.connect(self.path, timeout=10)) as connection:
+            connection.row_factory = sqlite3.Row
+            # The connection context commits or rolls back before closing.
+            with connection:
+                yield connection
 
     def _initialize(self) -> None:
         with self._open() as connection:
@@ -46,6 +51,12 @@ class RequestLedger:
                   updated_at INTEGER NOT NULL
                 )
             """)
+            # Where a finished reply came from: "marker" (the marked reply read from the pane) or
+            # "transcript" (the agent's own session transcript, when the marker could not be read).
+            # Added in place; NULL on rows written before it existed.
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(requests)")}
+            if "reply_source" not in columns:
+                connection.execute("ALTER TABLE requests ADD COLUMN reply_source TEXT")
         os.chmod(self.path, 0o600)
 
     @staticmethod
@@ -81,11 +92,13 @@ class RequestLedger:
             row = connection.execute("SELECT * FROM requests WHERE key=?", (key,)).fetchone()
             return dict(row) if row else None
 
-    def finish(self, key: str, reply: str) -> None:
+    def finish(self, key: str, reply: str, source: str = "marker") -> None:
+        if source not in ("marker", "transcript"):
+            raise ValueError("Unknown reply source")
         with self._open() as connection:
             connection.execute("""
-                UPDATE requests SET state='finished', reply=?, updated_at=? WHERE key=?
-            """, (reply, int(time.time()), key))
+                UPDATE requests SET state='finished', reply=?, reply_source=?, updated_at=? WHERE key=?
+            """, (reply, source, int(time.time()), key))
 
     def uncertain(self, key: str) -> None:
         with self._open() as connection:
