@@ -15,7 +15,7 @@ declare -A EXTRA_SHA256=(
   [activity_line.py]="63bfe3b211fe42794e6bf84780b82f6760a045f0be6969fbb6a61f39b69e549f"
   [herdr_browser.py]="495258749d16f5a67d1c9aabaa885705adf9dadf5ad660b7d3b2d15679939ecb"
   [openbot_browser_cli.py]="f095971783a6f8810a1091c93d8dd5a92177a0bec4a737e67d8b4732410eddf5"
-  [transcript_reply.py]="3a1b66d3af5d7e82fc875bcc274d5fcef78a7829566c53e70f3801ab7b6ff409"
+  [transcript_reply.py]="0ce6521ec214c9de020aa746da4a86d8e6dc2893bf22fd1df9b2316975463ffe"
 )
 RUN_USER=""
 HERDR_SESSIONS=""
