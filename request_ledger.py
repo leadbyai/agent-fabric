@@ -12,6 +12,8 @@ import json
 import os
 import sqlite3
 import time
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 
@@ -25,10 +27,13 @@ class RequestLedger:
         self.path = str(destination)
         self._initialize()
 
-    def _open(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        return connection
+    @contextmanager
+    def _open(self) -> Iterator[sqlite3.Connection]:
+        with closing(sqlite3.connect(self.path, timeout=10)) as connection:
+            connection.row_factory = sqlite3.Row
+            # The connection context commits or rolls back before closing.
+            with connection:
+                yield connection
 
     def _initialize(self) -> None:
         with self._open() as connection:

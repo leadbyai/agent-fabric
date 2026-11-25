@@ -1,6 +1,7 @@
 """Offline tests. No real Herdr session or production endpoint is touched."""
 
 import base64
+import gc
 import http.client
 import importlib.util
 import json
@@ -1043,6 +1044,45 @@ sys.exit(1)
         record = self.bridge.LEDGER.get(key)
         self.assertEqual(record["state"], "finished")
         self.assertIn("Reply from Main/wA:p1", record["reply"])
+
+    @unittest.skipUnless(Path("/proc/self/fd").is_dir(), "requires Linux procfs")
+    def test_gateway_requests_close_ledger_descriptors(self):
+        ledger_path = Path(self.tmp.name) / "fd-probe.sqlite3"
+        watched = {str(ledger_path) + suffix for suffix in ("", "-wal", "-shm")}
+
+        def ledger_descriptors():
+            found = []
+            for fd in Path("/proc/self/fd").iterdir():
+                try:
+                    target = os.readlink(fd)
+                except FileNotFoundError:
+                    continue
+                if target in watched:
+                    found.append(target)
+            return found
+
+        # Verify deterministic cleanup, independent of when cyclic GC runs.
+        if gc.isenabled():
+            self.addCleanup(gc.enable)
+            gc.disable()
+        self.bridge.LEDGER = self.bridge.RequestLedger(str(ledger_path))
+        self.enable_bounded_queue()
+
+        request = self.message("Submit and record exactly once")
+        status, body = self.request("POST", "/ag-ui", request)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.events(body)[-1]["type"], "RUN_FINISHED")
+        key = self.bridge.LEDGER.key("Main", "wA:p1", "t1", "r1")
+        for _ in range(16):
+            self.assertEqual(self.request("GET", "/attention")[0], 200)
+            status, record = self.request("GET", "/requests/" + key)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(record)["state"], "finished")
+
+        self.assertEqual(self.request("POST", "/ag-ui", request)[0], 200)
+        self.assertEqual(self.request("POST", "/ag-ui", self.message("Changed"))[0], 409)
+        self.assertEqual(len(self.prompts), 1)
+        self.assertEqual(ledger_descriptors(), [])
 
     def test_completed_request_is_replayed_without_resubmitting(self):
         ledger_file = str(Path(self.tmp.name) / "requests.sqlite3")
