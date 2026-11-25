@@ -14,7 +14,12 @@
 // SDK_BRIDGE_DENY_SESSIONS (comma list of
 // session ids that must never be resumed or adopted, e.g. the agent's live interactive session).
 // SDK_BRIDGE_PROFILE=pilot (default): isolated, no settings, workspace-only tools; SDK_BRIDGE_WORKSPACE.
-// SDK_BRIDGE_PROFILE=agent: an existing agent's own setup, one workspace per conversation:
+// SDK_BRIDGE_PROFILE=agent: an existing agent's own setup. SDK_BRIDGE_WORKSPACE_MODE picks the folder:
+//   shared: every conversation runs in the agent's own folder, SDK_BRIDGE_AGENT_DIR (required, absolute, the exact
+//   path the agent itself runs in, not a symlink), so it has the same CLAUDE.md, files and Claude Code memory
+//   (memory is keyed by that path). Each conversation is still its own session. No template or pins: the files are
+//   the agent's own and it edits them. Setting sources default to user,project,local, like an interactive session.
+//   conversation (default): one workspace per conversation:
 //   SDK_BRIDGE_WORKSPACE_ROOT (required; <root>/_template/ is copied to <root>/<conversation>/ on first run),
 //   SDK_BRIDGE_TEMPLATE_SHA256 (required: "<relative path>=<sha256>,..." naming EXACTLY the template's files;
 //   checked before every seed and, inside the conversation folder, before every turn), SDK_BRIDGE_CLAUDE_PATH (optional absolute CLI path; default: the SDK's bundled CLI),
@@ -30,7 +35,7 @@ import { createServer } from "node:http";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-export const VERSION = "0.2.0-sdk-agent";
+export const VERSION = "0.3.0-sdk-agent";
 export const ALLOWED_HOSTS = ["127.0.0.1", "172.17.0.1"];
 export const PERMISSION_MODES = ["default", "acceptEdits", "dontAsk", "plan", "bypassPermissions"];
 const SETTING_SOURCES = ["user", "project", "local"];
@@ -159,6 +164,14 @@ export function conversationWorkspace(root, thread, pins) {
   return dir;
 }
 
+/** The agent's own folder (shared mode), checked before every turn: still a real folder, never a symlink. */
+export function sharedWorkspace(dir) {
+  let st;
+  try { st = lstatSync(dir); } catch { throw new BridgeError("agent_dir_missing", "The agent folder is missing"); }
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new BridgeError("agent_dir_not_folder", "The agent folder is not a plain folder");
+  return dir;
+}
+
 /** Session title for a new conversation. Agent titles always carry the id, so never equal the bare agent name. */
 export function sessionTitle(config, thread) {
   if ((config.profile ?? "pilot") === "pilot") return `OpenBot ${thread.slice(0, 12)} ${stableId("title", thread).slice(0, 10)}`;
@@ -198,6 +211,7 @@ export function createBridge({ query, config, ledger }) {
   const active = new Set();                      // threads with a run in flight (single flight per conversation)
   const maxConcurrent = config.maxConcurrent ?? 1;
   const workspaceFor = (thread) => (config.profile ?? "pilot") === "pilot" ? config.workspace
+    : config.agent.workspaceMode === "shared" ? sharedWorkspace(config.agent.agentDir)
     : conversationWorkspace(config.agent.workspaceRoot, thread, config.agent.templatePins);
   let reportedVersion = null;
 
@@ -314,7 +328,7 @@ export function createBridge({ query, config, ledger }) {
 
 const list = (v) => String(v ?? "").split(",").map((x) => x.trim()).filter(Boolean);
 const envName = (k) => "SDK_BRIDGE_" + k.replace(/[A-Z]/g, (c) => "_" + c).toUpperCase();
-const AGENT_KEYS = ["SDK_BRIDGE_WORKSPACE_ROOT", "SDK_BRIDGE_TEMPLATE_SHA256", "SDK_BRIDGE_CLAUDE_PATH", "SDK_BRIDGE_TITLE", "SDK_BRIDGE_SETTINGS", "SDK_BRIDGE_SETTING_SOURCES",
+const AGENT_KEYS = ["SDK_BRIDGE_WORKSPACE_MODE", "SDK_BRIDGE_AGENT_DIR", "SDK_BRIDGE_WORKSPACE_ROOT", "SDK_BRIDGE_TEMPLATE_SHA256", "SDK_BRIDGE_CLAUDE_PATH", "SDK_BRIDGE_TITLE", "SDK_BRIDGE_SETTINGS", "SDK_BRIDGE_SETTING_SOURCES",
   "SDK_BRIDGE_TOOLS", "SDK_BRIDGE_PERMISSION_MODE", "SDK_BRIDGE_STRICT_MCP", "SDK_BRIDGE_CLAUDEAI_MCP"];
 
 export function configFromEnv(env = process.env) {
@@ -349,31 +363,45 @@ export function configFromEnv(env = process.env) {
     if (!path.isAbsolute(config.workspace)) throw new Error("SDK_BRIDGE_WORKSPACE must be an absolute path");
     return config;
   }
-  if (env.SDK_BRIDGE_WORKSPACE) throw new Error("The agent profile uses SDK_BRIDGE_WORKSPACE_ROOT, not SDK_BRIDGE_WORKSPACE");
-  const workspaceRoot = env.SDK_BRIDGE_WORKSPACE_ROOT || "";
-  if (!path.isAbsolute(workspaceRoot)) throw new Error("SDK_BRIDGE_WORKSPACE_ROOT must be an absolute path");
+  if (env.SDK_BRIDGE_WORKSPACE) throw new Error("The agent profile uses SDK_BRIDGE_WORKSPACE_ROOT or SDK_BRIDGE_AGENT_DIR, not SDK_BRIDGE_WORKSPACE");
+  const workspaceMode = (env.SDK_BRIDGE_WORKSPACE_MODE || "conversation").trim();
+  if (!["conversation", "shared"].includes(workspaceMode)) throw new Error("SDK_BRIDGE_WORKSPACE_MODE must be conversation or shared");
+  let workspaceRoot, agentDir;
   const templatePins = {};
-  for (const item of list(env.SDK_BRIDGE_TEMPLATE_SHA256)) {
-    const at = item.lastIndexOf("="), file = item.slice(0, at).trim(), hash = item.slice(at + 1).trim().toLowerCase();
-    if (at < 1 || !/^[0-9a-f]{64}$/.test(hash) || path.isAbsolute(file) || file.split("/").includes("..") || file in templatePins)
-      throw new Error("SDK_BRIDGE_TEMPLATE_SHA256 entries must be <relative path>=<64-hex sha256>, each path once");
-    templatePins[file] = hash;
+  if (workspaceMode === "shared") {
+    if (env.SDK_BRIDGE_WORKSPACE_ROOT || env.SDK_BRIDGE_TEMPLATE_SHA256)
+      throw new Error("Shared mode uses SDK_BRIDGE_AGENT_DIR; SDK_BRIDGE_WORKSPACE_ROOT and SDK_BRIDGE_TEMPLATE_SHA256 are for conversation mode");
+    agentDir = env.SDK_BRIDGE_AGENT_DIR || "";
+    // Exact form: Claude Code keys memory by the path string, so "/a/b/" or "/a/./b" would be a different memory.
+    if (!path.isAbsolute(agentDir) || path.resolve(agentDir) !== agentDir || agentDir === "/")
+      throw new Error("SDK_BRIDGE_AGENT_DIR must be an absolute, normalized folder path (no trailing slash), as the agent itself runs in");
+  } else {
+    if (env.SDK_BRIDGE_AGENT_DIR) throw new Error("SDK_BRIDGE_AGENT_DIR needs SDK_BRIDGE_WORKSPACE_MODE=shared");
+    workspaceRoot = env.SDK_BRIDGE_WORKSPACE_ROOT || "";
+    if (!path.isAbsolute(workspaceRoot)) throw new Error("SDK_BRIDGE_WORKSPACE_ROOT must be an absolute path");
+    for (const item of list(env.SDK_BRIDGE_TEMPLATE_SHA256)) {
+      const at = item.lastIndexOf("="), file = item.slice(0, at).trim(), hash = item.slice(at + 1).trim().toLowerCase();
+      if (at < 1 || !/^[0-9a-f]{64}$/.test(hash) || path.isAbsolute(file) || file.split("/").includes("..") || file in templatePins)
+        throw new Error("SDK_BRIDGE_TEMPLATE_SHA256 entries must be <relative path>=<64-hex sha256>, each path once");
+      templatePins[file] = hash;
+    }
+    if (!Object.keys(templatePins).length) throw new Error("SDK_BRIDGE_TEMPLATE_SHA256 is required for the agent profile");
   }
-  if (!Object.keys(templatePins).length) throw new Error("SDK_BRIDGE_TEMPLATE_SHA256 is required for the agent profile");
   const claudePath = env.SDK_BRIDGE_CLAUDE_PATH || undefined;
   if (claudePath !== undefined && !path.isAbsolute(claudePath)) throw new Error("SDK_BRIDGE_CLAUDE_PATH must be an absolute path");
   const title = (env.SDK_BRIDGE_TITLE || "").trim();
   if (!title.includes("{id}")) throw new Error("SDK_BRIDGE_TITLE must contain {id}, so a bridge session never takes the agent's own title");
   const settings = env.SDK_BRIDGE_SETTINGS || undefined;
   if (settings !== undefined && !path.isAbsolute(settings)) throw new Error("SDK_BRIDGE_SETTINGS must be an absolute path");
-  const settingSources = env.SDK_BRIDGE_SETTING_SOURCES === undefined ? ["user", "project"] : list(env.SDK_BRIDGE_SETTING_SOURCES);
+  const settingSources = env.SDK_BRIDGE_SETTING_SOURCES !== undefined ? list(env.SDK_BRIDGE_SETTING_SOURCES)
+    : workspaceMode === "shared" ? ["user", "project", "local"] : ["user", "project"];
   if (settingSources.some((s) => !SETTING_SOURCES.includes(s))) throw new Error("SDK_BRIDGE_SETTING_SOURCES: user, project, local only");
   if (!settingSources.includes("project")) throw new Error("SDK_BRIDGE_SETTING_SOURCES must include project (workspace CLAUDE.md and deny list)");
   const rawTools = (env.SDK_BRIDGE_TOOLS || "preset").trim();
   const permissionMode = (env.SDK_BRIDGE_PERMISSION_MODE || "default").trim();
   if (!PERMISSION_MODES.includes(permissionMode)) throw new Error(`SDK_BRIDGE_PERMISSION_MODE must be one of ${PERMISSION_MODES.join(", ")}`);
   const flag = (k) => { const v = (env[k] || "0").trim(); if (!["0", "1"].includes(v)) throw new Error(`${k} must be 0 or 1`); return v === "1"; };
-  config.agent = { workspaceRoot, templatePins, claudePath, title, settings, settingSources, tools: rawTools === "preset" ? "preset" : list(rawTools),
+  config.agent = { workspaceMode, agentDir, workspaceRoot, templatePins, claudePath, title, settings, settingSources, tools: rawTools === "preset" ? "preset" : list(rawTools),
     permissionMode, strictMcp: flag("SDK_BRIDGE_STRICT_MCP"), claudeAiMcp: flag("SDK_BRIDGE_CLAUDEAI_MCP") };
   return config;
 }
@@ -385,6 +413,6 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   createServer((req, res) => handle(req, res).catch(() => { try { res.end(); } catch {} }))
     .listen(config.port, config.host, () => console.log(`Agent Fabric Claude SDK bridge ${VERSION} on ${config.host}:${config.port}`
       + ` profile=${config.profile}`
-      + (config.agent ? ` mode=${config.agent.permissionMode} sources=${config.agent.settingSources.join("+")}` : "")
+      + (config.agent ? ` workspace=${config.agent.workspaceMode} mode=${config.agent.permissionMode} sources=${config.agent.settingSources.join("+")}` : "")
       + ` caps=${config.maxTurns} turns/$${config.maxBudgetUsd}/${config.timeoutSeconds}s concurrent=${config.maxConcurrent} denied=${config.denySessions.length}`));
 }

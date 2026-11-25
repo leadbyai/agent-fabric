@@ -74,7 +74,7 @@ Both profiles:
 - `SDK_BRIDGE_PORT` (8768; 1024-65535) and `SDK_BRIDGE_MODEL`.
 - Caps: `SDK_BRIDGE_MAX_TURNS` (8; 1-500), `SDK_BRIDGE_MAX_BUDGET_USD` (2; 0.01-100), `SDK_BRIDGE_TIMEOUT_SECONDS` (600; 10-7200).
 - **Concurrency.** `SDK_BRIDGE_MAX_CONCURRENT` (1; 1-4) sets how many live conversations run at once. Each conversation runs one run at a time, so an OpenBot Retry or a second tab gets 409 `conversation_busy`; over the cap gets 429 `bridge_busy`. In both cases no prompt is sent and no ledger row is written.
-- **Failure codes.** `RUN_ERROR` carries a `code` naming what stopped the run: the SDK result subtype (`error_max_turns`, `error_max_budget_usd`, ...), `timeout`, `denied_session` or `workspace_pinned_file_changed`/`_missing`.
+- **Failure codes.** `RUN_ERROR` carries a `code` naming what stopped the run: the SDK result subtype (`error_max_turns`, `error_max_budget_usd`, ...), `timeout`, `denied_session`, `workspace_pinned_file_changed`/`_missing` or, in shared mode, `agent_dir_missing`/`agent_dir_not_folder`.
 - `SDK_BRIDGE_DENY_SESSIONS`: session ids that are never resumed or adopted, such as the agent's live interactive session.
 - `CLAUDE_CONFIG_DIR` is passed through, so the SDK uses that account's own sign-in where it already is.
 - The bridge never passes `continue`, and it resumes only sessions it created and recorded in its ledger.
@@ -83,7 +83,15 @@ Both profiles:
 Isolated: no settings, strict empty MCP, Read/Write/Glob/Agent limited to `SDK_BRIDGE_WORKSPACE`, plus the `word-counter` subagent. Agent-profile variables are refused.
 
 ### `SDK_BRIDGE_PROFILE=agent` (an existing agent's own setup)
-- **Workspace.** `SDK_BRIDGE_WORKSPACE_ROOT` (required). Each conversation gets `<root>/<conversation-id>/`, a 16-hex id derived from the thread, so raw thread ids never reach paths. It is seeded once from `<root>/_template/`.
+- **Workspace mode.** `SDK_BRIDGE_WORKSPACE_MODE`: `conversation` (default, below) or `shared`.
+- **Shared mode (same agent everywhere).** `SDK_BRIDGE_AGENT_DIR` (required): the exact folder the agent itself runs in, for example the folder Discord Vex's session starts in. Every OpenBot conversation runs there, so it loads the same CLAUDE.md, CLAUDE.local.md, project settings and files. It also gets the same Claude Code memory, because memory is stored per folder path.
+  - The path must be absolute and normalized, with no trailing slash, `.` or `..`. A different spelling of the same folder would be a different memory.
+  - The folder is checked before every turn. If it is missing, a file or a symlink, the run is refused with `agent_dir_missing` or `agent_dir_not_folder`, and no prompt is sent.
+  - Nothing is seeded or copied, and there are no template pins. The files are the agent's own, and it edits them from Discord and OpenBot alike. `SDK_BRIDGE_WORKSPACE_ROOT` and `SDK_BRIDGE_TEMPLATE_SHA256` are refused in this mode.
+  - Setting sources default to `user,project,local`, the same as an interactive session.
+  - Each OpenBot conversation is still its own session, titled with `{id}`, created on its first run and resumed after that. It is never the live interactive session: `continue` is never passed, and `SDK_BRIDGE_DENY_SESSIONS` still applies. Sessions share the folder's session list, so anything that picks "the latest session in this folder" (`claude --continue`, a watchdog without a title or id guard) could pick an OpenBot one. Keep the agent's own restarts pinned to its session id or title.
+  - An OpenBot session has the same authority as the agent's own session in that folder. Two sessions may edit the same files at once, just like two terminals in one folder.
+- **Conversation mode.** `SDK_BRIDGE_WORKSPACE_ROOT` (required). Each conversation gets `<root>/<conversation-id>/`, a 16-hex id derived from the thread, so raw thread ids never reach paths. It is seeded once from `<root>/_template/`.
 - **Template pins.** `SDK_BRIDGE_TEMPLATE_SHA256` (required): `<relative path>=<sha256>,...`.
   - The template must hold exactly those files, with no symlinks and no extras.
   - Hashes are checked before and after every seed.

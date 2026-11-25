@@ -1,6 +1,6 @@
 {
   "name": "agent-fabric-claude-sdk-bridge",
-  "version": "0.2.0-sdk-agent",
+  "version": "0.3.0-sdk-agent",
   "private": true,
   "type": "module",
   "description": "Pilot: private AG-UI bridge to Claude Agent SDK sessions (loopback, hash-only bearer).",

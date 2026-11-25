@@ -398,3 +398,82 @@ test("a repeated init in one run (background task re-entry) is accepted; a diffe
   const bad = await post("bg", "r3");
   assert.deepEqual([bad.at(-1).type, bad.at(-1).code], ["RUN_ERROR", "session_changed"]);
 });
+
+// ------------------------------------------------------------------ shared folder (0.3.0): same Vex everywhere
+import { sharedWorkspace } from "./claude_sdk_bridge.mjs";
+
+const SHARED = { ...BASE, SDK_BRIDGE_PROFILE: "agent", SDK_BRIDGE_WORKSPACE_MODE: "shared", SDK_BRIDGE_AGENT_DIR: "/home/vex/vex",
+  SDK_BRIDGE_TITLE: "Vex (OpenBot {id})", SDK_BRIDGE_PERMISSION_MODE: "bypassPermissions" };
+
+test("shared mode: the agent's own folder, exact path, no template; local settings load like an interactive session", () => {
+  const c = configFromEnv(SHARED);
+  assert.equal(c.agent.workspaceMode, "shared");
+  assert.equal(c.agent.agentDir, "/home/vex/vex");
+  assert.deepEqual(c.agent.templatePins, {});
+  assert.deepEqual(c.agent.settingSources, ["user", "project", "local"]);
+  assert.deepEqual(configFromEnv({ ...SHARED, SDK_BRIDGE_SETTING_SOURCES: "user,project" }).agent.settingSources, ["user", "project"]);
+  for (const bad of ["", "rel/vex", "/home/vex/vex/", "/home/vex/./vex", "/home/x/../vex/vex", "/"])
+    assert.throws(() => configFromEnv({ ...SHARED, SDK_BRIDGE_AGENT_DIR: bad }), /AGENT_DIR/);
+  assert.throws(() => configFromEnv({ ...SHARED, SDK_BRIDGE_WORKSPACE_ROOT: "/srv/ws" }), /Shared mode/);
+  assert.throws(() => configFromEnv({ ...SHARED, SDK_BRIDGE_TEMPLATE_SHA256: PIN_ENV }), /Shared mode/);
+  assert.throws(() => configFromEnv({ ...SHARED, SDK_BRIDGE_WORKSPACE_MODE: "both" }), /WORKSPACE_MODE/);
+  assert.throws(() => configFromEnv({ ...AGENT, SDK_BRIDGE_AGENT_DIR: "/home/vex/vex" }), /WORKSPACE_MODE=shared/);
+  assert.throws(() => configFromEnv({ ...BASE, SDK_BRIDGE_WORKSPACE: "/w", SDK_BRIDGE_WORKSPACE_MODE: "shared" }), /PROFILE=agent/);
+  assert.equal(configFromEnv(AGENT).agent.workspaceMode, "conversation");              // existing installs unchanged
+  assert.deepEqual(configFromEnv(AGENT).agent.settingSources, ["user", "project"]);
+  const o = sdkOptions(c, c.agent.agentDir, {});
+  assert.deepEqual([o.cwd, o.continue, o.settingSources], ["/home/vex/vex", false, ["user", "project", "local"]]);
+});
+
+test("shared folder must stay a plain folder", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "vexhome-"));
+  assert.equal(sharedWorkspace(dir), dir);
+  assert.throws(() => sharedWorkspace(path.join(dir, "nope")), (e) => e.reason === "agent_dir_missing");
+  const link = path.join(os.tmpdir(), `vexlink-${process.pid}-${Date.now()}`);
+  symlinkSync(dir, link);
+  assert.throws(() => sharedWorkspace(link), (e) => e.reason === "agent_dir_not_folder");
+  writeFileSync(path.join(dir, "f"), "x");
+  assert.throws(() => sharedWorkspace(path.join(dir, "f")), (e) => e.reason === "agent_dir_not_folder");
+});
+
+test("shared runs: every conversation in the agent's folder, nothing seeded, own session each; live session still refused", async (t) => {
+  const home = mkdtempSync(path.join(os.tmpdir(), "vexhome-"));
+  writeFileSync(path.join(home, "CLAUDE.md"), "I am Vex.");
+  const dir = mkdtempSync(path.join(os.tmpdir(), "sdkb-"));
+  const seen = [];
+  let force = null, n = 0;
+  const query = ({ options }) => (async function* () {
+    seen.push(options);
+    const sid = options.resume ?? force ?? `V${++n}`;
+    yield { type: "system", subtype: "init", session_id: sid };
+    yield { type: "result", subtype: "success", session_id: sid };
+  })();
+  const config = configFromEnv({ ...SHARED, SDK_BRIDGE_AGENT_DIR: home, SDK_BRIDGE_DENY_SESSIONS: "LIVE", SDK_BRIDGE_MAX_CONCURRENT: "2" });
+  const ledger = new Ledger(path.join(dir, "ledger.sqlite3"));
+  const handle = createBridge({ query, config, ledger });
+  const server = createServer((req, res) => handle(req, res));
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => server.close());
+  const post = async (thread, run) => (await (await fetch(`http://127.0.0.1:${server.address().port}/ag-ui`, { method: "POST",
+    headers: { authorization: `Bearer ${TOKEN}` }, body: JSON.stringify({ threadId: thread, runId: run,
+      messages: [{ role: "user", content: "hi" }] }) })).text()).split("\n").filter((l) => l.startsWith("data:")).map((l) => JSON.parse(l.slice(5)));
+  assert.equal((await post("t1", "r1")).at(-1).type, "RUN_FINISHED");
+  assert.equal((await post("t2", "r1")).at(-1).type, "RUN_FINISHED");
+  assert.deepEqual(seen.map((o) => o.cwd), [home, home]);
+  assert.deepEqual(seen.map((o) => o.continue), [false, false]);
+  assert.match(seen[0].title, /^Vex \(OpenBot [0-9a-f]{8}\)$/);
+  assert.notEqual(seen[0].title, seen[1].title);
+  assert.deepEqual([ledger.session("t1"), ledger.session("t2")], ["V1", "V2"]);
+  await post("t1", "r2");
+  assert.equal(seen[2].resume, "V1");
+  assert.equal(seen[2].cwd, home);
+  const { readdirSync } = await import("node:fs");
+  assert.deepEqual(readdirSync(home), ["CLAUDE.md"]);                                 // nothing seeded or copied
+  force = "LIVE";
+  assert.equal((await post("t3", "r1")).at(-1).type, "RUN_ERROR");
+  assert.equal(ledger.session("t3"), null);
+  rmSync(home, { recursive: true });
+  const before = seen.length, ev = await post("t4", "r1");
+  assert.equal(ev.at(-1).code, "agent_dir_missing");
+  assert.equal(seen.length, before);                                                  // no SDK call without the folder
+});
