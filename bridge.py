@@ -1283,15 +1283,15 @@ class Handler(BaseHTTPRequestHandler):
         self.json_response(status, result)
 
     def transcript_fallback(self, session: str, pane_id: str, marker_id: str,
-                            herdr_session_id: str | None, idle: bool) -> str | None:
-        """The reply from the agent's own transcript, or None (not available, not Claude, not done)."""
+                            herdr_session_id: str | None, idle: bool) -> tuple[str, str] | None:
+        """(reply, source) from the agent's own transcript, or None (not available, not Claude, not done)."""
         if not TRANSCRIPT_FALLBACK or MACHINE:
             return None
         try:
             output = command("pane", "process-info", "--pane", pane_id, session=session)
             info = json.loads(output).get("result", {}).get("process_info", {})
             path = transcript_reply.transcript_path(info if isinstance(info, dict) else {}, herdr_session_id)
-            return transcript_reply.reply_for(path, marker_id, idle)
+            return transcript_reply.reply_and_source(path, marker_id, idle)
         except (transcript_reply.Unavailable, RuntimeError, ValueError, OSError,
                 subprocess.TimeoutExpired) as exc:
             reason = str(exc) if isinstance(exc, transcript_reply.Unavailable) else type(exc).__name__
@@ -1304,7 +1304,7 @@ class Handler(BaseHTTPRequestHandler):
                              marker_id: str) -> str:
         """Submit once. Give a working turn time to finish before timing reply correlation.
 
-        Sets self.reply_source to "marker" or "transcript" for the reply it returns."""
+        Sets self.reply_source to "marker", "transcript" or "transcript_unmarked" for the reply it returns."""
         self.reply_source = "marker"
         extend_working = RECOVERY_SECONDS > 0 and ACTIVE_WAIT_SECONDS > 0
         active_deadline = time.monotonic() + ACTIVE_WAIT_SECONDS
@@ -1416,8 +1416,8 @@ class Handler(BaseHTTPRequestHandler):
                 if fallback:
                     # As written: a transcript has no terminal wrapping to undo, and unwrapping could
                     # merge Markdown lines. It is already cleaned and capped.
-                    self.reply_source = "transcript"
-                    return fallback
+                    reply, self.reply_source = fallback
+                    return reply
                 if time.monotonic() >= correlation_deadline:
                     raise RuntimeError(
                         f"{agent_title(agent, pane_id)} got your message, but its reply couldn't be "

@@ -93,7 +93,7 @@ class RequestLedger:
             return dict(row) if row else None
 
     def finish(self, key: str, reply: str, source: str = "marker") -> None:
-        if source not in ("marker", "transcript"):
+        if source not in ("marker", "transcript", "transcript_unmarked"):
             raise ValueError("Unknown reply source")
         with self._open() as connection:
             connection.execute("""

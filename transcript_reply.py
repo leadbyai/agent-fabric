@@ -10,8 +10,8 @@ Claude Code writes every turn to `<config dir>/projects/<cwd as a name>/<session
 module finds exactly that file for the pane's own process, never by searching: the config dir comes
 from the process's environment, and the session id from Claude Code's own `sessions/<pid>.json`
 record (or the id Herdr reports for the pane). In that file it finds the person's entry carrying this
-request's id (`[OpenBot pilot request <id>]`) and returns the last assistant text of that turn, but
-only once the turn has ended (a turn-end record follows it, or the caller saw the pane idle).
+request's id (`[OpenBot pilot request <id>]`) and returns this request's marked reply from that turn, or,
+with no marker pair, the turn's final text once the turn has ended (recorded as `transcript_unmarked`).
 
 Codex panes use another format and are not read here; the caller keeps its current behaviour.
 """
@@ -163,9 +163,15 @@ def _clean(text: str, marker_id: str) -> str:
     return "\n".join(line for line in text.splitlines() if not MARKER_LINE.match(line)).strip()
 
 
-def reply_for(path: Path, marker_id: str, pane_idle: bool) -> str | None:
-    """The agent's reply to request `marker_id`, or None while there is none yet.
+def reply_and_source(path: Path, marker_id: str, pane_idle: bool) -> tuple[str, str] | None:
+    """The agent's reply to request `marker_id` and where it came from, or None while there is none yet.
 
+    The source is "transcript" when the reply is the inside of a marker pair and "transcript_unmarked"
+    when the agent wrote no pair, so the turn's final text is taken as it stands.
+    - This request's pair wins wherever it is in the turn (an agent may write it and then keep working).
+    - Unmarked text is taken only when it is the final text of a turn that has ended (a turn-end record
+      or the next person's entry follows it). An idle pane alone is not enough for it: an unmarked text
+      in a turn that may still be running could be about anything.
     None also when the turn has not ended: no turn-end record follows the request and the pane was not
     seen idle. Raises Unavailable when the file cannot be read."""
     tag = f"[OpenBot pilot request {marker_id}]"
@@ -182,7 +188,7 @@ def reply_for(path: Path, marker_id: str, pane_idle: bool) -> str | None:
         return None
     # Only the turn this request began: it ends at the first turn-end record or the next person's
     # entry. A later turn (a background task finishing, say) is never taken for the reply.
-    last_text, ended = None, False
+    texts, ended = [], False
     for entry in entries[start + 1:]:
         if _is_person(entry) or (entry.get("type") == "system" and entry.get("subtype") == "turn_duration"):
             ended = True
@@ -190,13 +196,29 @@ def reply_for(path: Path, marker_id: str, pane_idle: bool) -> str | None:
         if entry.get("type") == "assistant" and not entry.get("isSidechain"):
             said = _text((entry.get("message") or {}).get("content")).strip()
             if said:
-                last_text = said
-    if not (ended or pane_idle) or last_text is None:
+                texts.append(said)
+    if not (ended or pane_idle) or not texts:
         return None
-    reply = _clean(last_text, marker_id)
+    own = re.compile(rf"OPENBOT_BEGIN_{re.escape(marker_id)}\s*(.*?)\s*OPENBOT_END_{re.escape(marker_id)}",
+                     flags=re.DOTALL)
+    own_text = next((text for text in reversed(texts) if own.search(text)), None)
+    if own_text is not None:
+        reply, source = _clean(own_text, marker_id), "transcript"
+    elif ANY_PAIR.search(texts[-1]):
+        reply, source = _clean(texts[-1], marker_id), "transcript"
+    elif ended:
+        reply, source = _clean(texts[-1], marker_id), "transcript_unmarked"
+    else:
+        return None
     if not reply:
         return None
     lines = reply.splitlines()
     if len(lines) > MAX_REPLY_LINES or len(reply) > MAX_REPLY_CHARS:
         reply = "\n".join(lines[:MAX_REPLY_LINES])[:MAX_REPLY_CHARS].rstrip() + CUT_NOTE
-    return reply
+    return reply, source
+
+
+def reply_for(path: Path, marker_id: str, pane_idle: bool) -> str | None:
+    """The reply text alone (see reply_and_source)."""
+    found = reply_and_source(path, marker_id, pane_idle)
+    return found[0] if found else None
