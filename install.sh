@@ -12,7 +12,7 @@ MODEL_SHA256="3a97e9ff84c9662091851e481fc79da00e6c805fc20bb3465928b1f0a686ed52"
 EXTRA_MODULES=(activity_line.py herdr_browser.py openbot_browser_cli.py)
 declare -A EXTRA_SHA256=(
   [activity_line.py]="f05480e88bf2b84cb90c7d974d2e74381df0e743aa066765d6e346972b701866"
-  [herdr_browser.py]="495258749d16f5a67d1c9aabaa885705adf9dadf5ad660b7d3b2d15679939ecb"
+  [herdr_browser.py]="c2fd95f826bbfc608d7e270a7f60e1244a3bf6c9f05aab09984b5743f5367573"
   [openbot_browser_cli.py]="f095971783a6f8810a1091c93d8dd5a92177a0bec4a737e67d8b4732410eddf5"
 )
 RUN_USER=""
