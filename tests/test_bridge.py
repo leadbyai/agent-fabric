@@ -1340,6 +1340,8 @@ class TranscriptFallbackTests(BridgeTests):
         events = self.events(body)
         self.assertEqual(events[-1]["type"], "RUN_FINISHED")
         self.assertIn("Recorded. It is in place now.", "".join(e.get("delta", "") for e in events))
+        self.assertEqual(self.bridge.LEDGER.get(self.key())["reply_source"], "transcript_unmarked")
+        self.assertTrue(any(line.startswith("reply_source=transcript_unmarked") for line in self.logged))
 
     def test_the_marked_reply_stays_first_choice(self):
         self.final_text = lambda m: f"OPENBOT_BEGIN_{m}\nFrom the transcript.\nOPENBOT_END_{m}"

@@ -102,8 +102,33 @@ class Replies(unittest.TestCase):
     def test_never_mid_turn(self):
         self.write(prompt(), says("Still working on it."))
         self.assertIsNone(tr.reply_for(self.path, ID, pane_idle=False))
-        # Idle with no end record (the turn was interrupted): the last thing it said is the reply.
-        self.assertEqual(tr.reply_for(self.path, ID, pane_idle=True), "Still working on it.")
+        # Idle with no end record: unmarked text is never taken from a turn that may still be running.
+        self.assertIsNone(tr.reply_for(self.path, ID, pane_idle=True))
+        # A marked reply is, once the pane is idle (the turn was interrupted after the reply).
+        self.write(prompt(), says(marked("The answer.")), says("Tidying up."))
+        self.assertEqual(tr.reply_and_source(self.path, ID, pane_idle=True), ("The answer.", "transcript"))
+
+    def test_sources(self):
+        # Marked present: the marked reply wins and is recorded as "transcript".
+        self.write(prompt(), says(marked("Marked answer.")), END)
+        self.assertEqual(tr.reply_and_source(self.path, ID, pane_idle=False), ("Marked answer.", "transcript"))
+        # No pair, finished turn: the final text, recorded as "transcript_unmarked".
+        self.write(prompt(), says("Working."), calls("Bash"), result(), says("Final summary."), END)
+        self.assertEqual(tr.reply_and_source(self.path, ID, pane_idle=False),
+                         ("Final summary.", "transcript_unmarked"))
+        # The next person's entry also ends the turn.
+        self.write(prompt(), says("Final summary."), {"type": "user", "message": {"content": "next"}})
+        self.assertEqual(tr.reply_and_source(self.path, ID, pane_idle=False),
+                         ("Final summary.", "transcript_unmarked"))
+        # Still running: stays waiting, idle or not.
+        self.write(prompt(), says("Working."), calls("Bash"), result())
+        self.assertIsNone(tr.reply_and_source(self.path, ID, pane_idle=False))
+        self.assertIsNone(tr.reply_and_source(self.path, ID, pane_idle=True))
+
+    def test_a_marked_reply_mid_turn_wins_over_a_later_unmarked_summary(self):
+        self.write(prompt(), says(marked("The real answer.")), calls("Bash"), result(),
+                   says("Summary of other work."), END)
+        self.assertEqual(tr.reply_and_source(self.path, ID, pane_idle=False), ("The real answer.", "transcript"))
 
     def test_a_later_turn_is_never_taken_for_the_reply(self):
         notification = {"type": "user", "isMeta": True, "message": {"content": "background task finished"}}
