@@ -184,6 +184,22 @@ ROUTE_HASHES: dict[tuple[str, str], str] = (
     parse_route_hashes(Path(ROUTE_TOKENS_FILE).read_text(encoding="utf-8")) if ROUTE_TOKENS_FILE else {})
 
 
+def credential_config_error(token: str, token_sha256: str, route_hashes: dict) -> str | None:
+    """Why this credential configuration is refused at startup, or None when it is acceptable.
+
+    A bridge-wide credential (a token or its hash, not both), per-agent route tokens, or a bridge-wide
+    credential with route tokens beside it. Never none, and no route token equal to the bridge-wide one."""
+    if token and token_sha256:
+        return "Configure OPENBOT_BRIDGE_TOKEN(_FILE) or OPENBOT_BRIDGE_TOKEN_SHA256(_FILE), not both"
+    if not (token or token_sha256 or route_hashes):
+        return ("Configure OPENBOT_BRIDGE_TOKEN(_FILE), OPENBOT_BRIDGE_TOKEN_SHA256(_FILE) "
+                "and/or OPENBOT_BRIDGE_ROUTE_TOKENS_FILE")
+    bridge_hash = token_sha256 or (hashlib.sha256(token.encode("utf-8")).hexdigest() if token else "")
+    if bridge_hash and bridge_hash in set(route_hashes.values()):
+        return "A route token must differ from the bridge-wide token"
+    return None
+
+
 def credential_scope(header: str, token: str = "", token_sha256: str = "",
                      route_hashes: dict | None = None, discovery_sha256: str = ""):
     """ALL_ROUTES for a bridge-wide credential, a frozenset of (session, pane) for a per-agent
@@ -201,7 +217,10 @@ def credential_scope(header: str, token: str = "", token_sha256: str = "",
         for route, expected in route_hashes.items():
             if hmac.compare_digest(digest, expected):
                 matched = frozenset({route})
-        return matched
+        # A per-agent token reaches its own route only. Anything else may still be the bridge-wide
+        # credential, when one is configured alongside the route tokens.
+        if matched is not None or not (token or token_sha256):
+            return matched
     if token_sha256:
         digest = hashlib.sha256(presented.encode("utf-8")).hexdigest()
         return ALL_ROUTES if hmac.compare_digest(digest, token_sha256) else None
@@ -1847,10 +1866,9 @@ def main() -> None:
         sys.exit("HERDR_SESSIONS_DENY must list Herdr session names")
     if DISCOVERY_SHA256 and not re.fullmatch(r"[0-9a-f]{64}", DISCOVERY_SHA256):
         sys.exit("OPENBOT_BRIDGE_DISCOVERY_TOKEN_SHA256(_FILE) must be a 64-character hex SHA-256")
-    configured = [bool(TOKEN), bool(TOKEN_SHA256), bool(ROUTE_HASHES)]
-    if sum(configured) != 1:
-        sys.exit("Configure exactly one of OPENBOT_BRIDGE_TOKEN(_FILE), OPENBOT_BRIDGE_TOKEN_SHA256(_FILE) "
-                 "or OPENBOT_BRIDGE_ROUTE_TOKENS_FILE")
+    problem = credential_config_error(TOKEN, TOKEN_SHA256, ROUTE_HASHES)
+    if problem:
+        sys.exit(problem)
     if TOKEN and len(TOKEN) < 24:
         sys.exit("Set OPENBOT_BRIDGE_TOKEN to a random secret of at least 24 characters")
     if DISCOVERY_SHA256 and DISCOVERY_SHA256 in (

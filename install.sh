@@ -33,6 +33,7 @@ SKIP_START=0
 BIND_HOST="127.0.0.1"
 TOKEN_SHA256=""
 ROUTE_HASHES=()
+ROUTE_TOKENS_ONLY=0
 EXPECT_BRIDGE_SHA256=""
 EXPECT_LEDGER_SHA256=""
 DENY_SESSIONS=""
@@ -41,7 +42,7 @@ VERIFY_TOKEN_FILE=""
 OPENBOT_BROWSER_URL=""
 
 usage() {
-  printf 'Usage: sudo bash install.sh --user USER --sessions NAME[,NAME] --roots DIR[:DIR] [--artifact-mode inline|signed_url --public-origin https://AGENT-HOST] [--legacy-target NAME --legacy-workdir DIR] [--token-file PATH] [--port 8766] [--busy-wait-seconds 600] [--recovery-seconds 600] [--source-dir DIR [--expect-bridge-sha256 HEX] [--expect-ledger-sha256 HEX]] [--bind 127.0.0.1|TAILSCALE-IP] [--token-sha256 HEX | --route-token-sha256 SESSION/PANE=HEX ...] [--sessions auto --deny-sessions NAME[,NAME]] [--discovery-token-sha256 HEX] [--openbot-browser-url https://OPENBOT-HOST/api/agent-fabric/browser] [--no-start]\n'
+  printf 'Usage: sudo bash install.sh --user USER --sessions NAME[,NAME] --roots DIR[:DIR] [--artifact-mode inline|signed_url --public-origin https://AGENT-HOST] [--legacy-target NAME --legacy-workdir DIR] [--token-file PATH] [--port 8766] [--busy-wait-seconds 600] [--recovery-seconds 600] [--source-dir DIR [--expect-bridge-sha256 HEX] [--expect-ledger-sha256 HEX]] [--bind 127.0.0.1|TAILSCALE-IP] [--token-file PATH | --token-sha256 HEX] [--route-token-sha256 SESSION/PANE=HEX ... [--route-tokens-only]] [--sessions auto --deny-sessions NAME[,NAME]] [--discovery-token-sha256 HEX] [--openbot-browser-url https://OPENBOT-HOST/api/agent-fabric/browser] [--no-start]\n'
 }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -101,6 +102,7 @@ while (($#)); do
       esac
       shift 2 ;;
     --no-start) SKIP_START=1; shift ;;
+    --route-tokens-only) ROUTE_TOKENS_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage; die "Unknown option: $1" ;;
   esac
@@ -143,8 +145,15 @@ if [[ "$BIND_HOST" != "127.0.0.1" ]]; then
 fi
 # Credentials: the bridge-wide token file (default), a bridge-wide SHA-256, or per-agent SHA-256s.
 [[ -z "$TOKEN_SHA256" || "$TOKEN_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--token-sha256 must be 64 lowercase hex characters"
-(( (${#TOKEN_SOURCE} > 0) + (${#TOKEN_SHA256} > 0) + (${#ROUTE_HASHES[@]} > 0) <= 1 )) \
-  || die "Use one of --token-file, --token-sha256 or --route-token-sha256"
+# One bridge-wide credential at most (--token-file or --token-sha256); route tokens may sit beside it.
+(( (${#TOKEN_SOURCE} > 0) + (${#TOKEN_SHA256} > 0) <= 1 )) || die "Use --token-file or --token-sha256, not both"
+# Route tokens alone used to replace the bridge-wide token and shred its file. Never do that silently:
+# an existing bridge token stays unless the operator passes --route-tokens-only to drop it on purpose.
+if ((${#ROUTE_HASHES[@]})) && [[ -z "$TOKEN_SOURCE" && -z "$TOKEN_SHA256" ]]; then
+  if [[ -f "/etc/openbot-herdr-bridge/bridge.token" ]] && ((ROUTE_TOKENS_ONLY == 0)); then
+    die "--route-token-sha256 without --token-file would remove the existing bridge-wide token. Pass --token-file /etc/openbot-herdr-bridge/bridge.token to keep it beside the route tokens, or --route-tokens-only to drop it"
+  fi
+fi
 ROUTE_TOKENS=""
 if ((${#ROUTE_HASHES[@]})); then
   declare -A seen_route=() seen_hash=()
@@ -269,7 +278,28 @@ done
 
 CREDENTIAL_ENV='OPENBOT_BRIDGE_TOKEN_FILE=%d/bridge.token'
 CREDENTIAL_LOAD="bridge.token:$CONF_DIR/bridge.token"
-if [[ -n "$ROUTE_TOKENS" || -n "$TOKEN_SHA256" ]]; then
+if [[ -n "$ROUTE_TOKENS" && ( -n "$TOKEN_SOURCE" || -n "$TOKEN_SHA256" ) ]]; then
+  # A bridge-wide credential with per-agent route tokens beside it.
+  printf '# <session>/<pane> <sha256 of that agent'"'"'s bearer token>; managed by install.sh\n%s' "$ROUTE_TOKENS" \
+    > "$CONF_DIR/route-tokens.sha256"
+  chmod 0600 "$CONF_DIR/route-tokens.sha256"
+  if [[ -n "$TOKEN_SHA256" ]]; then
+    printf '%s\n' "$TOKEN_SHA256" > "$CONF_DIR/bridge.token.sha256"
+    chmod 0600 "$CONF_DIR/bridge.token.sha256"
+    if [[ -f "$CONF_DIR/bridge.token" ]]; then shred -u "$CONF_DIR/bridge.token"; fi
+    CREDENTIAL_ENV='OPENBOT_BRIDGE_TOKEN_SHA256_FILE=%d/bridge.token.sha256'
+    CREDENTIAL_LOAD="bridge.token.sha256:$CONF_DIR/bridge.token.sha256"
+  else
+    # The named token file may already be the installed one; copying it onto itself is a no-op.
+    if [[ "$(readlink -f -- "$TOKEN_SOURCE")" != "$(readlink -f -- "$CONF_DIR/bridge.token")" ]]; then
+      install -m 0600 "$TOKEN_SOURCE" "$CONF_DIR/bridge.token"
+    fi
+    [[ $(wc -c < "$CONF_DIR/bridge.token") -ge 24 ]] || die "Bridge-wide bearer token too short"
+    rm -f "$CONF_DIR/bridge.token.sha256"
+  fi
+  CREDENTIAL_ENV+=$'\n'"Environment=OPENBOT_BRIDGE_ROUTE_TOKENS_FILE=%d/route-tokens.sha256"
+  CREDENTIAL_LOAD+=$'\n'"LoadCredential=route-tokens.sha256:$CONF_DIR/route-tokens.sha256"
+elif [[ -n "$ROUTE_TOKENS" || -n "$TOKEN_SHA256" ]]; then
   # Hash-only: the gateway never holds a bearer token; any old token file is removed.
   if [[ -n "$ROUTE_TOKENS" ]]; then
     printf '# <session>/<pane> <sha256 of that agent'"'"'s bearer token>; managed by install.sh\n%s' "$ROUTE_TOKENS" \
@@ -287,7 +317,8 @@ if [[ -n "$ROUTE_TOKENS" || -n "$TOKEN_SHA256" ]]; then
   fi
   if [[ -f "$CONF_DIR/bridge.token" ]]; then shred -u "$CONF_DIR/bridge.token"; fi
 else
-  if [[ -n "$TOKEN_SOURCE" ]]; then
+  rm -f "$CONF_DIR/route-tokens.sha256"
+  if [[ -n "$TOKEN_SOURCE" ]] && [[ "$(readlink -f -- "$TOKEN_SOURCE")" != "$(readlink -f -- "$CONF_DIR/bridge.token")" ]]; then
     install -m 0600 "$TOKEN_SOURCE" "$CONF_DIR/bridge.token"
   elif [[ ! -f "$CONF_DIR/bridge.token" ]]; then
     python3 -c 'import secrets,sys;sys.stdout.write(secrets.token_urlsafe(48)+"\n")' > "$CONF_DIR/bridge.token"
@@ -427,7 +458,10 @@ else
   printf 'Gateway installed: %s, user=%s, sessions=%s, bind=%s, port=%s\n' "$RELEASE_VERSION" "$RUN_USER" "$HERDR_SESSIONS" "$BIND_HOST" "$GATEWAY_PORT"
 fi
 printf 'Busy wait=%ss, recovery=%ss; run ledger stays on this server when either is enabled.\n' "$BUSY_WAIT_SECONDS" "$RECOVERY_SECONDS"
-if [[ -n "$ROUTE_TOKENS" ]]; then
+if [[ -n "$ROUTE_TOKENS" && ( -n "$TOKEN_SOURCE" || -n "$TOKEN_SHA256" ) ]]; then
+  printf 'Bridge-wide credential kept, plus %s per-agent token hash(es) at %s.\n' \
+    "${#ROUTE_HASHES[@]}" "$CONF_DIR/route-tokens.sha256"
+elif [[ -n "$ROUTE_TOKENS" ]]; then
   printf 'Per-agent token hashes stored at %s (%s routes); no bearer token is stored on this server.\n' \
     "$CONF_DIR/route-tokens.sha256" "${#ROUTE_HASHES[@]}"
 elif [[ -n "$TOKEN_SHA256" ]]; then

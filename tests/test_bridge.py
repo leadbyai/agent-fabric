@@ -274,6 +274,71 @@ class BridgeTests(unittest.TestCase):
         self.assertIn("Reply from Main/w3:p1", body)
         self.assertEqual([(s, p) for s, p, _ in self.prompts], [("Main", "w3:p1")])
 
+    def test_route_tokens_beside_the_bridge_wide_token(self):
+        """The bridge-wide token keeps reaching every route; a route token reaches only its own."""
+        self.use_route_tokens()
+        self.bridge.TOKEN = "Z" * 48
+        # Bridge-wide: every agent, the legacy route and discovery, as before.
+        status, body = self.request("GET", "/agents")
+        self.assertEqual(status, 200)
+        self.assertGreater(sum(len(s["agents"]) for s in json.loads(body)["sessions"]), 1)
+        status, body = self.request("POST", "/sessions/Main/agents/wA:p1/ag-ui", self.message("Hi"))
+        self.assertEqual(status, 200)
+        self.assertIn("Reply from Main/wA:p1", body)
+        # Route token: its own agent only, even in discovery, and nothing sent anywhere else.
+        status, body = self.request("GET", "/agents", token=self.tok_pricing)
+        self.assertEqual([(s["name"], [a["pane_id"] for a in s["agents"]]) for s in json.loads(body)["sessions"]],
+                         [("Main", ["w3:p1"])])
+        before = len(self.prompts)
+        for path in ("/sessions/Main/agents/wA:p1/ag-ui", "/sessions/Other/agents/w1:p2/ag-ui", "/ag-ui"):
+            self.assertIn(self.request("POST", path, self.message("x"), token=self.tok_pricing)[0], (401, 403, 404))
+        self.assertEqual(len(self.prompts), before)
+        status, body = self.request("POST", "/sessions/Main/agents/w3:p1/ag-ui", self.message("Hello"),
+                                    token=self.tok_pricing)
+        self.assertIn("Reply from Main/w3:p1", body)
+        # A wrong token is refused everywhere.
+        self.assertEqual(self.request("GET", "/agents", token="Q" * 43)[0], 401)
+        self.assertEqual(self.request("POST", "/sessions/Main/agents/w3:p1/ag-ui", self.message("x"),
+                                      token="Q" * 43)[0], 401)
+
+    def test_credential_scope_with_routes_and_a_bridge_wide_credential(self):
+        import hashlib
+        scope = self.bridge.credential_scope
+        routes = {("Main", "w3:p1"): hashlib.sha256(b"P" * 43).hexdigest()}
+        wide = hashlib.sha256(b"W" * 43).hexdigest()
+        for kwargs in ({"token": "W" * 43}, {"token_sha256": wide}):
+            self.assertEqual(scope("Bearer " + "W" * 43, route_hashes=routes, **kwargs), self.bridge.ALL_ROUTES)
+            self.assertEqual(scope("Bearer " + "P" * 43, route_hashes=routes, **kwargs), frozenset({("Main", "w3:p1")}))
+            self.assertIsNone(scope("Bearer " + "Q" * 43, route_hashes=routes, **kwargs))
+        # The discovery-only credential is unchanged.
+        discovery = hashlib.sha256(b"D" * 43).hexdigest()
+        self.assertEqual(scope("Bearer " + "D" * 43, token="W" * 43, route_hashes=routes, discovery_sha256=discovery),
+                         self.bridge.DISCOVERY)
+
+    def test_installer_keeps_the_bridge_token_beside_route_tokens(self):
+        """The installer runs only as root, so its credential rules are checked as text here."""
+        installer = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
+        self.assertNotIn("Use one of --token-file, --token-sha256 or --route-token-sha256", installer)
+        self.assertIn('die "Use --token-file or --token-sha256, not both"', installer)
+        # Route tokens alone never silently shred an existing bridge-wide token.
+        self.assertIn("would remove the existing bridge-wide token", installer)
+        self.assertIn("--route-tokens-only) ROUTE_TOKENS_ONLY=1", installer)
+        # Combined: both credentials reach the unit.
+        self.assertIn('CREDENTIAL_ENV+=$\'\\n\'"Environment=OPENBOT_BRIDGE_ROUTE_TOKENS_FILE=%d/route-tokens.sha256"', installer)
+        self.assertIn('CREDENTIAL_LOAD+=$\'\\n\'"LoadCredential=route-tokens.sha256:$CONF_DIR/route-tokens.sha256"', installer)
+
+    def test_startup_credential_rules(self):
+        import hashlib
+        check = self.bridge.credential_config_error
+        routes = {("Main", "w3:p1"): hashlib.sha256(b"P" * 43).hexdigest()}
+        self.assertIsNone(check("W" * 43, "", {}))
+        self.assertIsNone(check("", hashlib.sha256(b"W" * 43).hexdigest(), {}))
+        self.assertIsNone(check("", "", routes))
+        self.assertIsNone(check("W" * 43, "", routes))
+        self.assertIn("not both", check("W" * 43, hashlib.sha256(b"W" * 43).hexdigest(), {}))
+        self.assertIn("Configure", check("", "", {}))
+        self.assertIn("must differ", check("P" * 43, "", routes))
+
     def test_route_token_scopes_request_status_and_attention(self):
         self.use_route_tokens()
         self.bridge.LEDGER = self.bridge.RequestLedger(str(Path(self.tmp.name) / "scoped.sqlite3"))
