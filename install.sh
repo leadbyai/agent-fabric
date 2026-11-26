@@ -15,7 +15,7 @@ declare -A EXTRA_SHA256=(
   [activity_line.py]="63bfe3b211fe42794e6bf84780b82f6760a045f0be6969fbb6a61f39b69e549f"
   [herdr_browser.py]="495258749d16f5a67d1c9aabaa885705adf9dadf5ad660b7d3b2d15679939ecb"
   [openbot_browser_cli.py]="f095971783a6f8810a1091c93d8dd5a92177a0bec4a737e67d8b4732410eddf5"
-  [transcript_reply.py]="0ce6521ec214c9de020aa746da4a86d8e6dc2893bf22fd1df9b2316975463ffe"
+  [transcript_reply.py]="9f7ea290346a95097a47103a639535ba1f52ebd91211dc2063ef9c3e257bc9dd"
 )
 RUN_USER=""
 HERDR_SESSIONS=""
@@ -36,13 +36,14 @@ ROUTE_HASHES=()
 ROUTE_TOKENS_ONLY=0
 EXPECT_BRIDGE_SHA256=""
 EXPECT_LEDGER_SHA256=""
+EXPECT_EXTRA=()
 DENY_SESSIONS=""
 DISCOVERY_SHA256=""
 VERIFY_TOKEN_FILE=""
 OPENBOT_BROWSER_URL=""
 
 usage() {
-  printf 'Usage: sudo bash install.sh --user USER --sessions NAME[,NAME] --roots DIR[:DIR] [--artifact-mode inline|signed_url --public-origin https://AGENT-HOST] [--legacy-target NAME --legacy-workdir DIR] [--token-file PATH] [--port 8766] [--busy-wait-seconds 600] [--recovery-seconds 600] [--source-dir DIR [--expect-bridge-sha256 HEX] [--expect-ledger-sha256 HEX]] [--bind 127.0.0.1|TAILSCALE-IP] [--token-file PATH | --token-sha256 HEX] [--route-token-sha256 SESSION/PANE=HEX ... [--route-tokens-only]] [--sessions auto --deny-sessions NAME[,NAME]] [--discovery-token-sha256 HEX] [--openbot-browser-url https://OPENBOT-HOST/api/agent-fabric/browser] [--no-start]\n'
+  printf 'Usage: sudo bash install.sh --user USER --sessions NAME[,NAME] --roots DIR[:DIR] [--artifact-mode inline|signed_url --public-origin https://AGENT-HOST] [--legacy-target NAME --legacy-workdir DIR] [--token-file PATH] [--port 8766] [--busy-wait-seconds 600] [--recovery-seconds 600] [--source-dir DIR [--expect-bridge-sha256 HEX] [--expect-ledger-sha256 HEX] [--expect-extra-sha256 MODULE.py=HEX ...]] [--bind 127.0.0.1|TAILSCALE-IP] [--token-file PATH | --token-sha256 HEX] [--route-token-sha256 SESSION/PANE=HEX ... [--route-tokens-only]] [--sessions auto --deny-sessions NAME[,NAME]] [--discovery-token-sha256 HEX] [--openbot-browser-url https://OPENBOT-HOST/api/agent-fabric/browser] [--no-start]\n'
 }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -75,7 +76,7 @@ esac
 
 while (($#)); do
   case "$1" in
-    --user|--sessions|--roots|--legacy-target|--legacy-workdir|--token-file|--port|--busy-wait-seconds|--recovery-seconds|--source-dir|--public-origin|--artifact-mode|--bind|--token-sha256|--route-token-sha256|--expect-bridge-sha256|--expect-ledger-sha256|--deny-sessions|--discovery-token-sha256|--verify-token-file|--openbot-browser-url)
+    --user|--sessions|--roots|--legacy-target|--legacy-workdir|--token-file|--port|--busy-wait-seconds|--recovery-seconds|--source-dir|--public-origin|--artifact-mode|--bind|--token-sha256|--route-token-sha256|--expect-bridge-sha256|--expect-ledger-sha256|--expect-extra-sha256|--deny-sessions|--discovery-token-sha256|--verify-token-file|--openbot-browser-url)
       (($# >= 2)) || die "Missing value for $1"
       case "$1" in
         --user) RUN_USER="$2" ;;
@@ -96,6 +97,7 @@ while (($#)); do
         --route-token-sha256) ROUTE_HASHES+=("$2") ;;
         --expect-bridge-sha256) EXPECT_BRIDGE_SHA256="$2" ;;
         --expect-ledger-sha256) EXPECT_LEDGER_SHA256="$2" ;;
+        --expect-extra-sha256) EXPECT_EXTRA+=("$2") ;;
         --deny-sessions) DENY_SESSIONS="$2" ;;
         --discovery-token-sha256) DISCOVERY_SHA256="$2" ;;
         --verify-token-file) VERIFY_TOKEN_FILE="$2" ;;
@@ -177,6 +179,13 @@ fi
 [[ -z "$EXPECT_LEDGER_SHA256" || "$EXPECT_LEDGER_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--expect-ledger-sha256 must be 64 lowercase hex characters"
 [[ -z "$EXPECT_LEDGER_SHA256" || -n "$SOURCE_DIR" ]] || die "--expect-ledger-sha256 needs --source-dir"
 [[ -n "$EXPECT_LEDGER_SHA256" ]] && LEDGER_SHA256="$EXPECT_LEDGER_SHA256"
+# A reviewed module other than this installer's table (MODULE=<sha256>), from --source-dir only.
+for entry in "${EXPECT_EXTRA[@]}"; do
+  [[ "$entry" =~ ^([a-z_]+\.py)=([0-9a-f]{64})$ ]] || die "--expect-extra-sha256 must be MODULE.py=<64 lowercase hex>"
+  [[ -n "${EXTRA_SHA256[${BASH_REMATCH[1]}]:-}" ]] || die "--expect-extra-sha256 names an unknown module: ${BASH_REMATCH[1]}"
+  [[ -n "$SOURCE_DIR" ]] || die "--expect-extra-sha256 needs --source-dir"
+  EXTRA_SHA256[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]}"
+done
 [[ -z "$DISCOVERY_SHA256" || "$DISCOVERY_SHA256" != "$TOKEN_SHA256" ]] || die "The discovery token must differ from the bridge-wide token"
 [[ -z "$OPENBOT_BROWSER_URL" || "$OPENBOT_BROWSER_URL" =~ ^(https://[A-Za-z0-9.-]+(:[0-9]+)?|http://(127\.0\.0\.1|100\.[0-9.]+|10\.[0-9.]+|192\.168\.[0-9.]+)(:[0-9]+)?)/[A-Za-z0-9/_.-]*$ ]] \
   || die "--openbot-browser-url must be OpenBot's https browser route (or http to a private address)"
