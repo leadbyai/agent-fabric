@@ -83,6 +83,9 @@ ACTIVITY_SECONDS = 2.0
 # answers the question; the person (or whoever runs the agent) answers it on the agent's own screen.
 # 0 restores the old behaviour: refuse at once.
 QUESTION_HOLD_SECONDS = int(os.environ.get("OPENBOT_BRIDGE_QUESTION_HOLD_SECONDS", "1800"))
+# While the pane stays busy (working, or blocked on a later turn's question), check the agent's own
+# transcript this often for this request's turn having already ended. Only an ended turn is accepted.
+BUSY_TRANSCRIPT_SECONDS = int(os.environ.get("OPENBOT_BRIDGE_BUSY_TRANSCRIPT_SECONDS", "30"))
 QUESTION_HOLD_MAX = int(os.environ.get("OPENBOT_BRIDGE_QUESTION_HOLD_MAX", "3"))
 # The held line names the question only when this is 1. The gateway cannot tell a Bot's owner from
 # someone the Bot is shared with, and the question is the operator's, so the default is generic.
@@ -1355,6 +1358,17 @@ class Handler(BaseHTTPRequestHandler):
         correlation_deadline = None
         blocked_since: float | None = None
         last_question: str | None = None
+        next_busy_check = time.monotonic() + BUSY_TRANSCRIPT_SECONDS
+
+        def finished_while_busy() -> tuple[str, str] | None:
+            """This request's reply when its turn has already ended although the pane is still busy
+            (a later message started a new turn). Checked every BUSY_TRANSCRIPT_SECONDS."""
+            nonlocal next_busy_check
+            if BUSY_TRANSCRIPT_SECONDS <= 0 or time.monotonic() < next_busy_check:
+                return None
+            next_busy_check = time.monotonic() + BUSY_TRANSCRIPT_SECONDS
+            return self.transcript_fallback(session, pane_id, marker_id, session_id, idle=False)
+
         while True:
             agent = agent_record(session, pane_id)
             state = normalized_state(agent)
@@ -1363,6 +1377,11 @@ class Handler(BaseHTTPRequestHandler):
                     or (session_id and current_session and current_session != session_id)):
                 raise RuntimeError("Agent session changed after submission. Inspect Herdr before retrying.")
             session_id = session_id or current_session
+            if state in ("blocked", "working"):
+                finished = finished_while_busy()
+                if finished:
+                    reply, self.reply_source = finished
+                    return reply
             if state == "blocked":
                 # A question mid-turn: the turn resumes once it is answered on the agent's own screen.
                 if QUESTION_HOLD_SECONDS <= 0:

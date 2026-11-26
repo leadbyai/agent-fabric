@@ -1273,6 +1273,8 @@ class TranscriptFallbackTests(BridgeTests):
         self.addCleanup(setattr, self.bridge.Handler, "log_message", original)
         self.screen_after = None  # what the pane's screen shows after the turn (a function of the marker)
         self.final_text = None  # what the agent's last message in the transcript says
+        self.turn_ends = True  # whether the transcript records the end of the request's turn
+        self.after_turn = None  # pane status after the turn and the next entry ("a peer's message" etc.)
         base = self.fake_command
 
         def agent(*args, **kwargs):
@@ -1284,8 +1286,14 @@ class TranscriptFallbackTests(BridgeTests):
                     {"type": "user", "message": {"content": args[3]}},
                     {"type": "assistant", "message": {"content": [{"type": "text",
                                                                    "text": self.final_text(marker)}]}},
-                    {"type": "system", "subtype": "turn_duration"},
                 ]
+                if self.turn_ends:
+                    entries.append({"type": "system", "subtype": "turn_duration"})
+                if self.after_turn:
+                    status, entry = self.after_turn
+                    entries.append(entry)
+                    pane = next(a for a in self.roster["Main"] if a["pane_id"] == "wA:p1")
+                    pane["agent_status"] = status
                 with self.transcript.open("a") as handle:
                     handle.writelines(json.dumps(entry) + "\n" for entry in entries)
                 self.screens = {("Main", "wA:p1"): self.screen_after(marker)}
@@ -1311,6 +1319,42 @@ class TranscriptFallbackTests(BridgeTests):
         self.assertTrue(any(line.startswith("reply_source=transcript") and self.markers[0] in line
                             for line in self.logged))
         self.assertEqual(len(self.prompts), 1)
+
+    def test_a_finished_reply_is_delivered_while_the_agent_stays_busy(self):
+        # The agent ended the request's turn, then a peer's message started a new turn at once.
+        self.bridge.BUSY_TRANSCRIPT_SECONDS = 0.05
+        self.bridge.ACTIVE_WAIT_SECONDS = 5
+        peer = {"type": "user", "message": {"content": "A peer's next message"}}
+        for status in ("working", "blocked"):
+            with self.subTest(status=status):
+                next(a for a in self.roster["Main"] if a["pane_id"] == "wA:p1")["agent_status"] = "idle"
+                self.final_text = lambda m: f"OPENBOT_BEGIN_{m}\nDone while busy.\nOPENBOT_END_{m}"
+                self.screen_after = lambda m: "nothing readable"
+                self.after_turn = (status, peer)
+                message = self.message("Hello")
+                message["runId"] = f"busy-{status}"
+                started = time.monotonic()
+                status_code, body = self.request("POST", "/ag-ui", message)
+                events = self.events(body)
+                self.assertEqual(events[-1]["type"], "RUN_FINISHED")
+                self.assertEqual("".join(e.get("delta", "") for e in events
+                                         if e["type"] == "TEXT_MESSAGE_CONTENT"), "Done while busy.")
+                self.assertEqual(self.bridge.LEDGER.get(self.key(f"busy-{status}"))["reply_source"], "transcript")
+                self.assertLess(time.monotonic() - started, 3)
+
+    def test_a_busy_turn_that_has_not_ended_is_never_taken(self):
+        self.bridge.BUSY_TRANSCRIPT_SECONDS = 0.05
+        self.bridge.ACTIVE_WAIT_SECONDS = 0.6
+        self.final_text = lambda m: "Halfway through, still checking."
+        self.screen_after = lambda m: "nothing readable"
+        self.turn_ends = False
+        self.after_turn = ("working", {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]}})
+        status, body = self.request("POST", "/ag-ui", self.message("Check everything"))
+        events = self.events(body)
+        self.assertEqual(events[-1]["type"], "RUN_ERROR")
+        self.assertIn("still working", events[-1]["message"])
+        self.assertNotIn("Halfway", "".join(e.get("delta", "") for e in events))
 
     def test_a_reply_with_another_requests_marker(self):
         self.final_text = lambda m: ("A note for myself.\nOPENBOT_BEGIN_FEDCBA9876543210\nCreated it.\n"
