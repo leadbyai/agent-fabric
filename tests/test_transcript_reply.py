@@ -125,6 +125,25 @@ class Replies(unittest.TestCase):
         self.assertIsNone(tr.reply_and_source(self.path, ID, pane_idle=False))
         self.assertIsNone(tr.reply_and_source(self.path, ID, pane_idle=True))
 
+    def test_a_mid_turn_compaction_is_not_a_turn_end(self):
+        boundary = {"type": "system", "subtype": "compact_boundary"}
+        summary = {"type": "user", "isCompactSummary": True, "isVisibleInTranscriptOnly": True,
+                   "message": {"content": "This session is being continued from a previous conversation..."}}
+        # Compacted mid-turn and still working afterwards: nothing is taken, idle or not.
+        self.write(prompt(), says("Checking the hub."), calls("Bash"), result(), boundary, summary,
+                   says("Still going."), calls("Bash", "toolu_2"))
+        self.assertIsNone(tr.reply_and_source(self.path, ID, pane_idle=False))
+        self.assertIsNone(tr.reply_and_source(self.path, ID, pane_idle=True))
+        # The marked reply after the compaction, then the turn end: that reply, not the earlier text.
+        self.write(prompt(), says("Checking the hub."), calls("Bash"), result(), boundary, summary,
+                   says(marked("The hub is connected.")), END)
+        self.assertEqual(tr.reply_and_source(self.path, ID, pane_idle=False),
+                         ("The hub is connected.", "transcript"))
+        # Unmarked: the final text after the compaction, never the pre-compaction progress line.
+        self.write(prompt(), says("Checking the hub."), boundary, summary, says("All connected."), END)
+        self.assertEqual(tr.reply_and_source(self.path, ID, pane_idle=False),
+                         ("All connected.", "transcript_unmarked"))
+
     def test_a_marked_reply_mid_turn_wins_over_a_later_unmarked_summary(self):
         self.write(prompt(), says(marked("The real answer.")), calls("Bash"), result(),
                    says("Summary of other work."), END)
