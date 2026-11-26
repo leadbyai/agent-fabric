@@ -133,8 +133,13 @@ def _text(content: object) -> str:
 
 
 def _is_person(entry: dict) -> bool:
-    """An entry that starts a turn: not a tool result, an image note or a side chain."""
-    if entry.get("type") != "user" or entry.get("isMeta") or entry.get("isSidechain"):
+    """An entry that starts a turn: not a tool result, an image note, a side chain or a compaction summary.
+
+    Claude Code may compact mid-turn: it writes a `system/compact_boundary` entry, then a `user` entry
+    flagged `isCompactSummary`/`isVisibleInTranscriptOnly` holding the summary. That is not a person
+    and does not end the turn; the boundary itself is neither text nor a turn end, so scans pass it."""
+    if (entry.get("type") != "user" or entry.get("isMeta") or entry.get("isSidechain")
+            or entry.get("isCompactSummary") or entry.get("isVisibleInTranscriptOnly")):
         return False
     content = (entry.get("message") or {}).get("content")
     if isinstance(content, list) and content and all(

@@ -1342,6 +1342,19 @@ class TranscriptFallbackTests(BridgeTests):
                 self.assertEqual(self.bridge.LEDGER.get(self.key(f"busy-{status}"))["reply_source"], "transcript")
                 self.assertLess(time.monotonic() - started, 3)
 
+    def test_a_mid_turn_compaction_while_busy_is_never_taken(self):
+        self.bridge.BUSY_TRANSCRIPT_SECONDS = 0.05
+        self.bridge.ACTIVE_WAIT_SECONDS = 0.6
+        self.final_text = lambda m: "Checking the hub."
+        self.screen_after = lambda m: "nothing readable"
+        self.turn_ends = False
+        self.after_turn = ("working", {"type": "user", "isCompactSummary": True, "isVisibleInTranscriptOnly": True,
+                                       "message": {"content": "Summary of the conversation so far."}})
+        status, body = self.request("POST", "/ag-ui", self.message("Check the hub"))
+        events = self.events(body)
+        self.assertEqual(events[-1]["type"], "RUN_ERROR")
+        self.assertNotIn("Checking the hub", "".join(e.get("delta", "") for e in events))
+
     def test_a_busy_turn_that_has_not_ended_is_never_taken(self):
         self.bridge.BUSY_TRANSCRIPT_SECONDS = 0.05
         self.bridge.ACTIVE_WAIT_SECONDS = 0.6
