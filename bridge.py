@@ -1470,12 +1470,17 @@ class Handler(BaseHTTPRequestHandler):
                                          user_text.encode("utf-8")))
                 staged = stage_attachments(staged_items, marker_id, workdir,
                                            dynamic=dynamic)
-                outbox = prepare_outbox(marker_id, workdir, dynamic=dynamic)
             except (ValueError, OSError) as exc:
                 if stream_started:
                     raise RuntimeError(f"Could not prepare attachment: {exc}") from exc
                 self.json_response(422, {"error": str(exc)})
                 return
+            try:
+                outbox = prepare_outbox(marker_id, workdir, dynamic=dynamic)
+            except (ValueError, OSError) as exc:
+                # Reply images are optional, even when this agent cannot host files.
+                outbox = None
+                self.log_message("Reply image directory unavailable (%s)", type(exc).__name__)
             if not stream_started:
                 self.start_stream(thread_id, run_id)
                 stream_started = True
@@ -1495,28 +1500,31 @@ class Handler(BaseHTTPRequestHandler):
                     "not guaranteed to be byte-for-byte identical to the upload:\n" +
                     "\n".join(f"- {path}" for path in staged)
                 )
-            browser_hint = ""
-            try:
-                browser_turn = herdr_browser.open_turn(body.get("forwardedProps"),
-                                                       self.headers.get("Authorization"),
-                                                       outbox, self.gateway_address())
-            except OSError as exc:
-                self.log_message("OpenBot browser unavailable for this request (%s)", type(exc).__name__)
-            if browser_turn is not None:
-                browser_hint = herdr_browser.prompt_hint(
-                    browser_turn, f".openbot-outbox/{marker_id}/{browser_turn.name}", BROWSER_CLI)
+            screenshot_instructions = ""
+            if outbox is not None:
+                screenshot_instructions = (
+                    "To return up to four screenshots, save actual PNG, JPEG, or WebP files "
+                    f"into .openbot-outbox/{marker_id}/. The gateway automatically attaches "
+                    "the image files in that directory. No OPENBOT_IMAGE declaration or "
+                    "special reply formatting is needed. This is optional; never claim a "
+                    "screenshot was attached unless you saved the image. "
+                )
+                try:
+                    browser_turn = herdr_browser.open_turn(body.get("forwardedProps"),
+                                                           self.headers.get("Authorization"),
+                                                           outbox, self.gateway_address())
+                except OSError as exc:
+                    self.log_message("OpenBot browser unavailable for this request (%s)", type(exc).__name__)
+                if browser_turn is not None:
+                    screenshot_instructions += herdr_browser.prompt_hint(
+                        browser_turn, f".openbot-outbox/{marker_id}/{browser_turn.name}", BROWSER_CLI)
             prompt = (
                 f"[OpenBot pilot request {marker_id}]\n{user_text}"
                 f"{attachment_instructions}\n\n"
                 "For this integration test, enclose your final response between "
                 "these exact lines, with no formatting around them:\n"
                 f"{begin}\n<your response>\n{end}\n"
-                "To return up to four screenshots, save actual PNG, JPEG, or WebP files "
-                f"into .openbot-outbox/{marker_id}/. The gateway automatically attaches "
-                "the image files in that directory. No OPENBOT_IMAGE declaration or "
-                "special reply formatting is needed. This is optional; never claim a "
-                "screenshot was attached unless you saved the image. "
-                f"{browser_hint}Keep the response concise."
+                f"{screenshot_instructions}Keep the response concise."
             )
             if LEDGER:
                 try:
@@ -1536,7 +1544,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_submitted_event({"type": "CUSTOM", "name": "agent-fabric.request",
                                            "value": {"id": request_key, "state": "submitted"}})
             response = self.prompt_with_liveness(session, pane_id, prompt, marker_id)
-            response = persist_reply_images(response, outbox)
+            if outbox is not None:
+                response = persist_reply_images(response, outbox)
             if LEDGER:
                 LEDGER.finish(request_key, response)
                 ledger_reserved = False
