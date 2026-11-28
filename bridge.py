@@ -916,6 +916,41 @@ def extract_reply(transcript: str, marker_id: str) -> str:
     return text
 
 
+TUI_FRAME = re.compile(r"[ \t]*[\u2502\u2503\u2551]\s*$")
+
+
+def strip_tui_frame(text: str) -> str:
+    """Remove a full-screen TUI's right-hand frame (│ ┃ ║) and its indent from a scraped reply.
+
+    Hermes's TUI draws each reply inside a panel; reading the pane picks up the panel's right
+    border on every line (Derek, 11-28: "pipes at the end of every line"). Only when most lines
+    carry the border is it treated as a frame, so a reply that merely ends a line with │ is kept.
+    """
+    lines = text.split("\n")
+    filled = [line for line in lines if line.strip()]
+    if not filled or sum(1 for line in filled if TUI_FRAME.search(line)) * 10 < len(filled) * 6:
+        return text
+    lines = [TUI_FRAME.sub("", line).rstrip() for line in lines]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    indents = [len(line) - len(line.lstrip(" ")) for line in lines if line.strip()]
+    cut = min(indents) if indents else 0
+    return "\n".join(line[cut:] for line in lines)
+
+
+def is_hermes_pane(known: dict, session: str, pane_id: str) -> bool:
+    """Only Hermes TUI panes get the frame removed; every other agent's reply is untouched."""
+    agent = known if known.get("agent") else None
+    if agent is None:
+        try:
+            agent = agent_record(session, pane_id)
+        except (RuntimeError, OSError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError):
+            return False
+    return str(agent.get("agent") or "") == "hermes"
+
+
 def normalize_prose_wrapping(text: str) -> str:
     """Undo apparent terminal-style wrapping in ordinary prose only.
 
@@ -1427,7 +1462,10 @@ class Handler(BaseHTTPRequestHandler):
                 transcript = command("agent", "read", pane_id,
                                      "--source", "recent-unwrapped", "--lines", "200",
                                      session=session, wait_seconds=30)
-                return normalize_prose_wrapping(extract_reply(transcript, marker_id))
+                reply = extract_reply(transcript, marker_id)
+                if is_hermes_pane(initial_agent, session, pane_id):
+                    reply = strip_tui_frame(reply)
+                return normalize_prose_wrapping(reply)
             except (RuntimeError, subprocess.TimeoutExpired) as exc:
                 screen = pane_screen(session, pane_id)
                 shown = activity_line.signed_out(screen) if screen else None

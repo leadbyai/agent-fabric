@@ -1284,6 +1284,63 @@ sys.exit(1)
 
 
 
+def hermes_panel(lines, width=119, border="\u2502"):
+    """A reply as the Hermes TUI draws it, in the layout captured from real Techno and Artimis
+    panes (11-28): a lone border line first, then each line indented 4, padded to the panel
+    width, and closed by the right border; blank lines are padding plus the border."""
+    out = [border]
+    for line in lines:
+        body = ("    " + line) if line else ""
+        out.append(body.ljust(width - 1) + border)
+    return "\n".join(out)
+
+
+class TuiFrameTests(BridgeTests):
+    def test_a_hermes_panel_frame_is_removed(self):
+        lines = ["Understood. The first two drafts are out; I will try a more distinctive voice.",
+                 "", "Files:", "\u2022 01-draft.wav", "\u2022 02-draft.wav", "",
+                 "Should the next voice lean toward a calm futurist or an energetic announcer?"]
+        for border in ("\u2502", "\u2503"):
+            self.assertEqual(self.bridge.strip_tui_frame(hermes_panel(lines, border=border)), "\n".join(lines))
+
+    def test_pipes_the_agent_wrote_are_kept(self):
+        lines = ["| Voice | Length |", "| --- | --- |", "| A | 6.2 s |", "", "```", "a | b", "```",
+                 "This line really ends with a pipe |"]
+        self.assertEqual(self.bridge.strip_tui_frame(hermes_panel(lines)), "\n".join(lines))
+
+    def test_unframed_text_is_left_alone(self):
+        for text in ("Plain reply.\nSecond line.", "| a | b |\n|---|---|\n| 1 | 2 |",
+                     "One line ends with a bar \u2502\nbut the rest\ndo not\nat all"):
+            self.assertEqual(self.bridge.strip_tui_frame(text), text)
+
+    def framed_turn(self, kind):
+        self.roster["Main"][0]["agent"] = kind
+        framed = hermes_panel(["First line of the answer.", "", "Second | part, with a pipe |"])
+        original = self.fake_command
+
+        def fake(*args, session=None, **kwargs):
+            if args[:2] == ("agent", "prompt"):
+                marker = re.search(r"OPENBOT_BEGIN_([A-F0-9]{16})", args[3]).group(1)
+                self.prompts.append((session, args[2], args[3]))
+                self.replies[(session, args[2])] = f"OPENBOT_BEGIN_{marker}\n{framed}\nOPENBOT_END_{marker}"
+                return '{"result":{"agent_status":"done"}}'
+            return original(*args, session=session, **kwargs)
+
+        self.bridge.command = fake
+        status, body = self.request("POST", "/ag-ui", self.message("Hello"))
+        self.assertEqual(status, 200)
+        return body, framed
+
+    def test_a_hermes_pane_reply_arrives_without_the_frame(self):
+        body, _ = self.framed_turn("hermes")
+        self.assertIn(json.dumps("First line of the answer.\n\nSecond | part, with a pipe |")[1:-1], body)
+        self.assertNotIn("\\u2502", body)
+
+    def test_a_claude_pane_reply_is_unchanged(self):
+        body, framed = self.framed_turn("claude")
+        self.assertIn("\\u2502", body)
+
+
 class TranscriptFallbackTests(BridgeTests):
     """The reply from the agent's own transcript when the marked reply can't be read from its screen."""
 
