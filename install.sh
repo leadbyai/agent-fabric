@@ -5,9 +5,20 @@ set -euo pipefail
 
 RELEASE_VERSION="v0.7.0-rc4"
 RELEASE_URL="https://raw.githubusercontent.com/leadbyai/agent-fabric/${RELEASE_VERSION}"
-BRIDGE_SHA256="daf0cfa9c7a7d6cce37db7ca98d01144b5e63e947ab6deb4ed8ff09f1dc31e05"
-LEDGER_SHA256="c675b60a26a462690361951e6569848831f3efecf15577bb34dcb71babf2f49d"
+BRIDGE_SHA256="c6bbd1d446033e05069c7062232a33f65f706e576a1463c97e2ed9b216fbd808"
+LEDGER_SHA256="d29cdac58cf0b17dfc2c8f85e8178671ec490e5483dd0e71eb431bdb517af52f"
 MODEL_SHA256="2a9d74a3f3eb96190f68157d543fab365c0c3b0eafa0d775e7b2505f7924b1c2"
+# OpenBot activity line and browser (activity_line.py, herdr_browser.py, openbot_browser_cli.py), and the
+# reply fallback from the agent's own transcript (transcript_reply.py), and files an agent hands back
+# through OpenBot (agent_files.py).
+EXTRA_MODULES=(activity_line.py agent_files.py herdr_browser.py openbot_browser_cli.py transcript_reply.py)
+declare -A EXTRA_SHA256=(
+  [activity_line.py]="63bfe3b211fe42794e6bf84780b82f6760a045f0be6969fbb6a61f39b69e549f"
+  [agent_files.py]="c7439ebce0dcd3632bb7839cadaa729536d3b3f170b95bc1df532d837208c80d"
+  [herdr_browser.py]="495258749d16f5a67d1c9aabaa885705adf9dadf5ad660b7d3b2d15679939ecb"
+  [openbot_browser_cli.py]="f095971783a6f8810a1091c93d8dd5a92177a0bec4a737e67d8b4732410eddf5"
+  [transcript_reply.py]="9f7ea290346a95097a47103a639535ba1f52ebd91211dc2063ef9c3e257bc9dd"
+)
 RUN_USER=""
 HERDR_SESSIONS=""
 UPLOAD_ROOTS=""
@@ -24,13 +35,17 @@ SKIP_START=0
 BIND_HOST="127.0.0.1"
 TOKEN_SHA256=""
 ROUTE_HASHES=()
+ROUTE_TOKENS_ONLY=0
 EXPECT_BRIDGE_SHA256=""
+EXPECT_LEDGER_SHA256=""
+EXPECT_EXTRA=()
 DENY_SESSIONS=""
 DISCOVERY_SHA256=""
 VERIFY_TOKEN_FILE=""
+OPENBOT_BROWSER_URL=""
 
 usage() {
-  printf 'Usage: sudo bash install.sh --user USER --sessions NAME[,NAME] --roots DIR[:DIR] [--artifact-mode inline|signed_url --public-origin https://AGENT-HOST] [--legacy-target NAME --legacy-workdir DIR] [--token-file PATH] [--port 8766] [--busy-wait-seconds 600] [--recovery-seconds 600] [--source-dir DIR [--expect-bridge-sha256 HEX]] [--bind 127.0.0.1|TAILSCALE-IP] [--token-sha256 HEX | --route-token-sha256 SESSION/PANE=HEX ...] [--sessions auto --deny-sessions NAME[,NAME]] [--discovery-token-sha256 HEX] [--no-start]\n'
+  printf 'Usage: sudo bash install.sh --user USER --sessions NAME[,NAME] --roots DIR[:DIR] [--artifact-mode inline|signed_url --public-origin https://AGENT-HOST] [--legacy-target NAME --legacy-workdir DIR] [--token-file PATH] [--port 8766] [--busy-wait-seconds 600] [--recovery-seconds 600] [--source-dir DIR [--expect-bridge-sha256 HEX] [--expect-ledger-sha256 HEX] [--expect-extra-sha256 MODULE.py=HEX ...]] [--bind 127.0.0.1|TAILSCALE-IP] [--token-file PATH | --token-sha256 HEX] [--route-token-sha256 SESSION/PANE=HEX ... [--route-tokens-only]] [--sessions auto --deny-sessions NAME[,NAME]] [--discovery-token-sha256 HEX] [--openbot-browser-url https://OPENBOT-HOST/api/agent-fabric/browser] [--no-start]\n'
 }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -63,7 +78,7 @@ esac
 
 while (($#)); do
   case "$1" in
-    --user|--sessions|--roots|--legacy-target|--legacy-workdir|--token-file|--port|--busy-wait-seconds|--recovery-seconds|--source-dir|--public-origin|--artifact-mode|--bind|--token-sha256|--route-token-sha256|--expect-bridge-sha256|--deny-sessions|--discovery-token-sha256|--verify-token-file)
+    --user|--sessions|--roots|--legacy-target|--legacy-workdir|--token-file|--port|--busy-wait-seconds|--recovery-seconds|--source-dir|--public-origin|--artifact-mode|--bind|--token-sha256|--route-token-sha256|--expect-bridge-sha256|--expect-ledger-sha256|--expect-extra-sha256|--deny-sessions|--discovery-token-sha256|--verify-token-file|--openbot-browser-url)
       (($# >= 2)) || die "Missing value for $1"
       case "$1" in
         --user) RUN_USER="$2" ;;
@@ -74,6 +89,7 @@ while (($#)); do
         --token-file) TOKEN_SOURCE="$2" ;;
         --port) GATEWAY_PORT="$2" ;;
         --busy-wait-seconds) BUSY_WAIT_SECONDS="$2" ;;
+        --openbot-browser-url) OPENBOT_BROWSER_URL="$2" ;;
         --recovery-seconds) RECOVERY_SECONDS="$2" ;;
         --source-dir) SOURCE_DIR="$2" ;;
         --public-origin) PUBLIC_ORIGIN="$2" ;;
@@ -82,12 +98,15 @@ while (($#)); do
         --token-sha256) TOKEN_SHA256="$2" ;;
         --route-token-sha256) ROUTE_HASHES+=("$2") ;;
         --expect-bridge-sha256) EXPECT_BRIDGE_SHA256="$2" ;;
+        --expect-ledger-sha256) EXPECT_LEDGER_SHA256="$2" ;;
+        --expect-extra-sha256) EXPECT_EXTRA+=("$2") ;;
         --deny-sessions) DENY_SESSIONS="$2" ;;
         --discovery-token-sha256) DISCOVERY_SHA256="$2" ;;
         --verify-token-file) VERIFY_TOKEN_FILE="$2" ;;
       esac
       shift 2 ;;
     --no-start) SKIP_START=1; shift ;;
+    --route-tokens-only) ROUTE_TOKENS_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage; die "Unknown option: $1" ;;
   esac
@@ -130,8 +149,15 @@ if [[ "$BIND_HOST" != "127.0.0.1" ]]; then
 fi
 # Credentials: the bridge-wide token file (default), a bridge-wide SHA-256, or per-agent SHA-256s.
 [[ -z "$TOKEN_SHA256" || "$TOKEN_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--token-sha256 must be 64 lowercase hex characters"
-(( (${#TOKEN_SOURCE} > 0) + (${#TOKEN_SHA256} > 0) + (${#ROUTE_HASHES[@]} > 0) <= 1 )) \
-  || die "Use one of --token-file, --token-sha256 or --route-token-sha256"
+# One bridge-wide credential at most (--token-file or --token-sha256); route tokens may sit beside it.
+(( (${#TOKEN_SOURCE} > 0) + (${#TOKEN_SHA256} > 0) <= 1 )) || die "Use --token-file or --token-sha256, not both"
+# Route tokens alone used to replace the bridge-wide token and shred its file. Never do that silently:
+# an existing bridge token stays unless the operator passes --route-tokens-only to drop it on purpose.
+if ((${#ROUTE_HASHES[@]})) && [[ -z "$TOKEN_SOURCE" && -z "$TOKEN_SHA256" ]]; then
+  if [[ -f "/etc/openbot-herdr-bridge/bridge.token" ]] && ((ROUTE_TOKENS_ONLY == 0)); then
+    die "--route-token-sha256 without --token-file would remove the existing bridge-wide token. Pass --token-file /etc/openbot-herdr-bridge/bridge.token to keep it beside the route tokens, or --route-tokens-only to drop it"
+  fi
+fi
 ROUTE_TOKENS=""
 if ((${#ROUTE_HASHES[@]})); then
   declare -A seen_route=() seen_hash=()
@@ -151,7 +177,20 @@ fi
 [[ -z "$EXPECT_BRIDGE_SHA256" || "$EXPECT_BRIDGE_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--expect-bridge-sha256 must be 64 lowercase hex characters"
 [[ -z "$EXPECT_BRIDGE_SHA256" || -n "$SOURCE_DIR" ]] || die "--expect-bridge-sha256 needs --source-dir"
 [[ -n "$EXPECT_BRIDGE_SHA256" ]] && BRIDGE_SHA256="$EXPECT_BRIDGE_SHA256"
+# A reviewed request_ledger.py other than the release's (e.g. the fixed file-handle build b1359fbc...).
+[[ -z "$EXPECT_LEDGER_SHA256" || "$EXPECT_LEDGER_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "--expect-ledger-sha256 must be 64 lowercase hex characters"
+[[ -z "$EXPECT_LEDGER_SHA256" || -n "$SOURCE_DIR" ]] || die "--expect-ledger-sha256 needs --source-dir"
+[[ -n "$EXPECT_LEDGER_SHA256" ]] && LEDGER_SHA256="$EXPECT_LEDGER_SHA256"
+# A reviewed module other than this installer's table (MODULE=<sha256>), from --source-dir only.
+for entry in "${EXPECT_EXTRA[@]}"; do
+  [[ "$entry" =~ ^([a-z_]+\.py)=([0-9a-f]{64})$ ]] || die "--expect-extra-sha256 must be MODULE.py=<64 lowercase hex>"
+  [[ -n "${EXTRA_SHA256[${BASH_REMATCH[1]}]:-}" ]] || die "--expect-extra-sha256 names an unknown module: ${BASH_REMATCH[1]}"
+  [[ -n "$SOURCE_DIR" ]] || die "--expect-extra-sha256 needs --source-dir"
+  EXTRA_SHA256[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]}"
+done
 [[ -z "$DISCOVERY_SHA256" || "$DISCOVERY_SHA256" != "$TOKEN_SHA256" ]] || die "The discovery token must differ from the bridge-wide token"
+[[ -z "$OPENBOT_BROWSER_URL" || "$OPENBOT_BROWSER_URL" =~ ^(https://[A-Za-z0-9.-]+(:[0-9]+)?|http://(127\.0\.0\.1|100\.[0-9.]+|10\.[0-9.]+|192\.168\.[0-9.]+)(:[0-9]+)?)/[A-Za-z0-9/_.-]*$ ]] \
+  || die "--openbot-browser-url must be OpenBot's https browser route (or http to a private address)"
 
 IFS=: read -r -a root_list <<< "$UPLOAD_ROOTS"
 for path in "${root_list[@]}"; do
@@ -169,6 +208,9 @@ if [[ -n "$SOURCE_DIR" ]]; then
   [[ -f "$SOURCE_DIR/bridge.py" ]] || die "Missing bridge.py in source directory"
   [[ -f "$SOURCE_DIR/request_ledger.py" ]] || die "Missing request_ledger.py in source directory"
   [[ -f "$SOURCE_DIR/model_control.py" ]] || die "Missing model_control.py in source directory"
+  for module in "${EXTRA_MODULES[@]}"; do
+    [[ -f "$SOURCE_DIR/$module" ]] || die "Missing $module in source directory"
+  done
 fi
 
 APP_DIR="/opt/openbot-herdr-bridge"
@@ -191,11 +233,13 @@ install -d -o "$RUN_USER" -g "$(id -gn "$RUN_USER")" -m 0700 "$ARTIFACT_DIR"
 TEMP_FILE="$(mktemp "$APP_DIR/.bridge.py.XXXXXX")"
 TEMP_LEDGER="$(mktemp "$APP_DIR/.request_ledger.py.XXXXXX")"
 TEMP_MODEL="$(mktemp "$APP_DIR/.model_control.py.XXXXXX")"
-trap 'test ! -e "$TEMP_FILE" || rm -f -- "$TEMP_FILE"; test ! -e "$TEMP_LEDGER" || rm -f -- "$TEMP_LEDGER"; test ! -e "$TEMP_MODEL" || rm -f -- "$TEMP_MODEL"' EXIT
+TEMP_EXTRA="$(mktemp -d "$APP_DIR/.extra.XXXXXX")"
+trap 'test ! -e "$TEMP_FILE" || rm -f -- "$TEMP_FILE"; test ! -e "$TEMP_LEDGER" || rm -f -- "$TEMP_LEDGER"; test ! -e "$TEMP_MODEL" || rm -f -- "$TEMP_MODEL"; test ! -e "$TEMP_EXTRA" || rm -rf -- "$TEMP_EXTRA"' EXIT
 if [[ -n "$SOURCE_DIR" ]]; then
   cp -- "$SOURCE_DIR/bridge.py" "$TEMP_FILE"
   cp -- "$SOURCE_DIR/request_ledger.py" "$TEMP_LEDGER"
   cp -- "$SOURCE_DIR/model_control.py" "$TEMP_MODEL"
+  for module in "${EXTRA_MODULES[@]}"; do cp -- "$SOURCE_DIR/$module" "$TEMP_EXTRA/$module"; done
 else
   command -v curl >/dev/null || die "curl required"
   curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --max-time 30 \
@@ -204,7 +248,15 @@ else
     "$RELEASE_URL/request_ledger.py" -o "$TEMP_LEDGER"
   curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --max-time 30 \
     "$RELEASE_URL/model_control.py" -o "$TEMP_MODEL"
+  for module in "${EXTRA_MODULES[@]}"; do
+    curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --max-time 30 \
+      "$RELEASE_URL/$module" -o "$TEMP_EXTRA/$module"
+  done
 fi
+for module in "${EXTRA_MODULES[@]}"; do
+  printf '%s  %s\n' "${EXTRA_SHA256[$module]}" "$TEMP_EXTRA/$module" | sha256sum -c - >/dev/null \
+    || die "$module SHA256 mismatch"
+done
 
 if [[ "$BRIDGE_SHA256" != __BRIDGE_SHA256__ && "$LEDGER_SHA256" != __LEDGER_SHA256__ &&
       "$MODEL_SHA256" != __MODEL_SHA256__ ]]; then
@@ -214,7 +266,8 @@ if [[ "$BRIDGE_SHA256" != __BRIDGE_SHA256__ && "$LEDGER_SHA256" != __LEDGER_SHA2
 elif [[ -z "$SOURCE_DIR" ]]; then
   die "Release checksum not finalized; use a signed release or --source-dir"
 fi
-python3 -m py_compile "$TEMP_FILE" "$TEMP_LEDGER" "$TEMP_MODEL" || die "Gateway code did not compile"
+python3 -m py_compile "$TEMP_FILE" "$TEMP_LEDGER" "$TEMP_MODEL" "${EXTRA_MODULES[@]/#/$TEMP_EXTRA/}" \
+  || die "Gateway code did not compile"
 BACKUP_STAMP="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 if [[ -f "$APP_DIR/bridge.py" ]]; then
   cp -p -- "$APP_DIR/bridge.py" "$APP_DIR/bridge.py.bak.$BACKUP_STAMP"
@@ -228,10 +281,36 @@ fi
 install -m 0755 "$TEMP_FILE" "$APP_DIR/bridge.py"
 install -m 0644 "$TEMP_LEDGER" "$APP_DIR/request_ledger.py"
 install -m 0644 "$TEMP_MODEL" "$APP_DIR/model_control.py"
+for module in "${EXTRA_MODULES[@]}"; do
+  [[ ! -f "$APP_DIR/$module" ]] || cp -p -- "$APP_DIR/$module" "$APP_DIR/$module.bak.$BACKUP_STAMP"
+  mode=0644; [[ "$module" != openbot_browser_cli.py ]] || mode=0755
+  install -m "$mode" "$TEMP_EXTRA/$module" "$APP_DIR/$module"
+done
 
 CREDENTIAL_ENV='OPENBOT_BRIDGE_TOKEN_FILE=%d/bridge.token'
 CREDENTIAL_LOAD="bridge.token:$CONF_DIR/bridge.token"
-if [[ -n "$ROUTE_TOKENS" || -n "$TOKEN_SHA256" ]]; then
+if [[ -n "$ROUTE_TOKENS" && ( -n "$TOKEN_SOURCE" || -n "$TOKEN_SHA256" ) ]]; then
+  # A bridge-wide credential with per-agent route tokens beside it.
+  printf '# <session>/<pane> <sha256 of that agent'"'"'s bearer token>; managed by install.sh\n%s' "$ROUTE_TOKENS" \
+    > "$CONF_DIR/route-tokens.sha256"
+  chmod 0600 "$CONF_DIR/route-tokens.sha256"
+  if [[ -n "$TOKEN_SHA256" ]]; then
+    printf '%s\n' "$TOKEN_SHA256" > "$CONF_DIR/bridge.token.sha256"
+    chmod 0600 "$CONF_DIR/bridge.token.sha256"
+    if [[ -f "$CONF_DIR/bridge.token" ]]; then shred -u "$CONF_DIR/bridge.token"; fi
+    CREDENTIAL_ENV='OPENBOT_BRIDGE_TOKEN_SHA256_FILE=%d/bridge.token.sha256'
+    CREDENTIAL_LOAD="bridge.token.sha256:$CONF_DIR/bridge.token.sha256"
+  else
+    # The named token file may already be the installed one; copying it onto itself is a no-op.
+    if [[ "$(readlink -f -- "$TOKEN_SOURCE")" != "$(readlink -f -- "$CONF_DIR/bridge.token")" ]]; then
+      install -m 0600 "$TOKEN_SOURCE" "$CONF_DIR/bridge.token"
+    fi
+    [[ $(wc -c < "$CONF_DIR/bridge.token") -ge 24 ]] || die "Bridge-wide bearer token too short"
+    rm -f "$CONF_DIR/bridge.token.sha256"
+  fi
+  CREDENTIAL_ENV+=$'\n'"Environment=OPENBOT_BRIDGE_ROUTE_TOKENS_FILE=%d/route-tokens.sha256"
+  CREDENTIAL_LOAD+=$'\n'"LoadCredential=route-tokens.sha256:$CONF_DIR/route-tokens.sha256"
+elif [[ -n "$ROUTE_TOKENS" || -n "$TOKEN_SHA256" ]]; then
   # Hash-only: the gateway never holds a bearer token; any old token file is removed.
   if [[ -n "$ROUTE_TOKENS" ]]; then
     printf '# <session>/<pane> <sha256 of that agent'"'"'s bearer token>; managed by install.sh\n%s' "$ROUTE_TOKENS" \
@@ -249,7 +328,8 @@ if [[ -n "$ROUTE_TOKENS" || -n "$TOKEN_SHA256" ]]; then
   fi
   if [[ -f "$CONF_DIR/bridge.token" ]]; then shred -u "$CONF_DIR/bridge.token"; fi
 else
-  if [[ -n "$TOKEN_SOURCE" ]]; then
+  rm -f "$CONF_DIR/route-tokens.sha256"
+  if [[ -n "$TOKEN_SOURCE" ]] && [[ "$(readlink -f -- "$TOKEN_SOURCE")" != "$(readlink -f -- "$CONF_DIR/bridge.token")" ]]; then
     install -m 0600 "$TOKEN_SOURCE" "$CONF_DIR/bridge.token"
   elif [[ ! -f "$CONF_DIR/bridge.token" ]]; then
     python3 -c 'import secrets,sys;sys.stdout.write(secrets.token_urlsafe(48)+"\n")' > "$CONF_DIR/bridge.token"
@@ -291,6 +371,7 @@ fi
   printf 'OPENBOT_BRIDGE_ARTIFACT_DIR=%s\n' "$ARTIFACT_DIR"
   printf 'OPENBOT_BRIDGE_ARTIFACT_MODE=%s\n' "$ARTIFACT_MODE"
   printf 'OPENBOT_BRIDGE_PUBLIC_ORIGIN=%s\n' "$PUBLIC_ORIGIN"
+  [[ -z "$OPENBOT_BROWSER_URL" ]] || printf 'OPENBOT_BROWSER_CALLBACK_URL=%s\n' "$OPENBOT_BROWSER_URL"
   if (( BUSY_WAIT_SECONDS > 0 || RECOVERY_SECONDS > 0 )); then
     printf 'OPENBOT_BRIDGE_LEDGER_PATH=%s/requests.sqlite3\n' "$STATE_DIR"
   fi
@@ -365,6 +446,13 @@ if ((SKIP_START == 0)); then
       else
         rm -f -- "$APP_DIR/model_control.py"  # the restored bridge predates it
       fi
+      for module in "${EXTRA_MODULES[@]}"; do
+        if [[ -f "$APP_DIR/$module.bak.$BACKUP_STAMP" ]]; then
+          cp -p -- "$APP_DIR/$module.bak.$BACKUP_STAMP" "$APP_DIR/$module"
+        else
+          rm -f -- "$APP_DIR/$module"  # the restored bridge predates it
+        fi
+      done
       systemctl daemon-reload
       systemctl restart openbot-herdr-gateway.service || true
       die "Gateway failed health check; attempted restoration of previous code, config and service"
@@ -381,7 +469,10 @@ else
   printf 'Gateway installed: %s, user=%s, sessions=%s, bind=%s, port=%s\n' "$RELEASE_VERSION" "$RUN_USER" "$HERDR_SESSIONS" "$BIND_HOST" "$GATEWAY_PORT"
 fi
 printf 'Busy wait=%ss, recovery=%ss; run ledger stays on this server when either is enabled.\n' "$BUSY_WAIT_SECONDS" "$RECOVERY_SECONDS"
-if [[ -n "$ROUTE_TOKENS" ]]; then
+if [[ -n "$ROUTE_TOKENS" && ( -n "$TOKEN_SOURCE" || -n "$TOKEN_SHA256" ) ]]; then
+  printf 'Bridge-wide credential kept, plus %s per-agent token hash(es) at %s.\n' \
+    "${#ROUTE_HASHES[@]}" "$CONF_DIR/route-tokens.sha256"
+elif [[ -n "$ROUTE_TOKENS" ]]; then
   printf 'Per-agent token hashes stored at %s (%s routes); no bearer token is stored on this server.\n' \
     "$CONF_DIR/route-tokens.sha256" "${#ROUTE_HASHES[@]}"
 elif [[ -n "$TOKEN_SHA256" ]]; then
