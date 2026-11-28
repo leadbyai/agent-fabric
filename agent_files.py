@@ -143,8 +143,9 @@ def link_name(name: str) -> str:
 def deliver_files(reply: str, outbox: Path, *, url: str | None, credential: str | None,
                   assertion: str | None, log: Callable[[str], None],
                   record: Callable[[Delivered], None] | None = None,
-                  send: Callable[..., dict] = upload) -> str:
+                  send: Callable[..., dict] | None = None) -> str:
     """The reply with one link line per delivered file, and a plain note for any that was not."""
+    send = send or upload
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     outbox_fd = os.open(outbox, flags)
     try:
