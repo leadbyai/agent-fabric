@@ -94,7 +94,15 @@ class BridgeTests(unittest.TestCase):
             pane_id, prompt = args[2], args[3]
             self.prompts.append((session, pane_id, prompt))
             marker = re.search(r"OPENBOT_BEGIN_([A-F0-9]{16})", prompt).group(1)
-            if "Create a screenshot" in prompt:
+            if "Make the narration" in prompt:
+                current = next(a for a in agents if a["pane_id"] == pane_id)
+                outbox = Path(re.search(r"into (.*?)/\. The gateway automatically attaches", prompt)[1])
+                if not outbox.is_absolute():
+                    outbox = Path(current["cwd"]) / outbox
+                (outbox / "narration.mp3").write_bytes(b"ID3" + b"\0" * 4096)
+                (outbox / ".env").write_text("TOKEN=1")
+                response = "Narration is ready."
+            elif "Create a screenshot" in prompt:
                 current = next(a for a in agents if a["pane_id"] == pane_id)
                 outbox = Path(re.search(r"into (.*?)/\. The gateway automatically attaches", prompt)[1])
                 if not outbox.is_absolute():
@@ -494,6 +502,29 @@ sys.exit(1)
         self.assertNotIn("https://lbai-agents.leadbyai.bot/artifacts/", body)
         # Inline mode exposes no unauthenticated public artifact endpoint.
         self.assertEqual(self.request("GET", "/artifacts/" + "x" * 43 + ".png", auth=False)[0], 404)
+
+    def test_an_agent_file_goes_to_openbot_and_the_reply_carries_its_link(self):
+        sent = []
+
+        def fake_upload(url, credential, assertion, name, data):
+            sent.append((url, credential, assertion, name, len(data)))
+            return {"id": "0b0f8a6e-3c1d-4e2f-9a8b-7c6d5e4f3a2b", "mimeType": "audio/mpeg"}
+
+        message = self.message("Make the narration")
+        message["forwardedProps"] = {"openbotRun": "signed-run"}
+        with patch.object(self.bridge.agent_files, "upload", fake_upload), \
+                patch.object(self.bridge.herdr_browser, "callback_url",
+                             lambda: "http://127.0.0.1:3001/api/agent-fabric/browser"):
+            status, body = self.request("POST", "/ag-ui", message)
+        self.assertEqual(status, 200)
+        self.assertIn("RUN_FINISHED", body)
+        self.assertEqual(sent, [("http://127.0.0.1:3001/api/agent-fabric/attachments", "Bearer " + "Z" * 48,
+                                 "signed-run", "narration.mp3", 4099)])
+        self.assertIn('[narration.mp3](/api/attachments/0b0f8a6e-3c1d-4e2f-9a8b-7c6d5e4f3a2b \\"audio/mpeg\\")', body)
+        self.assertNotIn(".env", [call[3] for call in sent])
+        prompt = self.prompts[-1][2]
+        self.assertIn("other files you made", prompt)
+        self.assertIn("Never put credentials", prompt)
 
     def test_screenshot_is_auto_attached_without_marker_over_agui(self):
         status, body = self.request("POST", "/ag-ui",
