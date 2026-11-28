@@ -57,6 +57,18 @@ class RequestLedger:
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(requests)")}
             if "reply_source" not in columns:
                 connection.execute("ALTER TABLE requests ADD COLUMN reply_source TEXT")
+            # Files an agent handed back through OpenBot: what was sent, never the contents.
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS files (
+                  key TEXT NOT NULL,
+                  name TEXT NOT NULL,
+                  size INTEGER NOT NULL,
+                  mime_type TEXT NOT NULL,
+                  sha256 TEXT NOT NULL,
+                  attachment_id TEXT NOT NULL,
+                  created_at INTEGER NOT NULL
+                )
+            """)
         os.chmod(self.path, 0o600)
 
     @staticmethod
@@ -100,6 +112,20 @@ class RequestLedger:
                 UPDATE requests SET state='finished', reply=?, reply_source=?, updated_at=? WHERE key=?
             """, (reply, source, int(time.time()), key))
 
+    def record_file(self, key: str, name: str, size: int, mime_type: str, sha256: str,
+                    attachment_id: str) -> None:
+        with self._open() as connection:
+            connection.execute(
+                "INSERT INTO files (key, name, size, mime_type, sha256, attachment_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (key, name[:255], int(size), mime_type[:120], sha256, attachment_id, int(time.time())))
+
+    def files_for(self, key: str) -> list[dict]:
+        with self._open() as connection:
+            return [dict(row) for row in connection.execute(
+                "SELECT name, size, mime_type, sha256, attachment_id FROM files WHERE key=? ORDER BY rowid",
+                (key,))]
+
     def uncertain(self, key: str) -> None:
         with self._open() as connection:
             connection.execute("""
@@ -120,3 +146,5 @@ class RequestLedger:
         with self._open() as connection:
             connection.execute("DELETE FROM requests WHERE state='finished' AND updated_at<?",
                                (int(time.time()) - older_than_seconds,))
+            connection.execute("DELETE FROM files WHERE created_at<?",
+                               (int(time.time()) - 90 * 86400,))

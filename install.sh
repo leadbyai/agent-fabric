@@ -9,10 +9,12 @@ BRIDGE_SHA256="c6bbd1d446033e05069c7062232a33f65f706e576a1463c97e2ed9b216fbd808"
 LEDGER_SHA256="d29cdac58cf0b17dfc2c8f85e8178671ec490e5483dd0e71eb431bdb517af52f"
 MODEL_SHA256="2a9d74a3f3eb96190f68157d543fab365c0c3b0eafa0d775e7b2505f7924b1c2"
 # OpenBot activity line and browser (activity_line.py, herdr_browser.py, openbot_browser_cli.py), and the
-# reply fallback from the agent's own transcript (transcript_reply.py).
-EXTRA_MODULES=(activity_line.py herdr_browser.py openbot_browser_cli.py transcript_reply.py)
+# reply fallback from the agent's own transcript (transcript_reply.py), and files an agent hands back
+# through OpenBot (agent_files.py).
+EXTRA_MODULES=(activity_line.py agent_files.py herdr_browser.py openbot_browser_cli.py transcript_reply.py)
 declare -A EXTRA_SHA256=(
   [activity_line.py]="63bfe3b211fe42794e6bf84780b82f6760a045f0be6969fbb6a61f39b69e549f"
+  [agent_files.py]="5e68af1bc59b2cf0ec67494a85e21478ba58be970292dea211126e639b598f32"
   [herdr_browser.py]="495258749d16f5a67d1c9aabaa885705adf9dadf5ad660b7d3b2d15679939ecb"
   [openbot_browser_cli.py]="f095971783a6f8810a1091c93d8dd5a92177a0bec4a737e67d8b4732410eddf5"
   [transcript_reply.py]="9f7ea290346a95097a47103a639535ba1f52ebd91211dc2063ef9c3e257bc9dd"
